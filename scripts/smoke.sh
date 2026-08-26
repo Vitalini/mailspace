@@ -11,6 +11,35 @@ FAILED=0
 pass() { echo "  ok   $*"; }
 fail() { echo "  FAIL $*"; FAILED=1; }
 
+# Runs a command under a wall-clock limit so a hung self-check cannot block the
+# script forever. Uses coreutils `timeout` when it is installed (it is not part
+# of base macOS), otherwise a plain background-and-kill watchdog.
+run_with_timeout() {
+  local seconds="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+  else
+    "$@" &
+    local pid=$!
+    ( sleep "$seconds"; kill -9 "$pid" 2>/dev/null ) &
+    local watchdog=$!
+    wait "$pid"
+    local status=$?
+    kill "$watchdog" 2>/dev/null
+    return $status
+  fi
+}
+
+# Nothing in this script may pass because of an instance left over from an
+# earlier run or a manual launch.
+kill_existing_instances() {
+  pkill -f "$BIN" 2>/dev/null && sleep 2
+  pkill -9 -f "$BIN" 2>/dev/null
+  return 0
+}
+
 echo "smoke: checking $APP_ABS"
 
 # 1. Bundle layout
@@ -55,7 +84,7 @@ else
 fi
 
 # 5. Headless self-check: boots the real app inside its bundle, reports state, exits.
-SELFTEST_OUT="$(MAILSPACE_SELFTEST=1 "$BIN" 2>&1)"
+SELFTEST_OUT="$(MAILSPACE_SELFTEST=1 run_with_timeout 60 "$BIN" 2>&1)"
 SELFTEST_STATUS=$?
 if [ $SELFTEST_STATUS -eq 0 ] && echo "$SELFTEST_OUT" | grep -q "^SELFTEST "; then
   pass "self-check: $(echo "$SELFTEST_OUT" | grep '^SELFTEST ' | head -1)"
@@ -66,13 +95,13 @@ fi
 # 6. Google sign-in page: served (not the embedded-browser block), autofill
 #    lands, and nothing about:blank escapes to NSWorkspace.
 if [ "${SMOKE_SKIP_NETWORK:-0}" != "1" ]; then
-  LOGIN_OUT="$(MAILSPACE_SELFTEST=login "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+  LOGIN_OUT="$(MAILSPACE_SELFTEST=login run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
   case "$LOGIN_OUT" in
     *"result=ok"*) pass "sign-in page served: $LOGIN_OUT" ;;
     *) fail "sign-in page check: $LOGIN_OUT" ;;
   esac
 
-  AUTOFILL_OUT="$(MAILSPACE_SELFTEST=autofill "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+  AUTOFILL_OUT="$(MAILSPACE_SELFTEST=autofill run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
   case "$AUTOFILL_OUT" in
     *"result=ok"*) pass "sign-in autofill: $AUTOFILL_OUT" ;;
     *) fail "sign-in autofill: $AUTOFILL_OUT" ;;
@@ -82,26 +111,33 @@ else
 fi
 
 # 7. Notification shim: both Notification and showNotification reach native.
-SHIM_OUT="$(MAILSPACE_SELFTEST=shim "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+SHIM_OUT="$(MAILSPACE_SELFTEST=shim run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
 case "$SHIM_OUT" in
   *"result=ok"*) pass "notification shim: $SHIM_OUT" ;;
   *) fail "notification shim: $SHIM_OUT" ;;
 esac
 
 # 8. Real launch: open the bundle, confirm the process stays alive, then quit it.
-open "$APP_ABS"
-sleep 5
-PID="$(pgrep -f "$APP_ABS/Contents/MacOS/MailSpace" | head -1)"
-if [ -n "$PID" ]; then
-  pass "app launched and stayed alive 5s (pid $PID)"
-  kill "$PID" 2>/dev/null
-  sleep 2
-  if pgrep -f "$APP_ABS/Contents/MacOS/MailSpace" >/dev/null; then
-    pkill -9 -f "$APP_ABS/Contents/MacOS/MailSpace" 2>/dev/null
-  fi
-  pass "app quit cleanly"
+#    Any instance already running from this bundle is killed first, so the check
+#    cannot pass on someone else's process.
+kill_existing_instances
+if pgrep -f "$BIN" >/dev/null; then
+  fail "a prior instance of $BIN would not quit; launch check skipped"
 else
-  fail "app did not stay alive after launch"
+  open "$APP_ABS"
+  sleep 5
+  PID="$(pgrep -f "$BIN" | head -1)"
+  if [ -n "$PID" ]; then
+    pass "app launched and stayed alive 5s (pid $PID)"
+    kill "$PID" 2>/dev/null
+    sleep 2
+    if pgrep -f "$BIN" >/dev/null; then
+      pkill -9 -f "$BIN" 2>/dev/null
+    fi
+    pass "app quit cleanly"
+  else
+    fail "app did not stay alive after launch"
+  fi
 fi
 
 echo
