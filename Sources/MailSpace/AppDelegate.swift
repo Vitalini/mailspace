@@ -139,7 +139,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     /// rest of the session.
     func tabBecameVisible(accountId: UUID, view: AccountView) {
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
-        navigationPolicy.recoverIfStalled(webView)
+        // The view's own entry point comes along because a webview that crashed
+        // before committing anything has no URL to reload.
+        navigationPolicy.recoverIfStalled(webView, baseURL: view.url)
     }
 
     func requestRemoveAccount(id: UUID) {
@@ -271,20 +273,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         windowController?.selectView(.calendar)
     }
 
-    /// ⌘R. Also the way out of a tab the crash throttle has given up on, which
-    /// is why it clears the crash record rather than only reloading.
+    /// ⌘R. Acts on the window the user is actually looking at — a Docs or print
+    /// popup could not be reloaded at all before, and pressing ⌘R over one
+    /// reloaded the main window instead. Also the way out of a tab the crash
+    /// throttle has given up on, which is why it clears the crash record rather
+    /// than only reloading.
     @objc func reloadCurrentTab(_ sender: Any?) {
+        guard let target = NavigationPolicy.reloadTarget(
+            keyWindowWebView: navigationPolicy.popupWebView(in: NSApp.keyWindow),
+            selectedTab: selectedTab()
+        ) else { return }
+
+        navigationPolicy.reload(target.webView, baseURL: target.baseURL)
+    }
+
+    /// The selected tab's web view together with the entry point to fall back
+    /// to when it never loaded a page.
+    private func selectedTab() -> (webView: WKWebView, baseURL: URL)? {
         guard
             let selection = windowController?.selection,
             let webView = sessions[selection.accountId]?.webView(for: selection.view)
-        else { return }
-
-        navigationPolicy.clearCrashThrottle(for: webView)
-        if webView.url == nil {
-            webView.load(URLRequest(url: selection.view.url))
-        } else {
-            webView.reload()
-        }
+        else { return nil }
+        return (webView, selection.view.url)
     }
 
     // MARK: - NotificationRouting

@@ -798,15 +798,78 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         webView.reload()
     }
 
+    /// How a webview is actually brought back — which is not always `reload()`.
+    enum Recovery: Equatable {
+        /// The webview has a page. Reloading it is the retry.
+        case reload
+        /// It never got one. `reload()` on a webview whose `url` is `nil` does
+        /// nothing at all, so the tab that crashed on its very first load — the
+        /// only tab that reaches the throttle before committing anything —
+        /// stayed blank while the one recovery it gets was consumed. Re-navigate
+        /// to the view's own entry point instead, the same way the initial load
+        /// does.
+        case load(URL)
+        /// No page and nowhere to go. Nothing may be consumed for this.
+        case impossible
+    }
+
+    /// Pure, so the "reload() on a blank webview" rule is covered by a test
+    /// rather than by a webview that has to crash first.
+    static func recovery(currentURL: URL?, baseURL: URL?) -> Recovery {
+        if currentURL != nil { return .reload }
+        guard let baseURL else { return .impossible }
+        return .load(baseURL)
+    }
+
+    /// Which web view ⌘R acts on: the key window's own, whatever that window
+    /// is. A popup brings its own web view and has no entry point to fall back
+    /// to; the main window's is the selected tab's, which does.
+    ///
+    /// Generic over the web view so the routing rule is testable without
+    /// standing up WebKit.
+    static func reloadTarget<View: AnyObject>(
+        keyWindowWebView: View?,
+        selectedTab: (webView: View, baseURL: URL)?
+    ) -> (webView: View, baseURL: URL?)? {
+        if let keyWindowWebView { return (keyWindowWebView, nil) }
+        guard let selectedTab else { return nil }
+        return (selectedTab.webView, selectedTab.baseURL)
+    }
+
     /// Gives a webview the throttle gave up on another chance, and says whether
     /// there was anything to recover. Driven by the user bringing the tab up,
     /// so the retry rate is bounded by them rather than by the crashing page.
+    ///
+    /// `baseURL` is the view's own entry point, needed because a webview that
+    /// crashed before committing anything has no URL to reload.
     @discardableResult
-    func recoverIfStalled(_ webView: WKWebView) -> Bool {
-        guard stalled.remove(webView) else { return false }
+    func recoverIfStalled(_ webView: WKWebView, baseURL: URL?) -> Bool {
+        guard stalled.contains(webView) else { return false }
+
+        let action = Self.recovery(currentURL: webView.url, baseURL: baseURL)
+        // The stall token is the tab's one way back. Spending it on a recovery
+        // that cannot happen leaves the tab blank for the rest of the session.
+        guard action != .impossible else { return false }
+
+        stalled.remove(webView)
         crashThrottle.forget(ObjectIdentifier(webView))
-        webView.reload()
+        perform(action, on: webView)
         return true
+    }
+
+    /// Reloads a webview the user asked for by hand, re-navigating rather than
+    /// calling `reload()` on one that never loaded a page.
+    func reload(_ webView: WKWebView, baseURL: URL?) {
+        clearCrashThrottle(for: webView)
+        perform(Self.recovery(currentURL: webView.url, baseURL: baseURL), on: webView)
+    }
+
+    private func perform(_ action: Recovery, on webView: WKWebView) {
+        switch action {
+        case .reload: webView.reload()
+        case .load(let url): webView.load(URLRequest(url: url))
+        case .impossible: break
+        }
     }
 
     /// Wipes the crash record for a webview the user has explicitly reloaded,
@@ -980,6 +1043,17 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             popupWindows[key] = nil
             dismiss(popup.window)
         }
+    }
+
+    /// The web view a popup window of ours is hosting, if this is one of ours.
+    ///
+    /// ⌘R needs it: routing "Reload Tab" through the main window's selected tab
+    /// meant a Docs, print or sign-in popup could never be reloaded, and
+    /// pressing ⌘R while one was focused silently reloaded a window the user
+    /// was not even looking at.
+    func popupWebView(in window: NSWindow?) -> WKWebView? {
+        guard let window, popupWindows.values.contains(where: { $0.window === window }) else { return nil }
+        return window.contentView as? WKWebView
     }
 
     private func closePopup(hosting webView: WKWebView) {
