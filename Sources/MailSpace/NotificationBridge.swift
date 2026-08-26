@@ -2,6 +2,23 @@ import AppKit
 import UserNotifications
 import WebKit
 
+/// The account-aware parts of a web notification, kept pure so they can be
+/// tested without a notification centre.
+enum NotificationContent {
+    /// A notification with neither title nor body still has to identify itself,
+    /// so the account name is the floor.
+    static func title(payloadTitle: String, accountName: String) -> String {
+        payloadTitle.isEmpty ? accountName : payloadTitle
+    }
+
+    /// Web `tag` semantics are replace-not-stack. Scoping the tag by account
+    /// keeps two accounts' identically tagged notifications apart, while an
+    /// untagged notification gets a fresh identity and replaces nothing.
+    static func identifier(tag: String, accountId: UUID) -> String {
+        tag.isEmpty ? UUID().uuidString : "\(accountId.uuidString)|\(tag)"
+    }
+}
+
 /// Where a clicked notification should take the user.
 protocol NotificationRouting: AnyObject {
     func focusAccount(_ accountId: UUID, view: AccountView)
@@ -65,9 +82,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         guard let center else { return }
 
         let content = UNMutableNotificationContent()
-        // A notification with neither title nor body still has to identify
-        // itself, so the account name is the floor.
-        content.title = title.isEmpty ? account.name : title
+        content.title = NotificationContent.title(payloadTitle: title, accountName: account.name)
         // userInfo only routes the click; the subtitle is what actually tells
         // the user which account the notification came from.
         content.subtitle = account.name
@@ -78,11 +93,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             InfoKey.view: view.rawValue
         ]
 
-        // Web `tag` semantics are replace-not-stack. Scope it by account so two
-        // accounts' identically tagged notifications stay separate.
-        let identifier = tag.isEmpty
-            ? UUID().uuidString
-            : "\(account.id.uuidString)|\(tag)"
+        let identifier = NotificationContent.identifier(tag: tag, accountId: account.id)
 
         center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
             if let error {
