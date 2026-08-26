@@ -67,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         notificationBridge.start()
         unreadPoller.start()
+        sweepOrphanedDataStores()
         if let pending = pendingMailto {
             pendingMailto = nil
             openMailto(pending)
@@ -155,10 +156,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         // Ordering matters twice over. `forget` goes first so a poll still in
         // flight cannot write a stale count back after the account is gone. And
         // WebKit refuses to delete a data store anything still references, so
-        // every webview on it — the account's popup windows included — has to
-        // be gone before `destroyDataStore`.
+        // every webview on it — the account's popup windows included — and
+        // every download running on it has to be gone before `destroyDataStore`.
         unreadPoller.forget(accountId: id)
         navigationPolicy.closePopups(for: id)
+        navigationPolicy.cancelDownloads(for: id)
         // Scoped on purpose: detaching is not enough, the session object itself
         // has to die, because its configuration holds the data store for its
         // whole lifetime. Measured — with the session still in scope every
@@ -175,6 +177,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         WebViewFactory.destroyDataStore(for: id) { error in
             guard let error else { return }
             Self.reportDataStoreRemovalFailure(name: name, error: error)
+        }
+    }
+
+    /// Stored sessions no account claims any more.
+    ///
+    /// Account removal can fail — a download still running, a popup that would
+    /// not go — and nothing ever came back for what it left behind. The whole
+    /// Google session for a deleted account then sits on disk indefinitely,
+    /// which is the one thing the removal dialog promises will not happen.
+    ///
+    /// Pure so the "delete exactly what no account claims" rule is a test
+    /// rather than a filesystem experiment.
+    static func orphanedStores(onDisk: [UUID], claimedBy accounts: [Account]) -> [UUID] {
+        let claimed = Set(accounts.map(\.id))
+        return onDisk.filter { !claimed.contains($0) }
+    }
+
+    /// Deletes those at launch.
+    ///
+    /// `fetchAllDataStoreIdentifiers` is what makes this safe to do at all: it
+    /// reports only stores that actually exist, and `remove(forIdentifier:)`
+    /// segfaults on an identifier with nothing on disk.
+    ///
+    /// It is skipped whenever `accounts.json` did not read cleanly. A file that
+    /// failed to parse leaves an empty account list, and sweeping against that
+    /// would delete every session on the Mac — the exact opposite of a repair.
+    private func sweepOrphanedDataStores() {
+        guard accountStore.didLoadCleanly else {
+            Log.error("skipping the orphaned-session sweep: accounts.json did not read cleanly")
+            return
+        }
+
+        let accounts = accountStore.accounts
+        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { identifiers in
+            for orphan in Self.orphanedStores(onDisk: identifiers, claimedBy: accounts) {
+                WebViewFactory.destroyDataStore(for: orphan) { error in
+                    guard let error else { return }
+                    Log.error("orphaned session \(orphan) could not be removed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 

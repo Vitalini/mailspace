@@ -604,7 +604,16 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         let accountId: UUID?
     }
 
+    /// One in-flight download, and the account whose data store it is running
+    /// on. WebKit refuses to delete a store anything still holds, and a
+    /// download holds one just as firmly as a webview does.
+    private struct ActiveDownload {
+        let download: WKDownload
+        let accountId: UUID?
+    }
+
     private var popupWindows: [ObjectIdentifier: Popup] = [:]
+    private var downloads: [ObjectIdentifier: ActiveDownload] = [:]
     private var crashThrottle = CrashThrottle()
     /// Webviews that have been through a sign-in step. Landing on an app
     /// surface only means "signed in" for these — Gmail's own print and
@@ -696,11 +705,21 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        download.delegate = self
+        adopt(download, from: webView)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        adopt(download, from: webView)
+    }
+
+    /// Takes the download over *and* remembers whose data store it is running
+    /// on, so removing that account can stop it.
+    private func adopt(_ download: WKDownload, from webView: WKWebView) {
         download.delegate = self
+        downloads[ObjectIdentifier(download)] = ActiveDownload(
+            download: download,
+            accountId: webView.configuration.websiteDataStore.identifier
+        )
     }
 
     /// Keeps the webview's sign-in provenance in step with what it just landed
@@ -1011,7 +1030,26 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         completionHandler(LinkRouter.uniqueDestination(in: directory, filename: suggestedFilename))
     }
 
+    func downloadDidFinish(_ download: WKDownload) {
+        downloads[ObjectIdentifier(download)] = nil
+    }
+
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        downloads[ObjectIdentifier(download)] = nil
         Log.error("download failed: \(error.localizedDescription)")
+    }
+
+    /// Cancels every download still running on this account's data store.
+    ///
+    /// A download in flight holds the store exactly as a webview does, and
+    /// nothing used to take it down: "click a Gmail attachment, then remove the
+    /// account" deleted the account row while `remove(forIdentifier:)` kept
+    /// failing, so the Google session stayed on disk — under a dialog that had
+    /// just promised it was deleted.
+    func cancelDownloads(for accountId: UUID) {
+        for (key, active) in downloads where active.accountId == accountId {
+            downloads[key] = nil
+            active.download.cancel { _ in }
+        }
     }
 }
