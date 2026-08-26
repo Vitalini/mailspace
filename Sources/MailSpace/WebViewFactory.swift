@@ -20,7 +20,8 @@ enum WebViewFactory {
     static func makeConfiguration(
         dataStoreIdentifier: UUID,
         userScripts: [WKUserScript] = [],
-        messageHandlers: [String: WKScriptMessageHandler] = [:]
+        messageHandlers: [String: WKScriptMessageHandler] = [:],
+        replyHandlers: [String: WKScriptMessageHandlerWithReply] = [:]
     ) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: dataStoreIdentifier)
@@ -31,6 +32,9 @@ enum WebViewFactory {
         let controller = WKUserContentController()
         for (name, handler) in messageHandlers {
             controller.add(handler, name: name)
+        }
+        for (name, handler) in replyHandlers {
+            controller.addScriptMessageHandler(handler, contentWorld: .page, name: name)
         }
         for script in userScripts {
             controller.addUserScript(script)

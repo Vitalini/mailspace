@@ -36,12 +36,45 @@ final class AccountStore {
     // MARK: - Mutations
 
     @discardableResult
-    func add(name: String) -> Account {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let account = Account(name: trimmed.isEmpty ? "Account \(accounts.count + 1)" : trimmed)
+    func add(name: String, email: String = "", mailEnabled: Bool = true, calendarEnabled: Bool = true) -> Account {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = trimmedEmail.isEmpty ? "Account \(accounts.count + 1)" : trimmedEmail
+        let account = Account(
+            name: trimmedName.isEmpty ? fallback : trimmedName,
+            email: trimmedEmail,
+            mailEnabled: mailEnabled,
+            calendarEnabled: calendarEnabled,
+            lastView: mailEnabled ? .mail : .calendar
+        )
         accounts.append(account)
         save()
         return account
+    }
+
+    /// Applies an edit from the account dialog. Returns the updated account.
+    @discardableResult
+    func update(id: UUID, name: String, email: String, mailEnabled: Bool, calendarEnabled: Bool) -> Account? {
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else { return nil }
+        let existing = accounts[index]
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var updated = Account(
+            id: existing.id,
+            name: trimmedName.isEmpty ? (trimmedEmail.isEmpty ? existing.name : trimmedEmail) : trimmedName,
+            email: trimmedEmail,
+            mailEnabled: mailEnabled,
+            calendarEnabled: calendarEnabled,
+            lastView: existing.lastView
+        )
+        // Never leave the account pointing at a service it no longer offers.
+        if !updated.isEnabled(updated.lastView), let fallback = updated.enabledViews.first {
+            updated.lastView = fallback
+        }
+        accounts[index] = updated
+        save()
+        return updated
     }
 
     func remove(id: UUID) {
@@ -58,7 +91,10 @@ final class AccountStore {
     }
 
     func setLastView(_ view: AccountView, for id: UUID) {
-        guard let index = accounts.firstIndex(where: { $0.id == id }), accounts[index].lastView != view else { return }
+        guard let index = accounts.firstIndex(where: { $0.id == id }),
+              accounts[index].lastView != view,
+              accounts[index].isEnabled(view)
+        else { return }
         accounts[index].lastView = view
         save()
     }

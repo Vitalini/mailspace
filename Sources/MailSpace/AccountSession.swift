@@ -1,68 +1,97 @@
 import WebKit
 
-/// One account's live browser session: an isolated `WKWebsiteDataStore` plus
-/// the Mail and Calendar webviews built on top of it.
+/// Resolves a live webview back to the account that owns it. Implemented by
+/// the app delegate; used by the autofill, notification and polling layers.
+protocol SessionLocating: AnyObject {
+    func session(hosting webView: WKWebView) -> AccountSession?
+    func account(for accountId: UUID) -> Account?
+}
+
+/// One account's live browser session: an isolated `WKWebsiteDataStore` plus a
+/// webview for each service the account has enabled.
 ///
-/// Both webviews are created and loaded eagerly at launch and kept alive for
-/// the process lifetime (KTD8). A background account has to keep receiving web
+/// Webviews are created and loaded eagerly and kept alive for the process
+/// lifetime (KTD8). A background account has to keep receiving web
 /// notifications and answering unread-feed polls, so switching accounts swaps
-/// retained views rather than creating or reloading them.
+/// retained views rather than creating or reloading them. A service the
+/// account has switched off gets no webview at all — and therefore no
+/// notifications and no feed polling.
 final class AccountSession {
     let accountId: UUID
     private(set) var displayName: String
 
     private let configuration: WKWebViewConfiguration
-    let mailWebView: WKWebView
-    let calendarWebView: WKWebView
+    private var views: [AccountView: WKWebView] = [:]
+    private weak var delegate: (NSObject & WKNavigationDelegate & WKUIDelegate)?
 
     init(
         account: Account,
         userScripts: [WKUserScript] = [],
-        messageHandlers: [String: WKScriptMessageHandler] = [:]
+        messageHandlers: [String: WKScriptMessageHandler] = [:],
+        replyHandlers: [String: WKScriptMessageHandlerWithReply] = [:]
     ) {
         self.accountId = account.id
         self.displayName = account.name
         self.configuration = WebViewFactory.makeConfiguration(
             dataStoreIdentifier: account.id,
             userScripts: userScripts,
-            messageHandlers: messageHandlers
+            messageHandlers: messageHandlers,
+            replyHandlers: replyHandlers
         )
-        self.mailWebView = WebViewFactory.makeWebView(configuration: configuration)
-        self.calendarWebView = WebViewFactory.makeWebView(configuration: configuration)
+        syncEnabledViews(with: account)
     }
 
-    var webViews: [WKWebView] { [mailWebView, calendarWebView] }
+    var webViews: [WKWebView] { AccountView.allCases.compactMap { views[$0] } }
 
-    func webView(for view: AccountView) -> WKWebView {
-        switch view {
-        case .mail: return mailWebView
-        case .calendar: return calendarWebView
-        }
+    var enabledViews: [AccountView] { AccountView.allCases.filter { views[$0] != nil } }
+
+    func webView(for view: AccountView) -> WKWebView? {
+        views[view]
     }
 
     func view(for webView: WKWebView) -> AccountView? {
-        if webView === mailWebView { return .mail }
-        if webView === calendarWebView { return .calendar }
-        return nil
+        views.first { $0.value === webView }?.key
     }
 
-    func setDelegates<D: WKNavigationDelegate & WKUIDelegate>(_ delegate: D) {
+    func hosts(_ webView: WKWebView) -> Bool {
+        views.values.contains { $0 === webView }
+    }
+
+    func setDelegates<D: NSObject & WKNavigationDelegate & WKUIDelegate>(_ delegate: D) {
+        self.delegate = delegate
         for webView in webViews {
             webView.navigationDelegate = delegate
             webView.uiDelegate = delegate
         }
     }
 
-    func rename(to name: String) {
-        displayName = name
+    /// Brings the live webviews in line with the account's current settings:
+    /// creates one for a newly enabled service and tears down a disabled one.
+    func syncEnabledViews(with account: Account) {
+        displayName = account.name
+
+        for view in AccountView.allCases {
+            switch (account.isEnabled(view), views[view]) {
+            case (true, nil):
+                let webView = WebViewFactory.makeWebView(configuration: configuration)
+                if let delegate {
+                    webView.navigationDelegate = delegate
+                    webView.uiDelegate = delegate
+                }
+                views[view] = webView
+            case (false, .some(let webView)):
+                teardown(webView)
+                views[view] = nil
+            default:
+                break
+            }
+        }
     }
 
-    /// Kicks off the initial load of both views. Safe to call more than once —
-    /// a webview that already has a URL is left alone.
+    /// Kicks off the initial load of every enabled view. Safe to call more than
+    /// once — a webview that already has a URL is left alone.
     func loadIfNeeded() {
-        for view in AccountView.allCases {
-            let webView = self.webView(for: view)
-            guard webView.url == nil else { continue }
+        for (view, webView) in views where webView.url == nil {
             webView.load(URLRequest(url: view.url))
         }
     }
@@ -73,13 +102,18 @@ final class AccountSession {
     /// first.
     func detach() {
         for webView in webViews {
-            webView.stopLoading()
-            webView.navigationDelegate = nil
-            webView.uiDelegate = nil
-            webView.removeFromSuperview()
-            webView.loadHTMLString("", baseURL: nil)
+            teardown(webView)
         }
+        views.removeAll()
         configuration.userContentController.removeAllUserScripts()
         configuration.userContentController.removeAllScriptMessageHandlers()
+    }
+
+    private func teardown(_ webView: WKWebView) {
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        webView.removeFromSuperview()
+        webView.loadHTMLString("", baseURL: nil)
     }
 }

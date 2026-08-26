@@ -1,16 +1,18 @@
 import AppKit
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
+final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating {
     let accountStore = AccountStore()
 
     private let navigationPolicy = NavigationPolicy()
+    private let loginAutofill = LoginAutofill()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private var loginProbe: LoginProbe?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.build()
+        loginAutofill.locator = self
 
         if SelfTest.mode == .login {
             loginProbe = LoginProbe()
@@ -57,6 +59,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
         addAccount(nil)
     }
 
+    func requestEditAccount(id: UUID) {
+        guard let account = accountStore.account(id: id), let edit = AccountEditor.run(editing: account) else { return }
+
+        let previousEmail = account.email
+        guard let updated = accountStore.update(
+            id: id,
+            name: edit.name,
+            email: edit.email,
+            mailEnabled: edit.mailEnabled,
+            calendarEnabled: edit.calendarEnabled
+        ) else { return }
+
+        // A renamed address leaves its Keychain item behind; move it with the
+        // account rather than orphaning it.
+        if previousEmail != updated.email, !previousEmail.isEmpty {
+            if edit.password == nil, let carried = KeychainStore.password(for: previousEmail) {
+                KeychainStore.setPassword(carried, for: updated.email)
+            }
+            KeychainStore.deletePassword(for: previousEmail)
+        }
+        applyPasswordEdit(edit, for: updated)
+
+        sessions[id]?.syncEnabledViews(with: updated)
+        sessions[id]?.loadIfNeeded()
+        windowController?.refresh()
+    }
+
     func requestRemoveAccount(id: UUID) {
         guard let account = accountStore.account(id: id) else { return }
 
@@ -73,17 +102,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
         let session = sessions.removeValue(forKey: id)
         session?.detach()
         accountStore.remove(id: id)
+        KeychainStore.deletePassword(for: account.email)
         windowController?.refresh()
         WebViewFactory.destroyDataStore(for: id)
+    }
+
+    // MARK: - SessionLocating
+
+    func session(hosting webView: WKWebView) -> AccountSession? {
+        sessions.values.first { $0.hosts(webView) }
+    }
+
+    func account(for accountId: UUID) -> Account? {
+        accountStore.account(id: accountId)
     }
 
     // MARK: - Menu actions
 
     @objc func addAccount(_ sender: Any?) {
-        guard let name = AccountNamePrompt.run() else { return }
-        let account = accountStore.add(name: name)
+        guard let edit = AccountEditor.run() else { return }
+        let account = accountStore.add(
+            name: edit.name,
+            email: edit.email,
+            mailEnabled: edit.mailEnabled,
+            calendarEnabled: edit.calendarEnabled
+        )
+        applyPasswordEdit(edit, for: account)
         makeSession(for: account)
-        windowController?.select(accountId: account.id, view: .mail)
+        if let view = account.effectiveView {
+            windowController?.select(accountId: account.id, view: view)
+        }
     }
 
     @objc func showMailView(_ sender: Any?) {
@@ -98,33 +146,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
 
     @discardableResult
     private func makeSession(for account: Account) -> AccountSession {
-        let session = AccountSession(account: account)
+        let session = AccountSession(
+            account: account,
+            userScripts: [LoginAutofill.userScript],
+            replyHandlers: [LoginAutofill.handlerName: loginAutofill]
+        )
         session.setDelegates(navigationPolicy)
         session.loadIfNeeded()
         sessions[account.id] = session
         return session
     }
-}
 
-// MARK: - Add-account prompt
-
-enum AccountNamePrompt {
-    /// Modal name prompt for a new account. Returns nil when cancelled or blank.
-    static func run() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Add Account"
-        alert.informativeText = "Name this account (for example “Work” or “Personal”). You will sign in to Google in the account's Mail view."
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.placeholderString = "Work"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? nil : name
+    /// Writes the dialog's password decision through to the Keychain. The
+    /// password never reaches `accounts.json` or any log.
+    private func applyPasswordEdit(_ edit: AccountEditor.Result, for account: Account) {
+        guard !account.email.isEmpty else { return }
+        if edit.clearPassword {
+            KeychainStore.deletePassword(for: account.email)
+        }
+        if let password = edit.password {
+            KeychainStore.setPassword(password, for: account.email)
+        }
     }
 }
 
