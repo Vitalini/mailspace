@@ -21,6 +21,15 @@ final class AccountStore {
 
     private(set) var accounts: [Account] = []
 
+    /// False when `accounts.json` was there but could not be read in full —
+    /// unparseable outright, or with a record skipped.
+    ///
+    /// `accounts` is then not the whole list, and anything that treats it as
+    /// the whole list does damage: the launch sweep would read "no account
+    /// claims this session" and delete a session that is very much claimed.
+    /// A first run, with no file at all, is clean.
+    private(set) var didLoadCleanly = true
+
     static var defaultDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
@@ -150,9 +159,11 @@ final class AccountStore {
             // otherwise fail the whole array, and the next save would make the
             // loss of every account permanent.
             let records = try JSONDecoder().decode([LenientRecord].self, from: data)
-            for failure in records.compactMap(\.failure) {
+            let failures = records.compactMap(\.failure)
+            for failure in failures {
                 Log.error("skipping unreadable account in \(fileURL.path): \(failure)")
             }
+            didLoadCleanly = failures.isEmpty
             accounts = records.compactMap(\.account)
             backfillColors()
             backfillTabOrder()
@@ -160,6 +171,7 @@ final class AccountStore {
             // A corrupt or hand-edited file must never block launch: start
             // empty and let the next save rewrite it.
             Log.error("could not read \(fileURL.path): \(error)")
+            didLoadCleanly = false
             accounts = []
         }
     }
