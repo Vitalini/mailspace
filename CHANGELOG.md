@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-08-26
+
 ### Added
 - Accounts can be added, edited and removed from Settings ▸ Accounts, without
   hunting for the right-click menu on a tab. Removing one still asks first, now
