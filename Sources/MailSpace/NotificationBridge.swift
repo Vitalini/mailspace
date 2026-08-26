@@ -19,6 +19,49 @@ enum NotificationContent {
     }
 }
 
+/// Which frames may raise a native notification.
+///
+/// Unlike the autofill handler, the shim cannot hide in its own content world:
+/// it replaces `window.Notification` and
+/// `ServiceWorkerRegistration.prototype.showNotification`, which only works in
+/// the page's own world, and a page-world script can only reach a page-world
+/// handler. So `window.webkit.messageHandlers.mailspaceNotify` is reachable
+/// from any script in any frame of any page an account webview loads, and the
+/// origin check *is* the boundary: without it a third-party frame — an ad, an
+/// embed, anything reached through a link — could put native macOS banners on
+/// screen carrying the user's account name.
+enum NotificationOrigin {
+    /// The hosts each view's real notifications come from.
+    static func hosts(for view: AccountView) -> Set<String> {
+        switch view {
+        case .mail: return ["mail.google.com", "mail.googlemail.com"]
+        case .calendar: return ["calendar.google.com"]
+        }
+    }
+
+    /// Top frame, https, one of the view's own hosts. Gmail's and Calendar's
+    /// notifications are raised by the page itself and by the service-worker
+    /// registration the page holds, both in the main frame.
+    static func isTrusted(scheme: String, host: String, port: Int, isMainFrame: Bool, view: AccountView) -> Bool {
+        guard isMainFrame else { return false }
+        guard scheme.lowercased() == "https" else { return false }
+        // WebKit reports 0 for a scheme's own default port.
+        guard port == 0 || port == 443 else { return false }
+        return hosts(for: view).contains(host.lowercased())
+    }
+
+    static func isTrusted(_ frame: WKFrameInfo, view: AccountView) -> Bool {
+        let origin = frame.securityOrigin
+        return isTrusted(
+            scheme: origin.protocol,
+            host: origin.host,
+            port: origin.port,
+            isMainFrame: frame.isMainFrame,
+            view: view
+        )
+    }
+}
+
 /// Where a clicked notification should take the user.
 protocol NotificationRouting: AnyObject {
     func focusAccount(_ accountId: UUID, view: AccountView)
@@ -66,6 +109,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             let webView = message.webView,
             let session = locator?.session(hosting: webView),
             let view = session.view(for: webView),
+            NotificationOrigin.isTrusted(message.frameInfo, view: view),
             let account = locator?.account(for: session.accountId)
         else { return }
 
