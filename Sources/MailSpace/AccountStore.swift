@@ -130,7 +130,15 @@ final class AccountStore {
             return
         }
         do {
-            accounts = try JSONDecoder().decode([Account].self, from: data)
+            // Decoding per record rather than as `[Account]`: one hand-edited
+            // entry with an unknown enum value (`"lastView":"notes"`) would
+            // otherwise fail the whole array, and the next save would make the
+            // loss of every account permanent.
+            let records = try JSONDecoder().decode([LenientRecord].self, from: data)
+            for failure in records.compactMap(\.failure) {
+                Log.error("skipping unreadable account in \(fileURL.path): \(failure)")
+            }
+            accounts = records.compactMap(\.account)
             backfillColors()
             backfillTabOrder()
         } catch {
@@ -138,6 +146,24 @@ final class AccountStore {
             // empty and let the next save rewrite it.
             Log.error("could not read \(fileURL.path): \(error)")
             accounts = []
+        }
+    }
+
+    /// One element of `accounts.json`: either a decoded account, or the reason
+    /// that record could not be read. Decoding never throws, so a single bad
+    /// entry costs only itself.
+    private struct LenientRecord: Decodable {
+        let account: Account?
+        let failure: String?
+
+        init(from decoder: Decoder) throws {
+            do {
+                account = try Account(from: decoder)
+                failure = nil
+            } catch {
+                account = nil
+                failure = "\(error)"
+            }
         }
     }
 

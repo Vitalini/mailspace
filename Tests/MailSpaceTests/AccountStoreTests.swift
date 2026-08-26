@@ -89,6 +89,30 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(store.accounts.first?.lastView, .mail)
     }
 
+    /// One hand-edited record must not take the whole file with it: decoding
+    /// `[Account]` in one go used to throw on the first bad enum value, empty
+    /// the store, and make the loss permanent on the next save.
+    func testOneUnreadableRecordDoesNotDropTheOthers() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let work = UUID()
+        let broken = UUID()
+        let personal = UUID()
+        let json = """
+        [{"id":"\(work.uuidString)","name":"Work","lastView":"mail","color":"blue"},
+         {"id":"\(broken.uuidString)","name":"Broken","lastView":"notes","color":"chartreuse"},
+         {"id":"\(personal.uuidString)","name":"Personal","lastView":"calendar","color":"green"}]
+        """
+        try Data(json.utf8).write(to: accountsFile)
+
+        let store = AccountStore(directory: directory)
+        XCTAssertEqual(store.accounts.map(\.id), [work, personal])
+        XCTAssertEqual(store.accounts.map(\.name), ["Work", "Personal"])
+        XCTAssertNil(store.account(id: broken))
+
+        // And the survivors are still there after the rewrite.
+        XCTAssertEqual(AccountStore(directory: directory).accounts.map(\.id), [work, personal])
+    }
+
     func testRemovingUnknownIdIsANoOp() {
         let store = AccountStore(directory: directory)
         let work = store.add(name: "Work")
