@@ -7,8 +7,14 @@ import Foundation
 /// (see `AccountSession`). Sidebar order is creation order; v1 has no
 /// reordering.
 final class AccountStore {
-    private static let folderName = "MailSpace"
     private static let fileName = "accounts.json"
+
+    /// The throwaway self-test identity keeps its own account list, so a probe
+    /// can boot the whole app without reading — or rewriting — the accounts,
+    /// colours and tab order of the app the user actually runs.
+    static func folderName(isSelfTest: Bool) -> String {
+        isSelfTest ? "MailSpace-SelfTest" : "MailSpace"
+    }
 
     private let directory: URL
     private let fileURL: URL
@@ -18,7 +24,10 @@ final class AccountStore {
     static var defaultDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent(folderName, isDirectory: true)
+        return base.appendingPathComponent(
+            folderName(isSelfTest: SelfTest.isSelfTestBundle),
+            isDirectory: true
+        )
     }
 
     init(directory: URL = AccountStore.defaultDirectory) {

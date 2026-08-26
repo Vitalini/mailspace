@@ -12,7 +12,17 @@ import Security
 /// of the user's real MailSpace items; the app always goes through `shared`.
 struct KeychainStore {
     static let defaultService = "MailSpace"
-    static let shared = KeychainStore()
+    /// The throwaway self-test identity gets its own service name: a probe can
+    /// never read, overwrite or delete one of the user's real Google passwords,
+    /// and never trips a Keychain access dialog by reaching for an item another
+    /// bundle created.
+    static let selfTestService = "MailSpace SelfTest"
+
+    static func service(isSelfTest: Bool) -> String {
+        isSelfTest ? selfTestService : defaultService
+    }
+
+    static let shared = KeychainStore(service: service(isSelfTest: SelfTest.isSelfTestBundle))
 
     let service: String
 

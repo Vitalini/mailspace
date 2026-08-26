@@ -18,6 +18,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var pendingMailto: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A self-test never runs as the app the user relies on. Its probes talk
+        // to UNUserNotificationCenter, and an unattended run has nobody to
+        // answer a permission prompt — macOS treats that silence as a denial.
+        // `make smoke` assembles the same binary under the throwaway identity;
+        // anything else is refused here, before a single probe starts.
+        if SelfTest.isEnabled, !SelfTest.isSelfTestBundle {
+            SelfTest.refuse(
+                "\(SelfTest.mode?.rawValue ?? "unknown") result=REFUSED "
+                + "reason=self-test-must-run-under-the-throwaway-bundle "
+                + "bundle=\(Bundle.main.bundleIdentifier ?? "none") expected=\(SelfTest.bundleIdentifier) "
+                + "hint=run-make-smoke-which-builds-build/MailSpace-SelfTest.app"
+            )
+        }
+
         NSApp.mainMenu = MainMenu.build()
         loginAutofill.locator = self
         navigationPolicy.mailtoHandler = { [weak self] url in self?.openMailto(url) }

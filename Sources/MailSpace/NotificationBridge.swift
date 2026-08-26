@@ -89,14 +89,51 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         return UNUserNotificationCenter.current()
     }
 
+    /// What `start()` is allowed to ask the system for, decided by the identity
+    /// the process is running under. This is the single place a permission
+    /// prompt can come from, and it is why an automated run cannot raise one:
+    ///
+    /// * the throwaway self-test bundle asks **provisionally** — macOS grants
+    ///   that silently, delivers the notifications quietly to Notification
+    ///   Center (so a probe can still read them back) and never draws a prompt;
+    /// * a self-test running under any other identity asks for **nothing**, so
+    ///   even a hand-run `MAILSPACE_SELFTEST=… build/MailSpace.app/…` cannot put
+    ///   an unanswerable prompt on screen for the real app;
+    /// * the real app, launched by the user, asks the normal interactive way.
+    ///
+    /// - Returns: the options to request, or `nil` to not ask at all.
+    static func authorizationOptions(
+        bundleIdentifier: String?,
+        selfTestActive: Bool
+    ) -> UNAuthorizationOptions? {
+        if SelfTest.isSelfTestBundle(bundleIdentifier) { return [.provisional, .alert, .sound, .badge] }
+        if selfTestActive { return nil }
+        return [.alert, .sound, .badge]
+    }
+
     /// Registers as the notification delegate and asks for permission once.
-    func start() {
-        guard let center else { return }
+    /// The completion reports whether the process ended up authorized, so a
+    /// caller that is about to post a notification can wait for the answer
+    /// instead of racing it.
+    func start(completion: ((Bool) -> Void)? = nil) {
+        guard let center else {
+            completion?(false)
+            return
+        }
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
+        guard let options = Self.authorizationOptions(
+            bundleIdentifier: Bundle.main.bundleIdentifier,
+            selfTestActive: SelfTest.isEnabled
+        ) else {
+            Log.error("notification authorization not requested: self-test running outside \(SelfTest.bundleIdentifier)")
+            completion?(false)
+            return
+        }
+        center.requestAuthorization(options: options) { granted, error in
             if let error {
                 Log.error("notification authorization failed: \(error.localizedDescription)")
             }
+            completion?(granted)
         }
     }
 

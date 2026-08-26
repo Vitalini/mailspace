@@ -1,15 +1,34 @@
 #!/bin/bash
 # Packaging + launch smoke test for the assembled MailSpace.app.
-# Usage: scripts/smoke.sh [path/to/MailSpace.app]
+#
+# Usage: scripts/smoke.sh [path/to/MailSpace.app] [path/to/MailSpace-SelfTest.app]
+#
+# Two bundles, on purpose. The real app is only ever *inspected on disk* here:
+# its layout, Info.plist, icon and signature. Everything that actually launches
+# a process — the headless probes and the launch check — runs the throwaway
+# self-test bundle, which carries its own bundle identifier.
+#
+# The reason is a real incident: this script used to launch the real app, macOS
+# raised the notification permission prompt, the run exited five seconds later
+# without answering it, and macOS recorded the silence as a denial. The user
+# lost banners in the app he was using. No repository command may be able to do
+# that again, so no repository command launches com.vitalii.MailSpace.
 set -uo pipefail
 
 APP="${1:-build/MailSpace.app}"
+SELFTEST_APP="${2:-build/MailSpace-SelfTest.app}"
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
-BIN="$APP_ABS/Contents/MacOS/MailSpace"
+SELFTEST_ABS="$(cd "$(dirname "$SELFTEST_APP")" && pwd)/$(basename "$SELFTEST_APP")"
+BIN="$SELFTEST_ABS/Contents/MacOS/MailSpace"
+REAL_BUNDLE_ID="com.vitalii.MailSpace"
+SELFTEST_BUNDLE_ID="com.vitalii.MailSpace.SelfTest"
 FAILED=0
 
 pass() { echo "  ok   $*"; }
 fail() { echo "  FAIL $*"; FAILED=1; }
+skip() { echo "  SKIP $*"; }
+
+plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
 
 # Runs a command under a wall-clock limit so a hung self-check cannot block the
 # script forever. Uses coreutils `timeout` when it is installed (it is not part
@@ -40,7 +59,19 @@ kill_existing_instances() {
   return 0
 }
 
-echo "smoke: checking $APP_ABS"
+echo "smoke: app       $APP_ABS"
+echo "smoke: self-test $SELFTEST_ABS"
+
+# 0. The whole safety property of this script: the probes run under a bundle
+#    identifier that is not the user's. If that is not true, run nothing.
+SELFTEST_ID="$(plist_value "$SELFTEST_ABS" CFBundleIdentifier)"
+if [ "$SELFTEST_ID" != "$SELFTEST_BUNDLE_ID" ]; then
+  echo "  FAIL self-test bundle identifier is \"$SELFTEST_ID\", expected \"$SELFTEST_BUNDLE_ID\""
+  echo "smoke: refusing to launch anything — run 'make selftest-app' first."
+  echo "smoke: FAIL"
+  exit 1
+fi
+pass "self-test bundle identifier is $SELFTEST_ID"
 
 # 1. Bundle layout
 for path in \
@@ -52,7 +83,7 @@ do
   if [ -f "$path" ]; then pass "exists ${path#$APP_ABS/}"; else fail "missing ${path#$APP_ABS/}"; fi
 done
 
-if [ -x "$BIN" ]; then pass "executable bit on Contents/MacOS/MailSpace"; else fail "Contents/MacOS/MailSpace not executable"; fi
+if [ -x "$APP_ABS/Contents/MacOS/MailSpace" ]; then pass "executable bit on Contents/MacOS/MailSpace"; else fail "Contents/MacOS/MailSpace not executable"; fi
 
 # 2. Info.plist lints and carries the keys the app depends on
 if plutil -lint "$APP_ABS/Contents/Info.plist" >/dev/null 2>&1; then
@@ -69,6 +100,45 @@ for key in CFBundleIdentifier CFBundleExecutable CFBundleIconFile NSPrincipalCla
   fi
 done
 
+# 2b. The real identifier is load-bearing: it owns the granted notification
+#     permission, the accounts and the Keychain items. Changing it silently
+#     throws all of that away, so it is pinned here.
+REAL_ID="$(plist_value "$APP_ABS" CFBundleIdentifier)"
+if [ "$REAL_ID" = "$REAL_BUNDLE_ID" ]; then
+  pass "app bundle identifier is still $REAL_BUNDLE_ID"
+else
+  fail "app bundle identifier changed to \"$REAL_ID\" — it must stay $REAL_BUNDLE_ID"
+fi
+
+# 2c. The self-test bundle must be the same code under a different identity, or
+#     the probes stop proving anything about the app that ships. `make
+#     selftest-app` records the checksum of the app binary it copied; signing
+#     the copy under the other identifier rewrites the Mach-O, so that record —
+#     itself covered by the self-test bundle's signature — is the comparison,
+#     not the two files.
+RECORDED_SHA="$(cut -d' ' -f1 "$SELFTEST_ABS/Contents/Resources/source-binary.sha256" 2>/dev/null)"
+APP_SHA="$(shasum -a 256 "$APP_ABS/Contents/MacOS/MailSpace" | cut -d' ' -f1)"
+if [ -n "$RECORDED_SHA" ] && [ "$RECORDED_SHA" = "$APP_SHA" ]; then
+  pass "self-test bundle was assembled from this app binary"
+else
+  fail "self-test bundle is stale: built from ${RECORDED_SHA:-nothing}, app binary is $APP_SHA"
+fi
+
+#     …and it must not claim to handle mailto:, so it can never take the URL
+#     scheme over from the real app in LaunchServices.
+if plist_value "$SELFTEST_ABS" CFBundleURLTypes >/dev/null 2>&1; then
+  fail "self-test bundle declares CFBundleURLTypes"
+else
+  pass "self-test bundle claims no URL scheme"
+fi
+
+SELFTEST_SIGNED_ID="$(codesign -dv "$SELFTEST_ABS" 2>&1 | sed -n 's/^Identifier=//p')"
+if [ "$SELFTEST_SIGNED_ID" = "$SELFTEST_BUNDLE_ID" ]; then
+  pass "self-test signature identifier is $SELFTEST_SIGNED_ID"
+else
+  fail "self-test signature identifier is \"$SELFTEST_SIGNED_ID\", expected $SELFTEST_BUNDLE_ID"
+fi
+
 # 3. Icon is a real icns with multiple representations
 if file "$APP_ABS/Contents/Resources/AppIcon.icns" | grep -q "Mac OS X icon"; then
   pass "AppIcon.icns is a valid icns"
@@ -77,20 +147,30 @@ else
 fi
 
 # 4. Signature
-if codesign --verify --strict "$APP_ABS" 2>/dev/null; then
-  pass "code signature verifies"
-else
-  fail "code signature does not verify"
-fi
+for bundle in "$APP_ABS" "$SELFTEST_ABS"; do
+  if codesign --verify --strict "$bundle" 2>/dev/null; then
+    pass "code signature verifies ($(basename "$bundle"))"
+  else
+    fail "code signature does not verify ($(basename "$bundle"))"
+  fi
+done
 
-# 5. Headless self-check: boots the real app inside its bundle, reports state, exits.
+# 5. Headless self-check: boots the app inside the self-test bundle, reports
+#    state, exits. `accounts=0` is part of the check: the throwaway identity
+#    keeps its own account list, so a non-zero count would mean a probe is
+#    reading — and could rewrite — the real accounts, colours and tab order.
 SELFTEST_OUT="$(MAILSPACE_SELFTEST=1 run_with_timeout 60 "$BIN" 2>&1)"
 SELFTEST_STATUS=$?
-if [ $SELFTEST_STATUS -eq 0 ] && echo "$SELFTEST_OUT" | grep -q "^SELFTEST "; then
-  pass "self-check: $(echo "$SELFTEST_OUT" | grep '^SELFTEST ' | head -1)"
+STATE_LINE="$(echo "$SELFTEST_OUT" | grep '^SELFTEST ' | head -1)"
+if [ $SELFTEST_STATUS -eq 0 ] && [ -n "$STATE_LINE" ]; then
+  pass "self-check: $STATE_LINE"
 else
   fail "self-check failed (exit $SELFTEST_STATUS): $SELFTEST_OUT"
 fi
+case "$STATE_LINE" in
+  *"accounts=0"*) pass "self-test identity has its own (empty) account list" ;;
+  *) fail "self-test run sees $(echo "$STATE_LINE" | sed -n 's/.*\(accounts=[0-9]*\).*/\1/p') — it is reading the real account list" ;;
+esac
 
 # 6. Google sign-in page: served (not the embedded-browser block), autofill
 #    lands, and nothing about:blank escapes to NSWorkspace.
@@ -113,19 +193,25 @@ fi
 # 7. Notifications end to end: both Notification and showNotification reach the
 #    native bridge, every delivery came from a frame that passes the origin
 #    check, and Notification Center is actually holding what they produced.
-#    `auth` is reported but not gated on — answering the permission prompt is
-#    the user's call, not something a build can assert.
+#
+#    All of it happens as com.vitalii.MailSpace.SelfTest, which asks for
+#    *provisional* authorization: macOS grants that without ever drawing a
+#    prompt, and still delivers the notifications (quietly) — so native delivery
+#    stays provable without anything to click. If the identity ends up with no
+#    authorization at all, native delivery genuinely cannot be proven and the
+#    probe reports SKIPPED; that is reported as a skip here, never as a pass.
 SHIM_OUT="$(MAILSPACE_SELFTEST=shim run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
 case "$SHIM_OUT" in
-  *"result=ok"*) pass "notifications reach Notification Center: $SHIM_OUT" ;;
-  *) fail "notifications: $SHIM_OUT" ;;
-esac
-case "$SHIM_OUT" in
-  *"auth=authorized"*) ;;
-  *"auth="*)
-    echo "  note notification permission is not granted yet — launch MailSpace and answer"
-    echo "       the prompt. If no prompt appears, see docs/notifications.md."
+  *"result=ok"*)
+    pass "notifications reach Notification Center: $SHIM_OUT" ;;
+  *"result=SKIPPED"*)
+    skip "NATIVE NOTIFICATION DELIVERY NOT PROVEN THIS RUN"
+    echo "       $SHIM_OUT"
+    echo "       The self-test identity holds no notification authorization, so nothing"
+    echo "       could be read back from Notification Center. The JS-to-bridge half of"
+    echo "       the path passed; the native half is unverified. See docs/notifications.md."
     ;;
+  *) fail "notifications: $SHIM_OUT" ;;
 esac
 
 # 7b. Account removal really deletes the account's browser session. WebKit
@@ -138,33 +224,36 @@ case "$STORE_OUT" in
   *) fail "data store removal: $STORE_OUT" ;;
 esac
 
-# 8. Real launch: open the bundle, confirm the process stays alive, then quit it.
-#    Any instance already running from this bundle is killed first, so the check
-#    cannot pass on someone else's process.
+# 8. Real launch through LaunchServices: open the self-test bundle, confirm the
+#    process stays alive, then quit it. Same binary and same Info.plist keys as
+#    the app, minus the identity — so this proves the assembled bundle launches
+#    without putting the user's notification permission anywhere near the run.
 kill_existing_instances
 if pgrep -f "$BIN" >/dev/null; then
   fail "a prior instance of $BIN would not quit; launch check skipped"
 else
-  open "$APP_ABS"
+  open "$SELFTEST_ABS"
   sleep 5
   PID="$(pgrep -f "$BIN" | head -1)"
   if [ -n "$PID" ]; then
-    pass "app launched and stayed alive 5s (pid $PID)"
+    pass "bundle launched and stayed alive 5s (pid $PID)"
     kill "$PID" 2>/dev/null
     sleep 2
     if pgrep -f "$BIN" >/dev/null; then
       pkill -9 -f "$BIN" 2>/dev/null
     fi
-    pass "app quit cleanly"
+    pass "bundle quit cleanly"
   else
-    fail "app did not stay alive after launch"
+    fail "bundle did not stay alive after launch"
   fi
 fi
 
 echo
-echo "smoke: manual check not covered here — open the Google sign-in page and"
-echo "       click into the form fields; no macOS \"no application set to open"
-echo "       the URL about:blank\" dialog may appear."
+echo "smoke: manual checks not covered here —"
+echo "       * open the Google sign-in page and click into the form fields; no macOS"
+echo "         \"no application set to open the URL about:blank\" dialog may appear."
+echo "       * banners: nothing here can prove one was drawn on screen. Do Not Disturb"
+echo "         suppresses banners for every app while still delivering the notification."
 
 if [ $FAILED -eq 0 ]; then
   echo "smoke: PASS"
