@@ -272,7 +272,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         }
 
         menu.addItem(.separator())
-        let settings = menu.addItem(withTitle: "Account Settings…", action: #selector(editCurrentAccount(_:)), keyEquivalent: ",")
+        // No key equivalent: ⌘, belongs to the app's own Settings window.
+        let settings = menu.addItem(withTitle: "Account Settings…", action: #selector(editCurrentAccount(_:)), keyEquivalent: "")
         settings.target = self
         let remove = menu.addItem(withTitle: "Remove Current Account…", action: #selector(removeCurrentAccount(_:)), keyEquivalent: "")
         remove.target = self

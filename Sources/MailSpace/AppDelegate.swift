@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private let unreadPoller = UnreadPoller()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
+    private let updateController = UpdateController()
+    private lazy var settingsWindowController = SettingsWindowController(updates: updateController)
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
     private var autofillProbe: AutofillProbe?
@@ -31,6 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
                 + "hint=run-make-smoke-which-builds-build/MailSpace-SelfTest.app"
             )
         }
+
+        // Before anything reads a preference, so every consumer sees a
+        // populated domain rather than a false-shaped zero value.
+        AppSettings.registerDefaults()
 
         NSApp.mainMenu = MainMenu.build()
         loginAutofill.locator = self
@@ -81,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         notificationBridge.start()
         unreadPoller.start()
+        updateController.start()
         sweepOrphanedDataStores()
         if let pending = pendingMailto {
             pendingMailto = nil
@@ -284,6 +291,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         unreadPoller.refresh(accountId: account.id)
     }
 
+    /// ⌘, — the Settings window.
+    @objc func showSettings(_ sender: Any?) {
+        settingsWindowController.show()
+    }
+
+    /// A check he asked for: it always answers, including when the answer is
+    /// "you are up to date" or "GitHub could not be reached".
+    @objc func checkForUpdates(_ sender: Any?) {
+        updateController.checkForUpdates(sender)
+    }
+
     @objc func showMailView(_ sender: Any?) {
         windowController?.selectView(.mail)
     }
@@ -462,6 +480,11 @@ enum MainMenu {
     private static func appMenuItem() -> NSMenuItem {
         let menu = NSMenu(title: "MailSpace")
         menu.addItem(withTitle: "About MailSpace", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Check for Updates…", action: #selector(AppDelegate.checkForUpdates(_:)), keyEquivalent: "")
+        menu.addItem(.separator())
+        // ⌘, is the system-wide Settings shortcut; `Accounts ▸ Account
+        // Settings…` gives it up for this (settings plan, KTD-S5).
+        menu.addItem(withTitle: "Settings…", action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Hide MailSpace", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = menu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
