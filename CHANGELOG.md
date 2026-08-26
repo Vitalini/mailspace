@@ -5,7 +5,7 @@ Update. `scripts/release.sh` publishes the section for the version being cut, so
 what is written here is exactly what the update window shows.
 
 Sections are `Added`, `Changed`, `Fixed`, `Removed`. One user-visible outcome per
-line, present tense, no commit hashes. Wrap at 80 columns and indent what wraps —
+line, present tense, no commit hashes. Wrap near 80 columns and indent the wrap:
 a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
