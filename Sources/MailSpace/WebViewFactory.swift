@@ -58,9 +58,7 @@ enum WebViewFactory {
     static func destroyDataStore(for identifier: UUID, completion: (() -> Void)? = nil) {
         WKWebsiteDataStore.remove(forIdentifier: identifier) { error in
             if let error {
-                FileHandle.standardError.write(
-                    Data("MailSpace: could not remove data store \(identifier): \(error)\n".utf8)
-                )
+                Log.error("could not remove data store \(identifier): \(error)")
             }
             completion?()
         }

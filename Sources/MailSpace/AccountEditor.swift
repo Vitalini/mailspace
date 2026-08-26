@@ -14,6 +14,10 @@ enum AccountEditor {
         var color: AccountColor
     }
 
+    /// Tags the "forget the saved password" checkbox so it can be found again
+    /// in the assembled form once the sheet closes.
+    private static let clearPasswordIdentifier = NSUserInterfaceItemIdentifier("clearPassword")
+
     static func run(editing account: Account? = nil) -> Result? {
         let isEditing = account != nil
         let hasStoredPassword = account.map { KeychainStore.hasPassword(for: $0.email) } ?? false
@@ -53,7 +57,7 @@ enum AccountEditor {
         if hasStoredPassword {
             let clear = NSButton(checkboxWithTitle: "Forget the saved password", target: nil, action: nil)
             clear.state = .off
-            clear.identifier = NSUserInterfaceItemIdentifier("clearPassword")
+            clear.identifier = clearPasswordIdentifier
             rows.append(labelled("", clear))
         }
 
@@ -70,7 +74,7 @@ enum AccountEditor {
         let clearPassword = rows
             .flatMap { $0.subviews }
             .compactMap { $0 as? NSButton }
-            .first { $0.identifier?.rawValue == "clearPassword" }?
+            .first { $0.identifier == clearPasswordIdentifier }?
             .state == .on
 
         let colors = AccountColor.allCases

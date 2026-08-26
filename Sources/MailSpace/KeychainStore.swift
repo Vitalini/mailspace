@@ -75,6 +75,6 @@ enum KeychainStore {
     /// Never logs the password itself — only the failure and its OSStatus.
     private static func report(_ message: String, status: OSStatus) {
         let detail = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
-        FileHandle.standardError.write(Data("MailSpace: \(message) (\(detail))\n".utf8))
+        Log.error("\(message) (\(detail))")
     }
 }

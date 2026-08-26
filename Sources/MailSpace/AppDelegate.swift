@@ -206,9 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     @objc func makeDefaultMailApp(_ sender: Any?) {
         NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto") { error in
             guard let error else { return }
-            FileHandle.standardError.write(
-                Data("MailSpace: could not become the default mail app: \(error.localizedDescription)\n".utf8)
-            )
+            Log.error("could not become the default mail app: \(error.localizedDescription)")
         }
     }
 

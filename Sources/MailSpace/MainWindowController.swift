@@ -216,6 +216,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func rebuildAccountsMenu() {
         guard let menu = NSApp.mainMenu?.item(withTitle: MainMenu.accountsMenuTitle)?.submenu else { return }
+        let tabs = self.tabs
         menu.removeAllItems()
 
         menu.addItem(withTitle: "Add Account…", action: #selector(AppDelegate.addAccount(_:)), keyEquivalent: "")

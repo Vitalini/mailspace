@@ -48,6 +48,25 @@ enum SelfTest {
         fflush(stdout)
         exit(0)
     }
+
+    /// A probe webview must be in a window for WebKit to run the page normally;
+    /// keep it off-screen so nothing flashes on the display.
+    static func presentOffscreen(_ webView: WKWebView) {
+        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 1200, height: 900),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView?.addSubview(webView)
+        webView.frame = window.contentView?.bounds ?? .zero
+        webView.translatesAutoresizingMaskIntoConstraints = true
+        window.orderBack(nil)
+    }
+
+    /// A throwaway session for a probe: the app's real configuration, but with
+    /// nothing written to disk.
+    static func makeProbeConfiguration() -> WKWebViewConfiguration {
+        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
+        configuration.websiteDataStore = .nonPersistent()
+        return configuration
+    }
 }
 
 /// Loads `accounts.google.com` in a throwaway session using the app's real
@@ -65,23 +84,13 @@ final class LoginProbe: NSObject, WKNavigationDelegate {
     private var finished = false
 
     override init() {
-        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
-        configuration.websiteDataStore = .nonPersistent()
-        webView = WebViewFactory.makeWebView(configuration: configuration)
+        webView = WebViewFactory.makeWebView(configuration: SelfTest.makeProbeConfiguration())
         super.init()
         webView.navigationDelegate = self
     }
 
     func run(timeout: TimeInterval = 30) {
-        // The probe webview must be in a window for WebKit to run the page
-        // normally; keep it off-screen so nothing flashes on the display.
-        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 1200, height: 900),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentView?.addSubview(webView)
-        webView.frame = window.contentView?.bounds ?? .zero
-        webView.translatesAutoresizingMaskIntoConstraints = true
-        window.orderBack(nil)
-
+        SelfTest.presentOffscreen(webView)
         webView.load(URLRequest(url: URL(string: "https://accounts.google.com/ServiceLogin?service=mail")!))
 
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
@@ -162,8 +171,7 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     """
 
     override init() {
-        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
-        configuration.websiteDataStore = .nonPersistent()
+        let configuration = SelfTest.makeProbeConfiguration()
         configuration.userContentController.addUserScript(NotificationShim.userScript)
         webView = WebViewFactory.makeWebView(configuration: configuration)
         super.init()
@@ -212,8 +220,7 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
     private var finished = false
 
     override init() {
-        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
-        configuration.websiteDataStore = .nonPersistent()
+        let configuration = SelfTest.makeProbeConfiguration()
         configuration.userContentController.addUserScript(LoginAutofill.userScript)
         webView = WebViewFactory.makeWebView(configuration: configuration)
         super.init()
@@ -224,13 +231,7 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
     }
 
     func run(timeout: TimeInterval = 40) {
-        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 1200, height: 900),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentView?.addSubview(webView)
-        webView.frame = window.contentView?.bounds ?? .zero
-        webView.translatesAutoresizingMaskIntoConstraints = true
-        window.orderBack(nil)
-
+        SelfTest.presentOffscreen(webView)
         webView.load(URLRequest(url: URL(string: "https://accounts.google.com/ServiceLogin?service=mail")!))
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self, !self.finished else { return }

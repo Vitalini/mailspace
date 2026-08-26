@@ -11,8 +11,7 @@ enum LinkRouter {
         "googlemail.com",
         "googleusercontent.com",
         "gstatic.com",
-        "googleapis.com",
-        "googleusercontent.com"
+        "googleapis.com"
     ]
 
     /// Gmail routes outbound clicks through `https://www.google.com/url?q=…`.
@@ -105,7 +104,7 @@ enum LinkRouter {
 /// - Google popups (sign-in, print) open as in-app child windows on the same
 ///   session, using the exact configuration WebKit hands over (KTD7)
 /// - downloads land in `~/Downloads` (R13)
-final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
     /// Handles a `mailto:` link clicked inside a webview.
     var mailtoHandler: ((URL) -> Void)?
 
@@ -286,6 +285,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         )
         window.appearance = NSAppearance(named: .aqua)
         window.contentView = popup
+        // Closing from the titlebar never reaches `webViewDidClose` — only a
+        // page calling window.close() does — so the window itself has to say
+        // when it goes, or its entry (and the webview under it) is retained
+        // for the rest of the session.
+        window.delegate = self
         window.center()
         window.makeKeyAndOrderFront(nil)
 
@@ -297,6 +301,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         guard let window = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
         window.contentView = nil
         window.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        popupWindows = popupWindows.filter { $0.value !== window }
     }
 
     // MARK: - WKDownloadDelegate
@@ -313,6 +322,6 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        FileHandle.standardError.write(Data("MailSpace: download failed: \(error.localizedDescription)\n".utf8))
+        Log.error("download failed: \(error.localizedDescription)")
     }
 }

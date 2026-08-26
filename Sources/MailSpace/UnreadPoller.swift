@@ -55,9 +55,11 @@ final class UnreadPoller {
     /// Polls every mail account, or just one when `accountId` is given (used
     /// right after a new-mail notification so the badge keeps up).
     func refresh(accountId: UUID? = nil) {
-        let targets = mailWebViews().filter { accountId == nil || $0.accountId == accountId }
+        let mailAccounts = mailWebViews()
+        let active = Set(mailAccounts.map(\.accountId))
+        let targets = mailAccounts.filter { accountId == nil || $0.accountId == accountId }
         guard !targets.isEmpty else {
-            pruneCounts(keeping: Set(mailWebViews().map(\.accountId)))
+            pruneCounts(keeping: active)
             updateBadge()
             return
         }
@@ -72,7 +74,7 @@ final class UnreadPoller {
             poll(accountId: target.accountId, webView: target.webView)
         }
 
-        pruneCounts(keeping: Set(mailWebViews().map(\.accountId)))
+        pruneCounts(keeping: active)
         updateBadge()
     }
 

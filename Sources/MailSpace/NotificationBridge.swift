@@ -35,9 +35,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             if let error {
-                FileHandle.standardError.write(
-                    Data("MailSpace: notification authorization failed: \(error.localizedDescription)\n".utf8)
-                )
+                Log.error("notification authorization failed: \(error.localizedDescription)")
             }
         }
     }
@@ -88,9 +86,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
 
         center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
             if let error {
-                FileHandle.standardError.write(
-                    Data("MailSpace: could not post notification: \(error.localizedDescription)\n".utf8)
-                )
+                Log.error("could not post notification: \(error.localizedDescription)")
             }
         }
 

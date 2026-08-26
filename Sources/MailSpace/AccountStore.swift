@@ -136,7 +136,7 @@ final class AccountStore {
         } catch {
             // A corrupt or hand-edited file must never block launch: start
             // empty and let the next save rewrite it.
-            FileHandle.standardError.write(Data("MailSpace: could not read \(fileURL.path): \(error)\n".utf8))
+            Log.error("could not read \(fileURL.path): \(error)")
             accounts = []
         }
     }
@@ -203,7 +203,7 @@ final class AccountStore {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(accounts).write(to: fileURL, options: .atomic)
         } catch {
-            FileHandle.standardError.write(Data("MailSpace: could not write \(fileURL.path): \(error)\n".utf8))
+            Log.error("could not write \(fileURL.path): \(error)")
         }
     }
 }
