@@ -7,9 +7,16 @@ protocol AccountHosting: AnyObject {
     func session(for accountId: UUID) -> AccountSession?
     func requestAddAccount()
     func requestEditAccount(id: UUID)
-    func requestRemoveAccount(id: UUID)
+    /// Confirms on `presentedOn` — the window the user clicked in — and falls
+    /// back to an app-modal dialog when there is none. Swift forbids a default
+    /// value in a protocol requirement, so every caller passes its own window.
+    func requestRemoveAccount(id: UUID, presentedOn: NSWindow?)
     /// This tab is now the visible one.
     func tabBecameVisible(accountId: UUID, view: AccountView)
+    /// Something that feeds the Dock badge changed. `repoll` is for a change to
+    /// what the number *means* (the badge scope); without it the existing
+    /// counts are simply re-totalled.
+    func badgeInputsChanged(repoll: Bool)
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -67,7 +74,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         }
         tabBar.onAddAccount = { [weak self] in self?.host.requestAddAccount() }
         tabBar.onEditAccount = { [weak self] id in self?.host.requestEditAccount(id: id) }
-        tabBar.onRemoveAccount = { [weak self] id in self?.host.requestRemoveAccount(id: id) }
+        tabBar.onRemoveAccount = { [weak self] id in
+            self?.host.requestRemoveAccount(id: id, presentedOn: self?.window)
+        }
     }
 
     // MARK: - Layout
@@ -113,6 +122,15 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             window.center()
         }
         window.setFrameAutosaveName(Self.frameAutosaveName)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// B6. The only way back from a frame stranded on a display that is no
+    /// longer attached. A rescue belongs in a menu, not in Settings.
+    func resetWindowPosition() {
+        NSWindow.removeFrame(usingName: Self.frameAutosaveName)
+        window.setContentSize(NSSize(width: 1280, height: 840))
+        window.center()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -291,7 +309,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     @objc private func removeCurrentAccount(_ sender: Any?) {
         guard let id = selection?.accountId else { return }
-        host.requestRemoveAccount(id: id)
+        host.requestRemoveAccount(id: id, presentedOn: window)
     }
 
     // MARK: - Diagnostics

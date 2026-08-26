@@ -27,30 +27,56 @@ final class UnreadPoller {
     /// reporting it as a failure is what left a stale badge on a signed-out
     /// account forever.
     ///
+    /// The whole inbox, and Gmail's own Primary tab. The badge used to disagree
+    /// with Gmail by counting Promotions and Social; A5 is the choice between
+    /// the two, and the smart-label form is what Gmail's own `Inbox (N)` shows.
+    static let plainFeedPath = "/mail/feed/atom"
+    static let primaryFeedPath = "/mail/feed/atom/%5Esmartlabel_personal"
+
+    /// The feed the scope asks for, unless the `UnreadUsePlainFeed` valve
+    /// (KTD-S6) forces the whole inbox — the way out for the day Gmail retires
+    /// the smart label.
+    static func feedPath(scope: BadgeScope, usePlainFeed: Bool) -> String {
+        guard scope == .primary, !usePlainFeed else { return plainFeedPath }
+        return primaryFeedPath
+    }
+
+    /// The Dock total: only the accounts that opted in (A4). An account left
+    /// out is still polled and still holds its own count — it just does not add
+    /// to this number.
+    static func dockTotal(_ counts: [UUID: Int], participants: Set<UUID>) -> Int {
+        counts.reduce(0) { total, entry in
+            participants.contains(entry.key) ? total + entry.value : total
+        }
+    }
+
     /// The URL is host-relative so the fetch is same-origin whichever Gmail
     /// host the webview is on.
-    private static let feedScript = """
-    if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
-      return { ok: true, feed: '' };
+    private static func feedScript(path: String) -> String {
+        """
+        if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
+          return { ok: true, feed: '' };
+        }
+        const controller = new AbortController();
+        const deadline = setTimeout(function () { controller.abort(); }, 20000);
+        try {
+          const response = await fetch('\(path)', {
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal
+          });
+          if (!response.ok) { return { ok: response.status < 500, feed: '' }; }
+          return { ok: true, feed: await response.text() };
+        } catch (error) {
+          return { ok: false, feed: '' };
+        } finally {
+          clearTimeout(deadline);
+        }
+        """
     }
-    const controller = new AbortController();
-    const deadline = setTimeout(function () { controller.abort(); }, 20000);
-    try {
-      const response = await fetch('/mail/feed/atom', {
-        credentials: 'include',
-        cache: 'no-store',
-        signal: controller.signal
-      });
-      if (!response.ok) { return { ok: response.status < 500, feed: '' }; }
-      return { ok: true, feed: await response.text() };
-    } catch (error) {
-      return { ok: false, feed: '' };
-    } finally {
-      clearTimeout(deadline);
-    }
-    """
 
     private let interval: TimeInterval
+    private let settings: AppSettings
     private var timer: Timer?
     private var counts: [UUID: Int] = [:]
     /// Accounts with a poll still running. Doubles as the completion's
@@ -59,10 +85,20 @@ final class UnreadPoller {
     private var inFlight: Set<UUID> = []
 
     /// Supplies the mail webview of every account that currently has Mail on.
+    ///
+    /// Filtered on `mailEnabled` **alone**, never on `countInBadge`: an account
+    /// left out of the Dock total is still polled, because its count belongs to
+    /// its own tab as well (KTD-S7).
     var mailWebViews: MailWebViewProvider = { [] }
 
-    init(interval: TimeInterval = 60) {
+    /// The accounts whose counts add up to the Dock badge (A4). Applied at the
+    /// summing step, so ticking the box re-totals immediately instead of after
+    /// a poll cycle.
+    var badgeParticipants: () -> Set<UUID> = { [] }
+
+    init(interval: TimeInterval = 60, settings: AppSettings = .shared) {
         self.interval = interval
+        self.settings = settings
     }
 
     func start() {
@@ -129,10 +165,18 @@ final class UnreadPoller {
         updateBadge()
     }
 
+    /// Re-totals the badge without going near Gmail — what a change to A4 needs.
+    func refreshBadge() {
+        updateBadge()
+    }
+
     private func poll(accountId: UUID, webView: WKWebView) {
         inFlight.insert(accountId)
+        let script = Self.feedScript(
+            path: Self.feedPath(scope: settings.badgeScope, usePlainFeed: settings.unreadUsePlainFeed)
+        )
         webView.callAsyncJavaScript(
-            Self.feedScript,
+            script,
             arguments: [:],
             in: nil,
             in: .defaultClient
@@ -161,7 +205,7 @@ final class UnreadPoller {
     }
 
     private func updateBadge() {
-        let total = counts.values.reduce(0, +)
+        let total = Self.dockTotal(counts, participants: badgeParticipants())
         NSApp.dockTile.badgeLabel = total > 0 ? String(total) : nil
     }
 }

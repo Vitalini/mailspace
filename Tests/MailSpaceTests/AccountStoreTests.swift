@@ -121,4 +121,79 @@ final class AccountStoreTests: XCTestCase {
 
         XCTAssertEqual(store.accounts.map(\.id), [work.id])
     }
+
+    // MARK: - Alert and badge flags (A2, A3, A4)
+
+    func testANewAccountAlertsAndCountsByDefault() {
+        let store = AccountStore(directory: directory)
+        let work = store.add(name: "Work")
+
+        XCTAssertTrue(work.notifyMail)
+        XCTAssertTrue(work.notifyCalendar)
+        XCTAssertTrue(work.countInBadge)
+    }
+
+    func testTheThreeFlagsRoundTripThroughTheFile() {
+        let store = AccountStore(directory: directory)
+        let work = store.add(name: "Work")
+
+        store.setFlag(.notifyMail, to: false, for: work.id)
+        store.setFlag(.countInBadge, to: false, for: work.id)
+
+        let reloaded = AccountStore(directory: directory).account(id: work.id)
+        XCTAssertEqual(reloaded?.notifyMail, false)
+        XCTAssertEqual(reloaded?.notifyCalendar, true)
+        XCTAssertEqual(reloaded?.countInBadge, false)
+    }
+
+    /// An `accounts.json` written before this change has none of the three
+    /// fields, and must keep behaving exactly as it did — alerts on, counted.
+    func testAFileFromBeforeTheseFlagsDecodesWithAllThreeOn() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = UUID()
+        let json = """
+        [{"id":"\(id.uuidString)","name":"Personal","email":"a@b.com","mailEnabled":true,
+          "calendarEnabled":true,"lastView":"mail","color":"blue","mailOrder":0,"calendarOrder":1}]
+        """
+        try Data(json.utf8).write(to: accountsFile)
+
+        let account = try XCTUnwrap(AccountStore(directory: directory).account(id: id))
+        XCTAssertTrue(account.notifyMail)
+        XCTAssertTrue(account.notifyCalendar)
+        XCTAssertTrue(account.countInBadge)
+    }
+
+    /// The account dialog knows nothing about the three flags, so editing an
+    /// account must not quietly switch its alerts back on.
+    func testEditingAnAccountCarriesTheFlagsAcross() {
+        let store = AccountStore(directory: directory)
+        let work = store.add(name: "Work")
+        store.setFlag(.notifyMail, to: false, for: work.id)
+        store.setFlag(.notifyCalendar, to: false, for: work.id)
+        store.setFlag(.countInBadge, to: false, for: work.id)
+
+        store.update(
+            id: work.id,
+            name: "Day Job",
+            email: "work@example.com",
+            mailEnabled: true,
+            calendarEnabled: true,
+            color: .green
+        )
+
+        let updated = store.account(id: work.id)
+        XCTAssertEqual(updated?.name, "Day Job")
+        XCTAssertEqual(updated?.notifyMail, false)
+        XCTAssertEqual(updated?.notifyCalendar, false)
+        XCTAssertEqual(updated?.countInBadge, false)
+    }
+
+    func testSettingAFlagOnAnUnknownAccountIsANoOp() {
+        let store = AccountStore(directory: directory)
+        let work = store.add(name: "Work")
+
+        store.setFlag(.countInBadge, to: false, for: UUID())
+
+        XCTAssertEqual(store.account(id: work.id)?.countInBadge, true)
+    }
 }

@@ -73,6 +73,9 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
     private enum InfoKey {
         static let accountId = "accountId"
         static let view = "view"
+        /// A finished download rather than a web notification: clicking it
+        /// reveals the file instead of switching tabs (G4).
+        static let downloadPath = "downloadPath"
     }
 
     weak var locator: SessionLocating?
@@ -81,6 +84,11 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
     /// Called after a mail notification lands, so the unread badge can catch up
     /// without waiting for the next poll.
     var onMailNotification: ((UUID) -> Void)?
+
+    /// The tab on screen right now, or `nil` when MailSpace has none. B1 reads
+    /// it to decide whether a banner would be announcing the page the user is
+    /// already looking at.
+    var currentSelection: () -> TabRef? = { nil }
 
     private var center: UNUserNotificationCenter? {
         // `UNUserNotificationCenter.current()` traps in a process without a
@@ -150,16 +158,40 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             let account = locator?.account(for: session.accountId)
         else { return }
 
+        // A preference, downstream of the origin check and never merged into
+        // it: the origin check decides whether the page *may* raise a
+        // notification, this decides whether the user wants to see it (A2/A3).
+        guard NotificationPolicy.shouldPost(account: account, view: view) else { return }
+
         post(
             title: (payload["title"] as? String) ?? "",
             body: (payload["body"] as? String) ?? "",
             tag: (payload["tag"] as? String) ?? "",
+            silent: (payload["silent"] as? Bool) ?? false,
             account: account,
             view: view
         )
     }
 
-    private func post(title: String, body: String, tag: String, account: Account, view: AccountView) {
+    /// A download that has just landed (G4). Not a web notification: it carries
+    /// the file's path so a click reveals it in Finder.
+    func postDownloadFinished(at url: URL) {
+        guard let center else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = url.lastPathComponent
+        content.body = "Downloaded to \(url.deletingLastPathComponent().lastPathComponent)"
+        content.sound = nil
+        content.userInfo = [InfoKey.downloadPath: url.path]
+
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { error in
+            if let error {
+                Log.error("could not post download notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func post(title: String, body: String, tag: String, silent: Bool, account: Account, view: AccountView) {
         guard let center else { return }
 
         let content = UNMutableNotificationContent()
@@ -168,7 +200,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // the user which account the notification came from.
         content.subtitle = account.name
         content.body = body
-        content.sound = .default
+        content.sound = NotificationPolicy.sound(silent: silent)
         content.userInfo = [
             InfoKey.accountId: account.id.uuidString,
             InfoKey.view: view.rawValue
@@ -198,7 +230,25 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         // Banners matter most when MailSpace is frontmost on another account.
-        completionHandler([.banner, .list, .sound])
+        // The one case where a banner says nothing is the tab already on
+        // screen: it still goes to Notification Center, without the interruption.
+        let suppressed = NotificationPolicy.suppressBanner(
+            appIsActive: NSApp.isActive,
+            notification: Self.tab(from: notification.request.content.userInfo),
+            selection: currentSelection()
+        )
+        completionHandler(suppressed ? [.list] : [.banner, .list, .sound])
+    }
+
+    /// The tab a notification came from, as recorded in its own `userInfo`.
+    private static func tab(from info: [AnyHashable: Any]) -> TabRef? {
+        guard
+            let rawId = info[InfoKey.accountId] as? String,
+            let accountId = UUID(uuidString: rawId),
+            let rawView = info[InfoKey.view] as? String,
+            let view = AccountView(rawValue: rawView)
+        else { return nil }
+        return TabRef(accountId: accountId, view: view)
     }
 
     func userNotificationCenter(
@@ -207,14 +257,14 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
-        if
-            let rawId = info[InfoKey.accountId] as? String,
-            let accountId = UUID(uuidString: rawId),
-            let rawView = info[InfoKey.view] as? String,
-            let view = AccountView(rawValue: rawView)
-        {
+        if let path = info[InfoKey.downloadPath] as? String {
+            // A finished download takes the user to the file, not to a tab.
+            DispatchQueue.main.async {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            }
+        } else if let tab = Self.tab(from: info) {
             DispatchQueue.main.async { [weak self] in
-                self?.router?.focusAccount(accountId, view: view)
+                self?.router?.focusAccount(tab.accountId, view: tab.view)
             }
         }
         completionHandler()

@@ -2,11 +2,10 @@ import AppKit
 
 /// The Settings window, ⌘, .
 ///
-/// This is the shell `docs/plans/2026-08-26-1224-feat-settings-window-plan.md`
-/// specifies in U1 — programmatic `NSWindow` plus an `NSToolbar` whose items
-/// select panes — carrying only the General pane, and in it only the update
-/// preferences. The rest of that plan's General controls and the whole Accounts
-/// pane drop in by adding to `panes` below; nothing here has to move.
+/// Programmatic `NSWindow` plus an `NSToolbar` whose items select panes
+/// (`docs/plans/2026-08-26-1224-feat-settings-window-plan.md`, U1): General
+/// carries the app-wide behaviour, Accounts the per-account switches and the
+/// add/edit/remove buttons.
 final class SettingsWindowController: NSObject, NSToolbarDelegate {
     private struct Pane {
         let identifier: NSToolbarItem.Identifier
@@ -16,16 +15,26 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
     }
 
     private let panes: [Pane]
+    private let accountsPane: SettingsAccountsPane
+    private let generalPane: SettingsGeneralPane
     private var window: NSWindow?
     private var selected: NSToolbarItem.Identifier
 
-    init(updates: UpdateController, settings: AppSettings = .shared) {
+    init(updates: UpdateController, settings: AppSettings = .shared, accounts host: AccountHosting) {
+        generalPane = SettingsGeneralPane(updates: updates, settings: settings, accounts: host)
+        accountsPane = SettingsAccountsPane(accounts: host, settings: settings)
         panes = [
             Pane(
                 identifier: NSToolbarItem.Identifier("general"),
                 title: "General",
                 symbol: "gearshape",
-                controller: SettingsGeneralPane(updates: updates, settings: settings)
+                controller: generalPane
+            ),
+            Pane(
+                identifier: NSToolbarItem.Identifier("accounts"),
+                title: "Accounts",
+                symbol: "person.2",
+                controller: accountsPane
             )
         ]
         selected = panes[0].identifier
@@ -34,15 +43,38 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
 
     func show() {
         buildIfNeeded()
+        // Covers anything that changed while the window was closed.
+        reloadAccounts()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The account list changed underneath the window (KTD-S10). Returns
+    /// immediately when the window has never been built — touching the `lazy`
+    /// property in `AppDelegate` constructs view controllers, not a window, and
+    /// a pane whose view has not loaded has nothing to reload.
+    func reloadAccounts() {
+        guard window != nil else { return }
+        accountsPane.reload()
+        generalPane.reload()
+    }
+
+    /// Builds the window without showing it, for the headless render check.
+    /// Nothing here activates the app or orders a window on screen.
+    func windowForOffscreenRender(paneIndex: Int) -> NSWindow? {
+        buildIfNeeded()
+        guard panes.indices.contains(paneIndex) else { return nil }
+        select(panes[paneIndex].identifier)
+        reloadAccounts()
+        window?.layoutIfNeeded()
+        return window
     }
 
     private func buildIfNeeded() {
         guard window == nil else { return }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 260),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -69,7 +101,7 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
     private func select(_ identifier: NSToolbarItem.Identifier) {
         guard let pane = panes.first(where: { $0.identifier == identifier }), let window else { return }
         selected = identifier
-        window.title = panes.count == 1 ? "Settings" : pane.title
+        window.title = pane.title
         window.contentViewController = pane.controller
         window.toolbar?.selectedItemIdentifier = identifier
     }

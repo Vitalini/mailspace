@@ -272,6 +272,11 @@ fi
 # 7. Notifications end to end: both Notification and showNotification reach the
 #    native bridge, every delivery came from a frame that passes the origin
 #    check, and Notification Center is actually holding what they produced.
+#    Then the same page again with the account's mail alerts muted: the script
+#    messages still arrive and still pass the origin check, and nothing reaches
+#    Notification Center (mutedMessages=3 mutedNative=0). That is the one place
+#    the per-account mute can be proven to sit on the native side rather than in
+#    the injected page script.
 #
 #    All of it happens as com.vitalii.MailSpace.SelfTest, which asks for
 #    *provisional* authorization: macOS grants that without ever drawing a
@@ -301,6 +306,17 @@ STORE_OUT="$(MAILSPACE_SELFTEST=store run_with_timeout 60 "$BIN" 2>&1 | grep '^S
 case "$STORE_OUT" in
   *"result=ok"*) pass "data store removal: $STORE_OUT" ;;
   *) fail "data store removal: $STORE_OUT" ;;
+esac
+
+# 7bb. The settings domain: `registerDefaults` populates the documented values,
+#      a written value round-trips, and all of it lands in the throwaway
+#      defaults domain rather than the real app's preferences. Nothing is
+#      rendered and no window is ordered front unless MAILSPACE_SETTINGS_SHOT
+#      is set by hand.
+SETTINGS_OUT="$(MAILSPACE_SELFTEST=settings run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$SETTINGS_OUT" in
+  *"result=ok"*) pass "settings defaults: $SETTINGS_OUT" ;;
+  *) fail "settings defaults: $SETTINGS_OUT" ;;
 esac
 
 # 7c. The updater's verify-and-swap, against the real signed app, in a temporary
