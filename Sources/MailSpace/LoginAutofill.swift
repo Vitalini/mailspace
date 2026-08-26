@@ -48,14 +48,17 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
       window.__mailspaceAutofill = true;
       if (location.hostname !== 'accounts.google.com') { return; }
 
-      var EMAIL = 'input[type=email]:not([disabled]), input[name=identifier]:not([disabled])';
-      var PASSWORD = 'input[type=password]:not([disabled])';
+      var EMAIL = '#identifierId, input[type=email]:not([disabled]), input[name="identifier"]:not([disabled])';
+      var PASSWORD = 'input[type=password]:not([disabled]), input[name="Passwd"]:not([disabled])';
       var filledEmail = false;
       var filledPassword = false;
       var pending = false;
 
       function usable(el) {
-        return !!el && !!el.offsetParent && !el.readOnly && !el.value;
+        // offsetParent is null for anything inside a fixed-position ancestor,
+        // which Google's sign-in card sometimes is — measure rects instead.
+        return !!el && !el.disabled && !el.readOnly && !el.value
+          && el.getClientRects().length > 0;
       }
 
       function setValue(el, value) {
@@ -65,8 +68,13 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
         } else {
           el.value = value;
         }
+        // Google's form is React-driven: it only notices a value that arrives
+        // through the native setter followed by real input events, and only
+        // then does Next become enabled.
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
       }
 
       async function tick() {
@@ -90,11 +98,14 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
         if (wantsEmail && credentials.email) {
           setValue(email, credentials.email);
           filledEmail = true;
+          try { email.focus(); } catch (e) {}
         }
         if (wantsPassword && credentials.password) {
           setValue(password, credentials.password);
           filledPassword = true;
+          try { password.focus(); } catch (e) {}
         }
+        window.__mailspaceFilled = { email: filledEmail, password: filledPassword };
         // Deliberately no form submit: the user presses Next, and any 2FA or
         // challenge step is handled by hand.
       }

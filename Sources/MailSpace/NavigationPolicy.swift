@@ -31,6 +31,34 @@ enum LinkRouter {
         return resolved
     }
 
+    /// What should happen to a URL the webview wants to go to.
+    enum Destination: Equatable {
+        /// Stays in the webview: Google pages, and every non-web URL the page
+        /// drives itself (`about:blank`, `blob:`, `data:`, `javascript:`).
+        case allowInApp
+        /// A real web page somewhere else — the user's browser owns it.
+        case openExternally(URL)
+        /// A `mailto:` link, which MailSpace composes itself.
+        case compose(URL)
+    }
+
+    /// The single routing decision, shared by the navigation and popup paths.
+    ///
+    /// Only a genuine http(s) URL with a host is ever handed to the system.
+    /// Google's sign-in SPA opens `about:blank` popups and iframes, and passing
+    /// those to `NSWorkspace` is what makes macOS put up "There is no
+    /// application set to open the URL about:blank".
+    static func destination(for requested: URL) -> Destination {
+        let url = unwrapRedirect(requested)
+
+        guard let scheme = url.scheme?.lowercased() else { return .allowInApp }
+        if scheme == "mailto" { return .compose(url) }
+        guard scheme == "http" || scheme == "https" else { return .allowInApp }
+        guard let host = url.host, !host.isEmpty else { return .allowInApp }
+
+        return isInApp(url) ? .allowInApp : .openExternally(url)
+    }
+
     static func isInApp(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
         guard let host = url.host?.lowercased() else { return false }
@@ -78,6 +106,9 @@ enum LinkRouter {
 ///   session, using the exact configuration WebKit hands over (KTD7)
 /// - downloads land in `~/Downloads` (R13)
 final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+    /// Handles a `mailto:` link clicked inside a webview.
+    var mailtoHandler: ((URL) -> Void)?
+
     private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
 
     private static var downloadsDirectory: URL {
@@ -102,25 +133,26 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             return
         }
 
-        let url = LinkRouter.unwrapRedirect(requested)
+        switch LinkRouter.destination(for: requested) {
+        case .allowInApp:
+            decisionHandler(.allow)
 
-        // Non-web schemes (mailto:, tel:, …) always belong to the system.
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        case .compose(let mailto):
+            // Our own compose, never the system's default mail app — that
+            // could be MailSpace itself and loop.
+            mailtoHandler?(mailto)
+            decisionHandler(.cancel)
+
+        case .openExternally(let url):
+            // Only user-initiated navigation leaves the app: a redirect or a
+            // subframe load inside Gmail must not be hijacked.
+            guard navigationAction.navigationType == .linkActivated else {
+                decisionHandler(.allow)
+                return
+            }
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
-            return
         }
-
-        // Only user-initiated navigation leaves the app: a redirect or a
-        // subframe load inside Gmail must not be hijacked.
-        let userInitiated = navigationAction.navigationType == .linkActivated
-        if userInitiated && !LinkRouter.isInApp(url) {
-            NSWorkspace.shared.open(url)
-            decisionHandler(.cancel)
-            return
-        }
-
-        decisionHandler(.allow)
     }
 
     func webView(
@@ -154,13 +186,19 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        // A blank target (window.open() then location=…) has no URL yet, so it
-        // gets the benefit of the doubt and opens in-app.
+        // A blank or scriptable target (window.open() then location=…,
+        // about:blank, blob:) has no external destination and must open in-app;
+        // Google's sign-in relies on exactly that.
         if let requested = navigationAction.request.url, !requested.absoluteString.isEmpty {
-            let url = LinkRouter.unwrapRedirect(requested)
-            guard LinkRouter.isInApp(url) else {
+            switch LinkRouter.destination(for: requested) {
+            case .openExternally(let url):
                 NSWorkspace.shared.open(url)
                 return nil
+            case .compose(let mailto):
+                mailtoHandler?(mailto)
+                return nil
+            case .allowInApp:
+                break
             }
         }
         return presentPopup(configuration: configuration, windowFeatures: windowFeatures)

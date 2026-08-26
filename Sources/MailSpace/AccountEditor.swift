@@ -11,6 +11,7 @@ enum AccountEditor {
         var clearPassword: Bool
         var mailEnabled: Bool
         var calendarEnabled: Bool
+        var color: AccountColor
     }
 
     static func run(editing account: Account? = nil) -> Result? {
@@ -20,8 +21,8 @@ enum AccountEditor {
         let alert = NSAlert()
         alert.messageText = isEditing ? "Account Settings" : "Add Account"
         alert.informativeText = isEditing
-            ? "Change what this account is called, which Google services it shows, and its saved sign-in details."
-            : "Name the account and pick which Google services it should show. You sign in to Google in the account's own view."
+            ? "Change what this account is called, how its tabs are coloured, and which Google services it shows."
+            : "You will sign in through the normal Google page once — MailSpace pre-fills what it can and then remembers the session. Two-step verification stays manual."
         alert.addButton(withTitle: isEditing ? "Save" : "Add")
         alert.addButton(withTitle: "Cancel")
 
@@ -39,12 +40,15 @@ enum AccountEditor {
         services.orientation = .horizontal
         services.spacing = 16
 
+        let colorPicker = colorPopUp(selected: account?.color ?? .forPosition(0))
+
         var rows: [NSView] = [
             labelled("Name", nameField),
             labelled("Google address", emailField),
             labelled("Password", passwordField),
-            hint("MailSpace fills the sign-in form for you. It never submits it, so two-factor stays manual. The password is kept only in your Keychain."),
-            labelled("Show", services)
+            hint("Optional. MailSpace types it into Google's sign-in page for you but never presses Next, so two-step verification stays in your hands. It is kept in your Keychain, never in MailSpace's files."),
+            labelled("Show", services),
+            labelled("Tab colour", colorPicker)
         ]
         if hasStoredPassword {
             let clear = NSButton(checkboxWithTitle: "Forget the saved password", target: nil, action: nil)
@@ -69,6 +73,11 @@ enum AccountEditor {
             .first { $0.identifier?.rawValue == "clearPassword" }?
             .state == .on
 
+        let colors = AccountColor.allCases
+        let color = colors.indices.contains(colorPicker.indexOfSelectedItem)
+            ? colors[colorPicker.indexOfSelectedItem]
+            : .blue
+
         var mail = mailCheckbox.state == .on
         let calendar = calendarCheckbox.state == .on
         // An account with no services would have nothing to show.
@@ -81,8 +90,32 @@ enum AccountEditor {
             password: password.isEmpty ? nil : password,
             clearPassword: clearPassword,
             mailEnabled: mail,
-            calendarEnabled: calendar
+            calendarEnabled: calendar,
+            color: color
         )
+    }
+
+    /// A pop-up of colour swatches — the palette is fixed, so a menu reads
+    /// better here than a full colour picker.
+    private static func colorPopUp(selected: AccountColor) -> NSPopUpButton {
+        let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 180, height: 24), pullsDown: false)
+        for color in AccountColor.allCases {
+            let item = NSMenuItem(title: color.displayName, action: nil, keyEquivalent: "")
+            item.image = swatch(color.nsColor)
+            popUp.menu?.addItem(item)
+        }
+        popUp.selectItem(at: AccountColor.allCases.firstIndex(of: selected) ?? 0)
+        return popUp
+    }
+
+    private static func swatch(_ color: NSColor) -> NSImage {
+        let size = NSSize(width: 14, height: 14)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        color.setFill()
+        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 3, yRadius: 3).fill()
+        image.unlockFocus()
+        return image
     }
 
     // MARK: - Form pieces

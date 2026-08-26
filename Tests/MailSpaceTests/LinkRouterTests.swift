@@ -47,6 +47,59 @@ final class LinkRouterTests: XCTestCase {
         XCTAssertFalse(LinkRouter.isInApp(url("file:///etc/hosts")))
     }
 
+    // MARK: - Routing decisions
+
+    /// Google's sign-in SPA opens about:blank popups and iframes. Handing any
+    /// of those to NSWorkspace makes macOS put up "There is no application set
+    /// to open the URL about:blank".
+    func testPageDrivenSchemesNeverLeaveTheApp() {
+        for candidate in [
+            "about:blank",
+            "about:srcdoc",
+            "blob:https://accounts.google.com/2b4f-1",
+            "data:text/html,<p>hi</p>",
+            "javascript:void(0)"
+        ] {
+            XCTAssertEqual(LinkRouter.destination(for: url(candidate)), .allowInApp, "must stay in-app: \(candidate)")
+        }
+    }
+
+    func testHttpUrlWithoutAHostStaysInApp() {
+        XCTAssertEqual(LinkRouter.destination(for: url("https:///relative")), .allowInApp)
+    }
+
+    func testGooglePagesStayInApp() {
+        XCTAssertEqual(LinkRouter.destination(for: url("https://accounts.google.com/signin")), .allowInApp)
+    }
+
+    func testRealExternalPageGoesToTheBrowser() {
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://example.com/article")),
+            .openExternally(url("https://example.com/article"))
+        )
+    }
+
+    func testWrappedExternalLinkGoesToTheBrowserUnwrapped() {
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://www.google.com/url?q=https://example.com/x")),
+            .openExternally(url("https://example.com/x"))
+        )
+    }
+
+    /// A mailto: link must reach our own compose, never the system default mail
+    /// app — which could be MailSpace itself.
+    func testMailtoRoutesToOurOwnCompose() {
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("mailto:a@b.com?subject=Hi")),
+            .compose(url("mailto:a@b.com?subject=Hi"))
+        )
+    }
+
+    func testOtherSystemSchemesStayInAppRatherThanPoppingADialog() {
+        XCTAssertEqual(LinkRouter.destination(for: url("tel:+15551234")), .allowInApp)
+        XCTAssertEqual(LinkRouter.destination(for: url("file:///etc/hosts")), .allowInApp)
+    }
+
     // MARK: - Gmail's outbound redirect wrapper
 
     func testUnwrapsGmailRedirectToRealDestination() {

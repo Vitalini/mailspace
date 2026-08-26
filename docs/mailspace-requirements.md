@@ -30,9 +30,19 @@ working, minimal, personal.
    iCloud Keychain integration.
 4b. **Per-account service toggles**: each account independently enables Mail, Calendar,
    or both — chosen when adding the account, editable later. Only enabled services get
-   webviews/tabs/notifications/badge polling.
-4c. **Account switcher on top as tabs** (like Mailplane), not a sidebar. Within the
-   active account, a Mail/Calendar view toggle showing only enabled services.
+   webviews/tabs/notifications/badge polling. A calendar-only account never polls the
+   Gmail feed.
+4c. **Flattened tabs on top** (like Mailplane), not a sidebar. The top bar holds one tab
+   per enabled service per account, in account order:
+   `[Work · Mail] [Work · Calendar] [Personal · Calendar]`. One click goes from one
+   account's mail to another's calendar; there is no separate Mail/Calendar toggle.
+   Cmd+1..9 addresses this flattened list. Each account has a user-pickable colour
+   (persisted in accounts.json) that tints both of its tabs, so accounts are
+   distinguishable at a glance; Mail and Calendar differ by icon and label.
+   Tabs are drag-reorderable: any tab can be dropped anywhere in the bar, a
+   service tab moves independently of its account sibling, and the order is
+   persisted (an order index per service in accounts.json) and restored on
+   launch. Cmd+1..9 follows the current visual order.
 5. **Light UI.** App chrome in light tones; matches the light Gmail/Calendar look.
 6. **App icon**: `assets/icon-1024.png` (red/white/blue envelope + calendar). Build a
    proper `.icns` from it.

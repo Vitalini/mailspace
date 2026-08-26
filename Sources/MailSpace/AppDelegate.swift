@@ -12,12 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var windowController: MainWindowController?
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
+    private var autofillProbe: AutofillProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.build()
         loginAutofill.locator = self
+        navigationPolicy.mailtoHandler = { [weak self] url in self?.openMailto(url) }
         notificationBridge.locator = self
         notificationBridge.router = self
         notificationBridge.onMailNotification = { [weak self] accountId in
@@ -39,6 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         if SelfTest.mode == .shim {
             shimProbe = ShimProbe()
             shimProbe?.run()
+            return
+        }
+        if SelfTest.mode == .autofill {
+            autofillProbe = AutofillProbe()
+            autofillProbe?.run()
             return
         }
 
@@ -97,7 +104,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
             name: edit.name,
             email: edit.email,
             mailEnabled: edit.mailEnabled,
-            calendarEnabled: edit.calendarEnabled
+            calendarEnabled: edit.calendarEnabled,
+            color: edit.color
         ) else { return }
 
         // A renamed address leaves its Keychain item behind; move it with the
@@ -157,7 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
             name: edit.name,
             email: edit.email,
             mailEnabled: edit.mailEnabled,
-            calendarEnabled: edit.calendarEnabled
+            calendarEnabled: edit.calendarEnabled,
+            color: edit.color
         )
         applyPasswordEdit(edit, for: account)
         makeSession(for: account)

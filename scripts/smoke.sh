@@ -63,7 +63,32 @@ else
   fail "self-check failed (exit $SELFTEST_STATUS): $SELFTEST_OUT"
 fi
 
-# 6. Real launch: open the bundle, confirm the process stays alive, then quit it.
+# 6. Google sign-in page: served (not the embedded-browser block), autofill
+#    lands, and nothing about:blank escapes to NSWorkspace.
+if [ "${SMOKE_SKIP_NETWORK:-0}" != "1" ]; then
+  LOGIN_OUT="$(MAILSPACE_SELFTEST=login "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+  case "$LOGIN_OUT" in
+    *"result=ok"*) pass "sign-in page served: $LOGIN_OUT" ;;
+    *) fail "sign-in page check: $LOGIN_OUT" ;;
+  esac
+
+  AUTOFILL_OUT="$(MAILSPACE_SELFTEST=autofill "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+  case "$AUTOFILL_OUT" in
+    *"result=ok"*) pass "sign-in autofill: $AUTOFILL_OUT" ;;
+    *) fail "sign-in autofill: $AUTOFILL_OUT" ;;
+  esac
+else
+  echo "  skip network checks (SMOKE_SKIP_NETWORK=1)"
+fi
+
+# 7. Notification shim: both Notification and showNotification reach native.
+SHIM_OUT="$(MAILSPACE_SELFTEST=shim "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$SHIM_OUT" in
+  *"result=ok"*) pass "notification shim: $SHIM_OUT" ;;
+  *) fail "notification shim: $SHIM_OUT" ;;
+esac
+
+# 8. Real launch: open the bundle, confirm the process stays alive, then quit it.
 open "$APP_ABS"
 sleep 5
 PID="$(pgrep -f "$APP_ABS/Contents/MacOS/MailSpace" | head -1)"
@@ -78,6 +103,11 @@ if [ -n "$PID" ]; then
 else
   fail "app did not stay alive after launch"
 fi
+
+echo
+echo "smoke: manual check not covered here — open the Google sign-in page and"
+echo "       click into the form fields; no macOS \"no application set to open"
+echo "       the URL about:blank\" dialog may appear."
 
 if [ $FAILED -eq 0 ]; then
   echo "smoke: PASS"

@@ -61,7 +61,7 @@ final class AccountServicesTests: XCTestCase {
         store.setLastView(.calendar, for: account.id)
         XCTAssertEqual(store.account(id: account.id)?.lastView, .calendar)
 
-        store.update(id: account.id, name: "Work", email: "", mailEnabled: true, calendarEnabled: false)
+        store.update(id: account.id, name: "Work", email: "", mailEnabled: true, calendarEnabled: false, color: .blue)
 
         XCTAssertEqual(store.account(id: account.id)?.lastView, .mail)
         XCTAssertEqual(AccountStore(directory: directory).account(id: account.id)?.lastView, .mail)
@@ -80,10 +80,11 @@ final class AccountServicesTests: XCTestCase {
         let store = AccountStore(directory: directory)
         let account = store.add(name: "Work", email: "old@gmail.com")
 
-        let updated = store.update(id: account.id, name: "  ", email: "new@gmail.com", mailEnabled: true, calendarEnabled: true)
+        let updated = store.update(id: account.id, name: "  ", email: "new@gmail.com", mailEnabled: true, calendarEnabled: true, color: .green)
 
         XCTAssertEqual(updated?.name, "new@gmail.com")
         XCTAssertEqual(updated?.email, "new@gmail.com")
+        XCTAssertEqual(updated?.color, .green)
     }
 
     func testAddNamesTheAccountAfterItsEmailWhenNoNameIsGiven() {

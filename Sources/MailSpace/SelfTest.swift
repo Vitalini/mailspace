@@ -14,12 +14,18 @@ import WebKit
 /// `MAILSPACE_SELFTEST=shim` exercises the notification shim against a local
 /// page: it proves permission is granted and that both `new Notification(…)`
 /// and `ServiceWorkerRegistration.showNotification(…)` reach the native
-/// handler. All modes are inert on a normal launch.
+/// handler.
+///
+/// `MAILSPACE_SELFTEST=autofill` loads the real Google sign-in page with the
+/// autofill script attached and a stub credential, then reads the identifier
+/// field back — proof that the fill lands on the page Google actually serves.
+/// All modes are inert on a normal launch.
 enum SelfTest {
     enum Mode: String {
         case state
         case login
         case shim
+        case autofill
     }
 
     static var mode: Mode? {
@@ -192,6 +198,84 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             let titles = (self?.delivered ?? []).joined(separator: "|")
             let count = self?.delivered.count ?? 0
             SelfTest.finish("shim result=\(count == 3 ? "ok" : "PARTIAL") delivered=\(count) titles=\(titles) probe=\(probe)")
+        }
+    }
+}
+
+
+/// Loads the real Google sign-in page with `LoginAutofill` attached and a stub
+/// credential, then reports whether the identifier field actually got filled.
+final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigationDelegate {
+    static let probeEmail = "mailspace.probe@gmail.com"
+
+    private let webView: WKWebView
+    private var finished = false
+
+    override init() {
+        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.addUserScript(LoginAutofill.userScript)
+        webView = WebViewFactory.makeWebView(configuration: configuration)
+        super.init()
+        configuration.userContentController.addScriptMessageHandler(
+            self, contentWorld: .page, name: LoginAutofill.handlerName
+        )
+        webView.navigationDelegate = self
+    }
+
+    func run(timeout: TimeInterval = 40) {
+        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 1200, height: 900),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView?.addSubview(webView)
+        webView.frame = window.contentView?.bounds ?? .zero
+        webView.translatesAutoresizingMaskIntoConstraints = true
+        window.orderBack(nil)
+
+        webView.load(URLRequest(url: URL(string: "https://accounts.google.com/ServiceLogin?service=mail")!))
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, !self.finished else { return }
+            SelfTest.finish("autofill result=timeout")
+        }
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        replyHandler(["email": Self.probeEmail], nil)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !finished else { return }
+        finished = true
+        // The script polls, so give the observer a few cycles to see the field.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+            self?.report()
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard !finished else { return }
+        finished = true
+        SelfTest.finish("autofill result=navigation-failed error=\(error.localizedDescription)")
+    }
+
+    private func report() {
+        let js = """
+        var field = document.querySelector('#identifierId, input[type=email], input[name="identifier"]');
+        return {
+          fieldFound: !!field,
+          value: field ? field.value : '',
+          filled: window.__mailspaceFilled || null
+        };
+        """
+        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { result in
+            let dict = (try? result.get()) as? [String: Any] ?? [:]
+            let value = (dict["value"] as? String) ?? ""
+            let found = (dict["fieldFound"] as? Bool) ?? false
+            let ok = value == Self.probeEmail
+            SelfTest.finish("autofill result=\(ok ? "ok" : "FAILED") fieldFound=\(found ? 1 : 0) value=\(value)")
         }
     }
 }

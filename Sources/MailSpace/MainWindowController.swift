@@ -54,8 +54,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
         buildLayout()
         emptyState.onAddAccount = { [weak self] in self?.host.requestAddAccount() }
-        tabBar.onSelectAccount = { [weak self] id in self?.select(accountId: id) }
-        tabBar.onSelectView = { [weak self] view in self?.selectView(view) }
+        tabBar.onSelectTab = { [weak self] tab in self?.select(accountId: tab.accountId, view: tab.view) }
+        tabBar.onReorderTab = { [weak self] tab, index in
+            self?.store.moveTab(tab, to: index)
+            self?.refresh()
+        }
         tabBar.onAddAccount = { [weak self] in self?.host.requestAddAccount() }
         tabBar.onEditAccount = { [weak self] id in self?.host.requestEditAccount(id: id) }
         tabBar.onRemoveAccount = { [weak self] id in self?.host.requestRemoveAccount(id: id) }
@@ -138,9 +141,14 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         select(accountId: accountId, view: view)
     }
 
-    func selectAccount(at index: Int) {
-        guard store.accounts.indices.contains(index) else { return }
-        select(accountId: store.accounts[index].id)
+    /// The flattened tab list, in dragged order — the same list Cmd+1..9
+    /// addresses.
+    var tabs: [TabRef] { TabOrder.tabs(for: store.accounts) }
+
+    func selectTab(at index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        let tab = tabs[index]
+        select(accountId: tab.accountId, view: tab.view)
     }
 
     func selectView(_ view: AccountView) {
@@ -212,15 +220,20 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
         menu.addItem(withTitle: "Add Account…", action: #selector(AppDelegate.addAccount(_:)), keyEquivalent: "")
 
-        guard !store.accounts.isEmpty else { return }
+        guard !tabs.isEmpty else { return }
         menu.addItem(.separator())
 
-        for (index, account) in store.accounts.enumerated() {
+        for (index, tab) in tabs.enumerated() {
+            guard let account = store.account(id: tab.accountId) else { continue }
             let shortcut = index < 9 ? String(index + 1) : ""
-            let item = menu.addItem(withTitle: account.name, action: #selector(selectAccountMenuItem(_:)), keyEquivalent: shortcut)
+            let item = menu.addItem(
+                withTitle: "\(account.name) · \(tab.view.displayName)",
+                action: #selector(selectTabMenuItem(_:)),
+                keyEquivalent: shortcut
+            )
             item.target = self
-            item.representedObject = account.id
-            item.state = account.id == selection?.accountId ? .on : .off
+            item.representedObject = index
+            item.state = (selection?.accountId == tab.accountId && selection?.view == tab.view) ? .on : .off
         }
 
         menu.addItem(.separator())
@@ -230,9 +243,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         remove.target = self
     }
 
-    @objc private func selectAccountMenuItem(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? UUID else { return }
-        select(accountId: id)
+    @objc private func selectTabMenuItem(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int else { return }
+        selectTab(at: index)
     }
 
     @objc private func editCurrentAccount(_ sender: Any?) {
@@ -258,25 +271,32 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
 // MARK: - Account tab bar
 
-/// Mailplane-style top bar: one tab per account on the left, a Mail/Calendar
-/// toggle for the active account on the right. The toggle only ever offers the
-/// services that account has enabled.
+/// One tab per enabled service per account, in account order:
+/// `[Work · Mail] [Work · Calendar] [Personal · Calendar]`. A single click
+/// goes from one account's mail straight to another's calendar, and Cmd+1..9
+/// addresses this flattened list.
+///
+/// Every tab of an account carries that account's colour, so the accounts stay
+/// apart at a glance; Mail and Calendar differ by icon and label.
 final class AccountTabBar: NSView {
-    static let height: CGFloat = 40
+    static let height: CGFloat = 42
 
-    var onSelectAccount: ((UUID) -> Void)?
-    var onSelectView: ((AccountView) -> Void)?
+    typealias Tab = TabRef
+
+    var onSelectTab: ((Tab) -> Void)?
+    /// Called when a tab is dropped: the dragged tab and the slot it landed in.
+    var onReorderTab: ((Tab, Int) -> Void)?
     var onAddAccount: (() -> Void)?
     var onEditAccount: ((UUID) -> Void)?
     var onRemoveAccount: ((UUID) -> Void)?
 
     private let background = NSVisualEffectView()
+    private let tabScroll = NSScrollView()
     private let tabStack = NSStackView()
     private let addButton = NSButton()
-    private let viewToggle = NSSegmentedControl()
-    private var toggleViews: [AccountView] = []
 
     private(set) var tabCount = 0
+    private var isDragging = false
 
     init() {
         super.init(frame: .zero)
@@ -288,8 +308,16 @@ final class AccountTabBar: NSView {
 
         tabStack.orientation = .horizontal
         tabStack.alignment = .centerY
-        tabStack.spacing = 4
+        tabStack.spacing = 6
+        tabStack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
         tabStack.translatesAutoresizingMaskIntoConstraints = false
+
+        tabScroll.drawsBackground = false
+        tabScroll.hasHorizontalScroller = false
+        tabScroll.hasVerticalScroller = false
+        tabScroll.horizontalScrollElasticity = .allowed
+        tabScroll.documentView = tabStack
+        tabScroll.translatesAutoresizingMaskIntoConstraints = false
 
         addButton.title = "＋"
         addButton.bezelStyle = .texturedRounded
@@ -298,22 +326,17 @@ final class AccountTabBar: NSView {
         addButton.action = #selector(addAccount(_:))
         addButton.translatesAutoresizingMaskIntoConstraints = false
 
-        viewToggle.segmentStyle = .texturedRounded
-        viewToggle.trackingMode = .selectOne
-        viewToggle.target = self
-        viewToggle.action = #selector(toggleChanged(_:))
-        viewToggle.translatesAutoresizingMaskIntoConstraints = false
-
         let separator = NSView()
         separator.wantsLayer = true
         separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
         separator.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(background)
-        addSubview(tabStack)
+        addSubview(tabScroll)
         addSubview(addButton)
-        addSubview(viewToggle)
         addSubview(separator)
+
+        registerForDraggedTypes([AccountTabView.pasteboardType])
 
         NSLayoutConstraint.activate([
             background.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -321,16 +344,18 @@ final class AccountTabBar: NSView {
             background.topAnchor.constraint(equalTo: topAnchor),
             background.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            tabStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            tabStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            tabScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            tabScroll.topAnchor.constraint(equalTo: topAnchor),
+            tabScroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+            tabScroll.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -4),
 
-            addButton.leadingAnchor.constraint(equalTo: tabStack.trailingAnchor, constant: 6),
+            tabStack.topAnchor.constraint(equalTo: tabScroll.contentView.topAnchor),
+            tabStack.bottomAnchor.constraint(equalTo: tabScroll.contentView.bottomAnchor),
+            tabStack.leadingAnchor.constraint(equalTo: tabScroll.contentView.leadingAnchor),
+
+            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 34),
-
-            viewToggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            viewToggle.centerYAnchor.constraint(equalTo: centerYAnchor),
-            viewToggle.leadingAnchor.constraint(greaterThanOrEqualTo: addButton.trailingAnchor, constant: 12),
 
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -348,78 +373,125 @@ final class AccountTabBar: NSView {
             view.removeFromSuperview()
         }
 
-        for account in accounts {
-            let tab = AccountTabView(account: account, isSelected: account.id == selection?.accountId)
-            tab.onClick = { [weak self] id in self?.onSelectAccount?(id) }
-            tab.onEdit = { [weak self] id in self?.onEditAccount?(id) }
-            tab.onRemove = { [weak self] id in self?.onRemoveAccount?(id) }
-            tabStack.addArrangedSubview(tab)
-        }
-        tabCount = accounts.count
+        let tabs = TabOrder.tabs(for: accounts)
+        tabCount = tabs.count
 
-        let active = selection.flatMap { current in accounts.first { $0.id == current.accountId } }
-        rebuildToggle(for: active, selection: selection)
-    }
-
-    private func rebuildToggle(for account: Account?, selection: MainWindowController.Selection?) {
-        guard let account, account.enabledViews.count > 1 else {
-            // A single-service account has nothing to toggle between.
-            viewToggle.isHidden = true
-            toggleViews = []
-            return
+        for tab in tabs {
+            guard let account = accounts.first(where: { $0.id == tab.accountId }) else { continue }
+            let isSelected = selection.map { $0.accountId == tab.accountId && $0.view == tab.view } ?? false
+            let tabView = AccountTabView(account: account, view: tab.view, isSelected: isSelected)
+            tabView.onClick = { [weak self] tab in self?.onSelectTab?(tab) }
+            tabView.onEdit = { [weak self] id in self?.onEditAccount?(id) }
+            tabView.onRemove = { [weak self] id in self?.onRemoveAccount?(id) }
+            tabView.onDragBegan = { [weak self] in self?.isDragging = true }
+            tabStack.addArrangedSubview(tabView)
         }
-
-        toggleViews = account.enabledViews
-        viewToggle.isHidden = false
-        viewToggle.segmentCount = toggleViews.count
-        for (index, view) in toggleViews.enumerated() {
-            viewToggle.setLabel(view.displayName, forSegment: index)
-            viewToggle.setWidth(88, forSegment: index)
-        }
-        if let current = selection?.view, let index = toggleViews.firstIndex(of: current) {
-            viewToggle.selectedSegment = index
-        }
+        tabStack.layoutSubtreeIfNeeded()
     }
 
     @objc private func addAccount(_ sender: Any?) {
         onAddAccount?()
     }
 
-    @objc private func toggleChanged(_ sender: NSSegmentedControl) {
-        guard toggleViews.indices.contains(sender.selectedSegment) else { return }
-        onSelectView?(toggleViews[sender.selectedSegment])
+    // MARK: - Reordering
+
+    /// Tabs are dragged into any order the user likes; a service tab can move
+    /// independently of its account sibling.
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        canAccept(sender) ? .move : []
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        canAccept(sender) ? .move : []
+    }
+
+    override func draggingEnded(_ sender: any NSDraggingInfo) {
+        isDragging = false
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        isDragging = false
+        guard
+            let raw = sender.draggingPasteboard.string(forType: AccountTabView.pasteboardType),
+            let tab = TabRef(identifier: raw)
+        else { return false }
+
+        onReorderTab?(tab, insertionIndex(at: convert(sender.draggingLocation, from: nil)))
+        return true
+    }
+
+    private func canAccept(_ sender: any NSDraggingInfo) -> Bool {
+        sender.draggingPasteboard.string(forType: AccountTabView.pasteboardType) != nil
+    }
+
+    /// The slot a drop at `point` should land in: the first tab whose midpoint
+    /// is to the right of the cursor, or the end of the bar.
+    private func insertionIndex(at point: NSPoint) -> Int {
+        for (index, tabView) in tabStack.arrangedSubviews.enumerated() {
+            let frame = convert(tabView.bounds, from: tabView)
+            if point.x < frame.midX { return index }
+        }
+        return tabStack.arrangedSubviews.count
     }
 }
 
-/// A single account tab.
-final class AccountTabView: NSView {
-    private let accountId: UUID
+/// A single account × service tab, tinted with the account's colour.
+final class AccountTabView: NSView, NSDraggingSource {
+    static let pasteboardType = NSPasteboard.PasteboardType("com.vitalii.MailSpace.tab")
+
+    private let tab: AccountTabBar.Tab
+    private let tint: NSColor
     private let selected: Bool
 
-    var onClick: ((UUID) -> Void)?
+    var onClick: ((AccountTabBar.Tab) -> Void)?
     var onEdit: ((UUID) -> Void)?
     var onRemove: ((UUID) -> Void)?
+    var onDragBegan: (() -> Void)?
 
-    init(account: Account, isSelected: Bool) {
-        self.accountId = account.id
+    /// Set on mouse-down and cleared once a drag starts, so a press that never
+    /// moves is a click and a press that moves is a reorder.
+    private var pressOrigin: NSPoint?
+
+    init(account: Account, view: AccountView, isSelected: Bool) {
+        self.tab = AccountTabBar.Tab(accountId: account.id, view: view)
+        self.tint = account.color.nsColor
         self.selected = isSelected
         super.init(frame: .zero)
 
         wantsLayer = true
-        let label = NSTextField(labelWithString: account.name)
-        label.font = .systemFont(ofSize: 13, weight: isSelected ? .semibold : .regular)
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: view == .mail ? "envelope.fill" : "calendar",
+            accessibilityDescription: view.displayName
+        )
+        icon.contentTintColor = isSelected ? tint : tint.withAlphaComponent(0.75)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: "\(account.name) · \(view.displayName)")
+        label.font = .systemFont(ofSize: 12.5, weight: isSelected ? .semibold : .regular)
         label.textColor = isSelected ? .labelColor : .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
-        toolTip = account.email.isEmpty ? account.name : "\(account.name) · \(account.email)"
 
+        toolTip = account.email.isEmpty
+            ? "\(account.name) · \(view.displayName)"
+            : "\(account.name) · \(view.displayName) — \(account.email)"
+
+        addSubview(icon)
         addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            heightAnchor.constraint(equalToConstant: 26),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 220)
+
+            heightAnchor.constraint(equalToConstant: 28),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 260)
         ])
 
         let contextMenu = NSMenu()
@@ -434,24 +506,85 @@ final class AccountTabView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used — the UI is built programmatically") }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard selected else { return }
-        NSColor.controlBackgroundColor.setFill()
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 6, yRadius: 6)
+        let body = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: body, xRadius: 7, yRadius: 7)
+
+        // The account colour is always present as a tint; selection deepens it
+        // and adds a colour bar so the active tab reads at a glance.
+        tint.withAlphaComponent(selected ? 0.20 : 0.07).setFill()
         path.fill()
-        NSColor.separatorColor.setStroke()
+        tint.withAlphaComponent(selected ? 0.85 : 0.25).setStroke()
+        path.lineWidth = selected ? 1.5 : 1
         path.stroke()
+
+        guard selected else { return }
+        let bar = NSRect(x: body.minX + 4, y: body.minY + 1.5, width: body.width - 8, height: 2.5)
+        tint.setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 1.25, yRadius: 1.25).fill()
     }
 
+    /// Clicking a tab while MailSpace is in the background should switch tabs,
+    /// not just bring the window forward.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) {
-        onClick?(accountId)
+        pressOrigin = event.locationInWindow
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let origin = pressOrigin else { return }
+        let travelled = hypot(
+            event.locationInWindow.x - origin.x,
+            event.locationInWindow.y - origin.y
+        )
+        guard travelled > 4 else { return }
+
+        pressOrigin = nil
+        beginReorderDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard pressOrigin != nil else { return }
+        pressOrigin = nil
+        onClick?(tab)
+    }
+
+    private func beginReorderDrag(with event: NSEvent) {
+        let item = NSPasteboardItem()
+        item.setString(tab.identifier, forType: Self.pasteboardType)
+
+        let draggingItem = NSDraggingItem(pasteboardWriter: item)
+        draggingItem.setDraggingFrame(bounds, contents: snapshot())
+
+        onDragBegan?()
+        beginDraggingSession(with: [draggingItem], event: event, source: self)
+    }
+
+    private func snapshot() -> NSImage {
+        let image = NSImage(size: bounds.size)
+        guard let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return image }
+        cacheDisplay(in: bounds, to: rep)
+        image.addRepresentation(rep)
+        return image
+    }
+
+    // MARK: - NSDraggingSource
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        // Reordering is in-window only; dragging a tab to the Finder or another
+        // app should do nothing.
+        context == .withinApplication ? .move : []
     }
 
     @objc private func edit(_ sender: Any?) {
-        onEdit?(accountId)
+        onEdit?(tab.accountId)
     }
 
     @objc private func removeAccount(_ sender: Any?) {
-        onRemove?(accountId)
+        onRemove?(tab.accountId)
     }
 }
 
