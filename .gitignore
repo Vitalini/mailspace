@@ -1,0 +1,20 @@
+.build/
+build/
+.DS_Store
+*.xcuserdatad
+
+# Agent worktrees and scratch — hold absolute paths and hundreds of MB of build output
+.claude/
+
+# Never commit key material or a generated icon set
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.icns
+
+# The account list lives in ~/Library/Application Support/MailSpace, never here
+accounts.json
+dist/
+update-key

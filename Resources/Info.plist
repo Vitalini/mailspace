@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>MailSpace</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.vitalii.MailSpace</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MailSpace</string>
+	<key>CFBundleDisplayName</key>
+	<string>MailSpace</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<!-- Both are placeholders on purpose. `make bundle` substitutes them from the
+	     VERSION file, so this checked-in file cannot state a version that has
+	     drifted from the one the release is cut at. -->
+	<key>CFBundleShortVersionString</key>
+	<string>__MARKETING_VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__BUILD_NUMBER__</string>
+	<!-- Update feed: the GitHub Releases API for the public repo. No token, no
+	     appcast file to keep in sync. -->
+	<key>MSUpdateFeedURL</key>
+	<string>https://api.github.com/repos/Vitalini/mailspace/releases/latest</string>
+	<!-- Base64 of the 32-byte Ed25519 *public* key whose private half signs every
+	     release zip. Written by `make update-key`; the private half never enters
+	     this repo. Empty means the updater will download and show release notes
+	     but refuse to install anything. -->
+	<key>MSUpdatePublicKey</key>
+	<string>PTjP/0S56Rf/4WO7SpuW7iYKbQhZN11km6fkKFU/PUQ=</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Mail URL</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>mailto</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -23,6 +23,31 @@ working, minimal, personal.
    - calendar event reminders.
    Clicking a notification opens the app on the right account/view.
 4. **Unread badge** on the Dock icon (total across accounts).
+4d. **Per-tab unread count**: each Mail tab shows its own account's unread
+   count in the tab itself, so the number is attributable without opening the
+   tab. The Dock badge stays the sum. Only accounts with "count in badge"
+   enabled contribute to the Dock total, but a tab shows its own count
+   regardless.
+4a. **Keychain-assisted login** (Mailplane-style): per-account Google credentials stored
+   in the app's own Keychain items; when accounts.google.com login page shows up, the app
+   auto-fills email (and password when available) via injected JS. 2FA stays manual.
+   macOS WKWebView has no native password-autofill UI, so this is our own fill, not
+   iCloud Keychain integration.
+4b. **Per-account service toggles**: each account independently enables Mail, Calendar,
+   or both — chosen when adding the account, editable later. Only enabled services get
+   webviews/tabs/notifications/badge polling. A calendar-only account never polls the
+   Gmail feed.
+4c. **Flattened tabs on top** (like Mailplane), not a sidebar. The top bar holds one tab
+   per enabled service per account, in account order:
+   `[Work · Mail] [Work · Calendar] [Personal · Calendar]`. One click goes from one
+   account's mail to another's calendar; there is no separate Mail/Calendar toggle.
+   Cmd+1..9 addresses this flattened list. Each account has a user-pickable colour
+   (persisted in accounts.json) that tints both of its tabs, so accounts are
+   distinguishable at a glance; Mail and Calendar differ by icon and label.
+   Tabs are drag-reorderable: any tab can be dropped anywhere in the bar, a
+   service tab moves independently of its account sibling, and the order is
+   persisted (an order index per service in accounts.json) and restored on
+   launch. Cmd+1..9 follows the current visual order.
 5. **Light UI.** App chrome in light tones; matches the light Gmail/Calendar look.
 6. **App icon**: `assets/icon-1024.png` (red/white/blue envelope + calendar). Build a
    proper `.icns` from it.

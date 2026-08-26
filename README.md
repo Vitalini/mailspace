@@ -1,0 +1,147 @@
+# MailSpace
+
+Personal macOS app wrapping Gmail and Google Calendar — a replacement for the
+discontinued Mailplane. Single user, never distributed. See
+[docs/mailspace-requirements.md](docs/mailspace-requirements.md).
+
+## Build
+
+```
+make signing-cert   # once per Mac — see below
+make build          # compile, assemble build/MailSpace.app, sign it
+make run            # build and launch
+make test           # swift test
+make smoke          # build, then packaging and launch checks
+make version        # what this checkout would ship as
+```
+
+`SMOKE_SKIP_NETWORK=1 make smoke` skips the checks that hit accounts.google.com.
+
+## Installing it the first time
+
+Install from a local build, not from a downloaded zip. `/Applications` is
+`drwxrwxr-x root:admin` and you are in `admin`, so this needs no password:
+
+```
+cd ~/Documents/projects/mailspace
+git checkout main && git pull
+make signing-cert          # no-op once "MailSpace Self-Signed" exists
+make build
+make smoke                 # expect: smoke: PASS
+ditto build/MailSpace.app /Applications/MailSpace.app
+codesign --verify --strict --verbose=2 /Applications/MailSpace.app
+open /Applications/MailSpace.app
+```
+
+`~/Applications` works identically if you prefer it. Either way the copy is
+owned by you, which is what lets MailSpace replace it later without an
+authentication prompt. Do **not** install it in a way that leaves the bundle
+owned by root.
+
+Do not install the first copy by downloading the release zip in a browser.
+Safari and Chrome stamp `com.apple.quarantine`, and `spctl` rejects this bundle
+(self-signed, not notarized), so you get the "damaged and can't be opened"
+dialog. `ditto` from a local build carries no quarantine at all. If you ever do
+install from a downloaded zip, `xattr -dr com.apple.quarantine
+/Applications/MailSpace.app` makes it launchable — no admin rights needed,
+because you own the file.
+
+## How updates reach you
+
+MailSpace asks the GitHub releases API for the newest published release, once a
+day and at launch, and shows a window with the version, the release notes and
+**Update** / **Later**. Nothing is downloaded or installed until you click
+Update. Settings (⌘,) ▸ General turns the daily check off; **MailSpace ▸ Check
+for Updates…** always works regardless, and always answers — including "1.0.0 is
+the latest version" and the reason a check failed. A background check is silent
+unless it found something.
+
+Before anything is swapped in, the download has to pass three checks:
+
+1. **An Ed25519 signature over the downloaded bytes**, verified against the
+   public key compiled into the running app. The private half lives only in
+   `~/.config/mailspace/update-key` on this Mac and is what makes a download
+   recognisable as genuine — TLS to github.com is not part of this guarantee.
+2. **The extracted app's code signature**, against the pinned requirement in
+   `scripts/expected-requirement.txt`: bundle identifier plus the "MailSpace
+   Self-Signed" certificate root, nested code and all architectures.
+3. **The bundle identifier and version** inside the downloaded app.
+
+Then `FileManager.replaceItemAt` swaps it in — atomic, with the old bundle kept
+until the new one is in place — and the new copy relaunches. A copy running from
+anywhere other than `/Applications` or `~/Applications` shows the notes and
+refuses to replace itself, so `make run` can never overwrite your working build.
+
+**Two secrets, both of which strand every installed copy if they are lost:**
+
+| What | Where | Backup |
+|---|---|---|
+| Ed25519 update key | `~/.config/mailspace/update-key` (mode 600, outside the repo) | `cat` it and store the single line in your password manager |
+| "MailSpace Self-Signed" certificate | login keychain | export the .p12 by hand from Keychain Access — a `security export` raises a keychain prompt, so it is not scripted |
+
+If the update key is lost, no future release will verify. If the certificate is
+lost, the new one has a different root hash, every future download fails check 2,
+and the notification permission and Keychain items are orphaned as well. Neither
+can be recovered remotely: the fix is replacing every install by hand.
+
+## Cutting a release
+
+```
+make version                # what this checkout would ship as
+make changelog-draft        # seed CHANGELOG.md's [Unreleased] from git log
+                            # then edit it — these notes are the update window
+make release-dry-run        # build, sign, package, verify, show what it would upload
+make release                # the real thing: tag, push, gh release create
+```
+
+The version lives in one place: the `VERSION` file at the repo root.
+`CFBundleShortVersionString` comes from it, `CFBundleVersion` is derived
+(`1.2.0` → `10200`), and the tag name is `v$(cat VERSION)` — so none of them can
+disagree. `Resources/Info.plist` carries placeholders, not versions.
+
+`make release` refuses on: a dirty tree, a missing or undated `## [X.Y.Z]`
+section in `CHANGELOG.md`, an empty notes section, a version that is not newer
+than the highest tag, a build whose version does not match `VERSION`, a drifted
+designated requirement, a failing `swift test` or `make smoke`, a missing or
+mismatched update key — and on an **ad-hoc signature**, which is the one failure
+that would otherwise be silent and unfixable after the fact. It also refuses
+when the branch is not `main`, `HEAD` is not pushed, the repo is not public, or
+CI for `HEAD` is red; a dry run reports those instead of stopping.
+
+`make update-key` creates the Ed25519 key once. It writes the private key
+outside the repo and pastes only the public half into `Resources/Info.plist`.
+
+## The checks never launch the real app
+
+`make smoke` inspects `build/MailSpace.app` on disk, but every check that actually starts
+a process runs `build/MailSpace-SelfTest.app` — the same binary in a second bundle under
+`com.vitalii.MailSpace.SelfTest`, with its own accounts, Keychain service, website data
+and notification permission.
+
+That is deliberate. macOS ties notification permission to the bundle identifier, and a
+smoke run that launches the real app can raise a permission prompt with nobody there to
+answer it — macOS records the silence as a denial and the app loses its banners. The
+self-test bundle asks *provisionally*, which macOS grants without ever drawing a prompt,
+so the probes still prove real delivery through `UNUserNotificationCenter`.
+
+`CFBundleIdentifier` of the real app is `com.vitalii.MailSpace` and must stay that way:
+it owns the granted notification permission, the account list and the Keychain items.
+`make smoke` fails if it changes.
+
+`./scripts/notification-status.sh` reports what macOS has recorded for both identities
+without launching anything.
+
+## One-time: the signing certificate
+
+There is no paid Apple Developer identity here, so the bundle is signed locally.
+`make signing-cert` creates a self-signed code-signing certificate called
+**MailSpace Self-Signed** in the login keychain, and `make build` uses it.
+
+Run it once. Without it the build still works — it falls back to ad-hoc signing — but
+ad-hoc gives the app a new identity on every rebuild, so macOS asks for notification
+permission again after each `make build`.
+
+Details, how notifications actually reach Notification Center, what the probes do and do
+not prove, and what to check when a banner does not appear (a Focus mode suppresses
+banners for every app while still delivering the notification):
+[docs/notifications.md](docs/notifications.md).

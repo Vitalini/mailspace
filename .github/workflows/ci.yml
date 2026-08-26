@@ -1,0 +1,31 @@
+name: CI
+
+# A gate, never a builder. Releases are cut locally and signed with the
+# "MailSpace Self-Signed" certificate, whose private key exists only on one Mac
+# — a runner cannot produce a bundle that satisfies the designated requirement
+# the updater checks, so a CI-built release could never be installed.
+#
+# This workflow must not run `make smoke`: those probes launch a bundle, talk to
+# accounts.google.com and read back from Notification Center. On a runner they
+# would either fail spuriously or pass vacuously, and a gate that passes
+# vacuously is worse than no gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Test
+        run: swift test

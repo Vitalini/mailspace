@@ -1,0 +1,1 @@
+identifier "com.vitalii.MailSpace" and certificate root = H"f5cf6d1c83884c6114eb7bc4b147d71c093f7645"
