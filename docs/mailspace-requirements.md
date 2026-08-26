@@ -23,6 +23,16 @@ working, minimal, personal.
    - calendar event reminders.
    Clicking a notification opens the app on the right account/view.
 4. **Unread badge** on the Dock icon (total across accounts).
+4a. **Keychain-assisted login** (Mailplane-style): per-account Google credentials stored
+   in the app's own Keychain items; when accounts.google.com login page shows up, the app
+   auto-fills email (and password when available) via injected JS. 2FA stays manual.
+   macOS WKWebView has no native password-autofill UI, so this is our own fill, not
+   iCloud Keychain integration.
+4b. **Per-account service toggles**: each account independently enables Mail, Calendar,
+   or both — chosen when adding the account, editable later. Only enabled services get
+   webviews/tabs/notifications/badge polling.
+4c. **Account switcher on top as tabs** (like Mailplane), not a sidebar. Within the
+   active account, a Mail/Calendar view toggle showing only enabled services.
 5. **Light UI.** App chrome in light tones; matches the light Gmail/Calendar look.
 6. **App icon**: `assets/icon-1024.png` (red/white/blue envelope + calendar). Build a
    proper `.icns` from it.

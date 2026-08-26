@@ -1,53 +1,37 @@
 import AppKit
+import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
     let accountStore = AccountStore()
-    private(set) var sessions: [UUID: AccountSession] = [:]
 
-    private var window: NSWindow?
-    private var contentContainer: NSView?
-    private var activeAccountId: UUID?
+    private var sessions: [UUID: AccountSession] = [:]
+    private var windowController: MainWindowController?
     private var loginProbe: LoginProbe?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.build()
 
-        for account in accountStore.accounts {
-            makeSession(for: account)
-        }
-        activeAccountId = accountStore.accounts.first?.id
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "MailSpace"
-        window.appearance = NSAppearance(named: .aqua)
-        window.setFrameAutosaveName("MailSpaceMainWindow")
-        window.center()
-
-        let container = NSView()
-        window.contentView = container
-        contentContainer = container
-
-        window.makeKeyAndOrderFront(nil)
-        self.window = window
-        showActiveView()
-
-        switch SelfTest.mode {
-        case .state:
-            SelfTest.schedule { [weak self] in
-                "accounts=\(self?.accountStore.accounts.count ?? -1) sessions=\(self?.sessions.count ?? -1)"
-            }
-            return
-        case .login:
+        if SelfTest.mode == .login {
             loginProbe = LoginProbe()
             loginProbe?.run()
             return
-        case nil:
-            break
+        }
+
+        for account in accountStore.accounts {
+            makeSession(for: account)
+        }
+
+        let controller = MainWindowController(host: self)
+        windowController = controller
+        controller.restoreSelection()
+        controller.showWindow()
+
+        if SelfTest.mode == .state {
+            SelfTest.schedule { [weak self] in
+                (self?.windowController?.stateDescription ?? "unavailable")
+                    + " sessions=\(self?.sessions.count ?? -1)"
+            }
+            return
         }
 
         NSApp.activate(ignoringOtherApps: true)
@@ -57,7 +41,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    // MARK: - Accounts
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { windowController?.showWindow() }
+        return true
+    }
+
+    // MARK: - AccountHosting
+
+    func session(for accountId: UUID) -> AccountSession? {
+        sessions[accountId]
+    }
+
+    func requestAddAccount() {
+        addAccount(nil)
+    }
+
+    func requestRemoveAccount(id: UUID) {
+        guard let account = accountStore.account(id: id) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Remove “\(account.name)”?"
+        alert.informativeText = "MailSpace will sign this account out and delete its stored Google session from this Mac. Your mail itself is not affected."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove Account")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Ordering matters: WebKit refuses to delete a data store that is still
+        // in use, so tear the webviews down before removing the store.
+        let session = sessions.removeValue(forKey: id)
+        session?.detach()
+        accountStore.remove(id: id)
+        windowController?.refresh()
+        WebViewFactory.destroyDataStore(for: id)
+    }
+
+    // MARK: - Menu actions
+
+    @objc func addAccount(_ sender: Any?) {
+        guard let name = AccountNamePrompt.run() else { return }
+        let account = accountStore.add(name: name)
+        makeSession(for: account)
+        windowController?.select(accountId: account.id, view: .mail)
+    }
+
+    @objc func showMailView(_ sender: Any?) {
+        windowController?.selectView(.mail)
+    }
+
+    @objc func showCalendarView(_ sender: Any?) {
+        windowController?.selectView(.calendar)
+    }
+
+    // MARK: - Sessions
 
     @discardableResult
     private func makeSession(for account: Account) -> AccountSession {
@@ -66,45 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessions[account.id] = session
         return session
     }
-
-    @objc func addAccount(_ sender: Any?) {
-        guard let name = AccountNamePrompt.run(window: window) else { return }
-        let account = accountStore.add(name: name)
-        makeSession(for: account)
-        activeAccountId = account.id
-        showActiveView()
-    }
-
-    private func showActiveView() {
-        guard let container = contentContainer else { return }
-        container.subviews.forEach { $0.removeFromSuperview() }
-
-        guard
-            let id = activeAccountId,
-            let account = accountStore.account(id: id),
-            let session = sessions[id]
-        else { return }
-
-        let webView = session.webView(for: account.lastView)
-        container.addSubview(webView)
-        NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: container.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor)
-        ])
-        window?.title = "MailSpace — \(account.name)"
-    }
 }
 
 // MARK: - Add-account prompt
 
 enum AccountNamePrompt {
-    /// Modal name prompt for a new account. Returns nil when cancelled.
-    static func run(window: NSWindow?) -> String? {
+    /// Modal name prompt for a new account. Returns nil when cancelled or blank.
+    static func run() -> String? {
         let alert = NSAlert()
         alert.messageText = "Add Account"
-        alert.informativeText = "Name this account (for example \"Work\" or \"Personal\"). You will sign in to Google in the next step."
+        alert.informativeText = "Name this account (for example “Work” or “Personal”). You will sign in to Google in the account's Mail view."
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
 
@@ -122,30 +129,29 @@ enum AccountNamePrompt {
 // MARK: - Main menu
 
 enum MainMenu {
+    static let accountsMenuTitle = "Accounts"
+    static let viewMenuTitle = "View"
+
     static func build() -> NSMenu {
         let mainMenu = NSMenu()
         mainMenu.addItem(appMenuItem())
         mainMenu.addItem(fileMenuItem())
         mainMenu.addItem(editMenuItem())
+        mainMenu.addItem(viewMenuItem())
         mainMenu.addItem(accountsMenuItem())
         mainMenu.addItem(windowMenuItem())
         return mainMenu
     }
 
-    /// The Accounts menu is rebuilt by `MainWindowController` whenever the
-    /// account list changes; this builds the static part.
-    static let accountsMenuTitle = "Accounts"
-
-    private static func accountsMenuItem() -> NSMenuItem {
-        let item = NSMenuItem()
-        let menu = NSMenu(title: accountsMenuTitle)
-        menu.addItem(withTitle: "Add Account…", action: #selector(AppDelegate.addAccount(_:)), keyEquivalent: "")
+    private static func submenuItem(_ menu: NSMenu) -> NSMenuItem {
+        // The top-level item needs its own title too — `item(withTitle:)`
+        // looks it up there, not on the submenu.
+        let item = NSMenuItem(title: menu.title, action: nil, keyEquivalent: "")
         item.submenu = menu
         return item
     }
 
     private static func appMenuItem() -> NSMenuItem {
-        let item = NSMenuItem()
         let menu = NSMenu(title: "MailSpace")
         menu.addItem(withTitle: "About MailSpace", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         menu.addItem(.separator())
@@ -155,21 +161,17 @@ enum MainMenu {
         menu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit MailSpace", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.submenu = menu
-        return item
+        return submenuItem(menu)
     }
 
     private static func fileMenuItem() -> NSMenuItem {
-        let item = NSMenuItem()
         let menu = NSMenu(title: "File")
         menu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        item.submenu = menu
-        return item
+        return submenuItem(menu)
     }
 
     /// Standard Edit menu — required so copy/paste/select-all reach the webviews.
     private static func editMenuItem() -> NSMenuItem {
-        let item = NSMenuItem()
         let menu = NSMenu(title: "Edit")
         menu.addItem(withTitle: "Undo", action: NSSelectorFromString("undo:"), keyEquivalent: "z")
         let redo = menu.addItem(withTitle: "Redo", action: NSSelectorFromString("redo:"), keyEquivalent: "z")
@@ -181,18 +183,35 @@ enum MainMenu {
         let pasteMatch = menu.addItem(withTitle: "Paste and Match Style", action: NSSelectorFromString("pasteAsPlainText:"), keyEquivalent: "v")
         pasteMatch.keyEquivalentModifierMask = [.command, .option, .shift]
         menu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        item.submenu = menu
-        return item
+        return submenuItem(menu)
+    }
+
+    /// R15: ⇧⌘M / ⇧⌘K are free in both Gmail and Google Calendar, whose own
+    /// shortcuts are single letters and plain ⌘-letter combinations.
+    private static func viewMenuItem() -> NSMenuItem {
+        let menu = NSMenu(title: viewMenuTitle)
+        let mail = menu.addItem(withTitle: "Mail", action: #selector(AppDelegate.showMailView(_:)), keyEquivalent: "m")
+        mail.keyEquivalentModifierMask = [.command, .shift]
+        let calendar = menu.addItem(withTitle: "Calendar", action: #selector(AppDelegate.showCalendarView(_:)), keyEquivalent: "k")
+        calendar.keyEquivalentModifierMask = [.command, .shift]
+        return submenuItem(menu)
+    }
+
+    /// Populated for real by `MainWindowController.refresh()`; this is the
+    /// placeholder shown before the window controller exists.
+    private static func accountsMenuItem() -> NSMenuItem {
+        let menu = NSMenu(title: accountsMenuTitle)
+        menu.addItem(withTitle: "Add Account…", action: #selector(AppDelegate.addAccount(_:)), keyEquivalent: "")
+        return submenuItem(menu)
     }
 
     private static func windowMenuItem() -> NSMenuItem {
-        let item = NSMenuItem()
         let menu = NSMenu(title: "Window")
         menu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         menu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
-        item.submenu = menu
+        let item = submenuItem(menu)
         NSApp.windowsMenu = menu
         return item
     }
