@@ -34,7 +34,7 @@
 	     this repo. Empty means the updater will download and show release notes
 	     but refuse to install anything. -->
 	<key>MSUpdatePublicKey</key>
-	<string></string>
+	<string>PTjP/0S56Rf/4WO7SpuW7iYKbQhZN11km6fkKFU/PUQ=</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>

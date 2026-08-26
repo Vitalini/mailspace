@@ -160,7 +160,16 @@ fi
 #     exact requirement, so a certificate rotation has to be a deliberate source
 #     change rather than something noticed after a release strands every install.
 EXPECTED_REQUIREMENT="$REPO_ROOT/scripts/expected-requirement.txt"
-if codesign -dv "$APP_ABS" 2>&1 | grep -q "^Authority=MailSpace Self-Signed"; then
+# Captured before matching, and at verbosity 4: plain `codesign -dv` prints no
+# Authority line, and under `pipefail` a `grep -q` that exits early kills
+# codesign with SIGPIPE and fails the pipeline even when it did match. Either
+# mistake reports a properly signed app as ad-hoc.
+SIGN_INFO="$(codesign -dv --verbose=4 "$APP_ABS" 2>&1)"
+case "$SIGN_INFO" in
+  *"Authority=MailSpace Self-Signed"*) SIGNED_WITH_IDENTITY=1 ;;
+  *) SIGNED_WITH_IDENTITY=0 ;;
+esac
+if [ "$SIGNED_WITH_IDENTITY" = "1" ]; then
   GOT_REQ="$(codesign -d -r- "$APP_ABS" 2>/dev/null | sed -n 's/^designated => //p')"
   WANT_REQ="$(cat "$EXPECTED_REQUIREMENT" 2>/dev/null)"
   if [ -n "$WANT_REQ" ] && [ "$GOT_REQ" = "$WANT_REQ" ]; then

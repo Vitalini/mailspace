@@ -16,3 +16,5 @@ build/
 
 # The account list lives in ~/Library/Application Support/MailSpace, never here
 accounts.json
+dist/
+update-key
