@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-26
+
 ### Changed
 - Account tabs are wider, evenly padded, and all the same width — the longest
   account name sets the width for the whole row, so no name is cut short while
