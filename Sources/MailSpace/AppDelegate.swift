@@ -111,10 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         // A renamed address leaves its Keychain item behind; move it with the
         // account rather than orphaning it.
         if previousEmail != updated.email, !previousEmail.isEmpty {
-            if edit.password == nil, let carried = KeychainStore.password(for: previousEmail) {
-                KeychainStore.setPassword(carried, for: updated.email)
+            if edit.password == nil, let carried = KeychainStore.shared.password(for: previousEmail) {
+                KeychainStore.shared.setPassword(carried, for: updated.email)
             }
-            KeychainStore.deletePassword(for: previousEmail)
+            KeychainStore.shared.deletePassword(for: previousEmail)
         }
         applyPasswordEdit(edit, for: updated)
 
@@ -141,7 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         let session = sessions.removeValue(forKey: id)
         session?.detach()
         accountStore.remove(id: id)
-        KeychainStore.deletePassword(for: account.email)
+        KeychainStore.shared.deletePassword(for: account.email)
         unreadPoller.forget(accountId: id)
         windowController?.refresh()
         WebViewFactory.destroyDataStore(for: id)
@@ -260,10 +260,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private func applyPasswordEdit(_ edit: AccountEditor.Result, for account: Account) {
         guard !account.email.isEmpty else { return }
         if edit.clearPassword {
-            KeychainStore.deletePassword(for: account.email)
+            KeychainStore.shared.deletePassword(for: account.email)
         }
         if let password = edit.password {
-            KeychainStore.setPassword(password, for: account.email)
+            KeychainStore.shared.setPassword(password, for: account.email)
         }
     }
 }

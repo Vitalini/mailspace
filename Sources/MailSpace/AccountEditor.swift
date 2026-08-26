@@ -20,7 +20,7 @@ enum AccountEditor {
 
     static func run(editing account: Account? = nil) -> Result? {
         let isEditing = account != nil
-        let hasStoredPassword = account.map { KeychainStore.hasPassword(for: $0.email) } ?? false
+        let hasStoredPassword = account.map { KeychainStore.shared.hasPassword(for: $0.email) } ?? false
 
         let alert = NSAlert()
         alert.messageText = isEditing ? "Account Settings" : "Add Account"

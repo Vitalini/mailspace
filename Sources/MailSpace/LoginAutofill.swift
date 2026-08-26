@@ -36,7 +36,7 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
         }
 
         var payload: [String: String] = ["email": account.email]
-        if let password = KeychainStore.password(for: account.email) {
+        if let password = KeychainStore.shared.password(for: account.email) {
             payload["password"] = password
         }
         replyHandler(payload, nil)
