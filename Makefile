@@ -21,7 +21,19 @@ SELFTEST_APP       := $(BUILD_DIR)/$(APP_NAME)-SelfTest.app
 # prompt each time.
 SIGN_IDENTITY ?= MailSpace Self-Signed
 
-.PHONY: all build compile icon bundle sign signing-cert selftest-app run smoke test clean
+# The one place a version number is written by hand. The tag name, the two
+# Info.plist keys and the release asset name are all derived from it, so they
+# cannot disagree with each other.
+#
+# CFBundleVersion is computed, never stored: 1.2.0 -> 10200. Monotonic exactly
+# when the semver is, which `scripts/release.sh` enforces. A git commit count
+# would not be — this repo merges agent worktrees.
+VERSION      := $(shell cat VERSION)
+BUILD_NUMBER := $(shell awk -F. '{printf "%d", $$1*10000 + $$2*100 + $$3}' VERSION)
+GIT_DESCRIBE := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+
+.PHONY: all build compile icon bundle sign signing-cert selftest-app run smoke test clean \
+        version update-key changelog-draft release release-dry-run
 
 all: build
 
@@ -35,6 +47,20 @@ compile:
 icon:
 	./scripts/make-icns.sh $(ICON_SRC) $(ICNS)
 
+# Writes the version into an assembled bundle and then proves it landed. The
+# guard is the point: a renamed placeholder or a PlistBuddy that silently did
+# nothing would otherwise ship an app whose "you have" line is a lie, and the
+# updater compares against exactly that value.
+define stamp_version
+	/usr/libexec/PlistBuddy \
+		-c "Set :CFBundleShortVersionString $(VERSION)" \
+		-c "Set :CFBundleVersion $(BUILD_NUMBER)" \
+		-c "Add :MSGitDescribe string $(GIT_DESCRIBE)" \
+		$(1)/Contents/Info.plist >/dev/null
+	@grep -q '__MARKETING_VERSION__\|__BUILD_NUMBER__' $(1)/Contents/Info.plist \
+		&& { echo "bundle: version placeholder survived substitution in $(1)"; exit 1; } || true
+endef
+
 bundle: compile icon
 	rm -rf $(APP)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
@@ -42,6 +68,7 @@ bundle: compile icon
 	cp Resources/Info.plist $(APP)/Contents/Info.plist
 	cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	printf 'APPL????' > $(APP)/Contents/PkgInfo
+	$(call stamp_version,$(APP))
 
 ## signing-cert - create the stable self-signed code-signing identity (once per Mac)
 signing-cert:
@@ -72,6 +99,9 @@ selftest-app: sign
 		-c "Set :CFBundleDisplayName $(APP_NAME) SelfTest" \
 		-c "Delete :CFBundleURLTypes" \
 		$(SELFTEST_APP)/Contents/Info.plist >/dev/null
+	# The self-test bundle copies Resources/Info.plist directly, so it needs the
+	# same substitution — an unstamped copy would carry the raw placeholders.
+	$(call stamp_version,$(SELFTEST_APP))
 	@./scripts/codesign-bundle.sh $(SELFTEST_APP) $(SELFTEST_BUNDLE_ID) "$(SIGN_IDENTITY)"
 	@echo "build: $(SELFTEST_APP) ready ($(SELFTEST_BUNDLE_ID))"
 
@@ -89,5 +119,29 @@ smoke: selftest-app
 test:
 	swift test
 
+## version - print what this checkout would ship as
+version:
+	@echo "marketing  $(VERSION)"
+	@echo "build      $(BUILD_NUMBER)"
+	@echo "describe   $(GIT_DESCRIBE)"
+
+## update-key - create the Ed25519 key that signs release zips (once per Mac)
+##              Writes the private key OUTSIDE the repo and pastes the public
+##              half into Resources/Info.plist.
+update-key:
+	./scripts/make-update-key.sh
+
+## changelog-draft - seed CHANGELOG.md's [Unreleased] section from git log
+changelog-draft:
+	./scripts/changelog-draft.sh
+
+## release - build, package, sign, tag and publish v$(VERSION) to GitHub
+release:
+	./scripts/release.sh
+
+## release-dry-run - everything `release` does except tag, push and publish
+release-dry-run:
+	./scripts/release.sh --dry-run
+
 clean:
-	rm -rf .build $(BUILD_DIR)
+	rm -rf .build $(BUILD_DIR) dist

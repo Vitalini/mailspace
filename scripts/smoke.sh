@@ -115,6 +115,64 @@ else
   fail "app bundle identifier changed to \"$REAL_ID\" — it must stay $REAL_BUNDLE_ID"
 fi
 
+# 2d. The version the updater compares against. `Resources/Info.plist` carries
+#     placeholders and `make bundle` substitutes them from VERSION, so a bundle
+#     whose version does not match the file means the substitution did not run —
+#     which would ship an app that reports someone else's version number.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$REPO_ROOT/VERSION" ]; then
+  WANT_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+  WANT_BUILD="$(awk -F. '{printf "%d", $1*10000 + $2*100 + $3}' "$REPO_ROOT/VERSION")"
+  GOT_VERSION="$(plist_value "$APP_ABS" CFBundleShortVersionString)"
+  GOT_BUILD="$(plist_value "$APP_ABS" CFBundleVersion)"
+  if [ "$GOT_VERSION" = "$WANT_VERSION" ]; then
+    pass "CFBundleShortVersionString is $GOT_VERSION (matches VERSION)"
+  else
+    fail "CFBundleShortVersionString is \"$GOT_VERSION\", VERSION says \"$WANT_VERSION\""
+  fi
+  if [ "$GOT_BUILD" = "$WANT_BUILD" ]; then
+    pass "CFBundleVersion is $GOT_BUILD (derived from $WANT_VERSION)"
+  else
+    fail "CFBundleVersion is \"$GOT_BUILD\", expected \"$WANT_BUILD\""
+  fi
+else
+  fail "VERSION file missing at $REPO_ROOT/VERSION"
+fi
+
+# 2e. Update feed and key. An empty public key is allowed — the updater then
+#     shows release notes and refuses to install — but a non-HTTPS feed is not.
+FEED_URL="$(plist_value "$APP_ABS" MSUpdateFeedURL)"
+case "$FEED_URL" in
+  https://*) pass "update feed is $FEED_URL" ;;
+  *) fail "update feed must be HTTPS, got \"$FEED_URL\"" ;;
+esac
+UPDATE_KEY="$(plist_value "$APP_ABS" MSUpdatePublicKey)"
+if [ -z "$UPDATE_KEY" ]; then
+  echo "  note MSUpdatePublicKey is empty — the updater will refuse to install."
+  echo "       Run 'make update-key' before cutting a release."
+elif [ "$(printf '%s' "$UPDATE_KEY" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" = "32" ]; then
+  pass "MSUpdatePublicKey is a 32-byte Ed25519 key"
+else
+  fail "MSUpdatePublicKey is not 32 bytes of base64"
+fi
+
+# 2f. The updater refuses any download whose code signature does not satisfy this
+#     exact requirement, so a certificate rotation has to be a deliberate source
+#     change rather than something noticed after a release strands every install.
+EXPECTED_REQUIREMENT="$REPO_ROOT/scripts/expected-requirement.txt"
+if codesign -dv "$APP_ABS" 2>&1 | grep -q "^Authority=MailSpace Self-Signed"; then
+  GOT_REQ="$(codesign -d -r- "$APP_ABS" 2>/dev/null | sed -n 's/^designated => //p')"
+  WANT_REQ="$(cat "$EXPECTED_REQUIREMENT" 2>/dev/null)"
+  if [ -n "$WANT_REQ" ] && [ "$GOT_REQ" = "$WANT_REQ" ]; then
+    pass "designated requirement matches scripts/expected-requirement.txt"
+  else
+    fail "designated requirement is \"$GOT_REQ\", expected \"$WANT_REQ\""
+  fi
+else
+  echo "  note app is ad-hoc signed; the pinned designated requirement does not apply."
+  echo "       Run 'make signing-cert' — an ad-hoc build can never ship an update."
+fi
+
 # 2c. The self-test bundle must be the same code under a different identity, or
 #     the probes stop proving anything about the app that ships. `make
 #     selftest-app` records the checksum of the app binary it copied; signing
