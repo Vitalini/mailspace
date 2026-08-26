@@ -111,6 +111,35 @@ CI for `HEAD` is red; a dry run reports those instead of stopping.
 `make update-key` creates the Ed25519 key once. It writes the private key
 outside the repo and pastes only the public half into `Resources/Info.plist`.
 
+## Settings, and the three keys that have no row
+
+Everything worth choosing is in **Settings** (⌘,): which account composes a
+`mailto:`, whether an external link may bring the browser forward, where
+downloads land and what happens when one finishes, who owns `mailto:` on this
+Mac — and, per account, mail alerts, calendar alerts and whether that account
+counts toward the Dock badge. Nothing there needs a relaunch.
+
+Three switches deliberately have no row. They are debugging valves, read at the
+point of use, and a row would suggest they are worth touching:
+
+```sh
+# How often the unread count is fetched, in seconds. Default 60.
+defaults write com.vitalii.MailSpace UnreadPollSeconds -float 120
+
+# Force the whole-inbox atom feed regardless of the Dock badge scope — the way
+# out for the day Gmail retires the Primary smart label. Default NO.
+defaults write com.vitalii.MailSpace UnreadUsePlainFeed -bool YES
+
+# Stop the native side answering the sign-in autofill request at all.
+# Default NO.
+defaults write com.vitalii.MailSpace DisableSignInAutofill -bool YES
+```
+
+`defaults delete com.vitalii.MailSpace <key>` puts any of them back. Each is
+read at launch or at the moment it is used, so a change takes effect on the next
+launch at the latest. The promotion rule: touch one twice in a year and it has
+earned a row in the window.
+
 ## The checks never launch the real app
 
 `make smoke` inspects `build/MailSpace.app` on disk, but every check that actually starts
