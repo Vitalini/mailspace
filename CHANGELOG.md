@@ -10,6 +10,12 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Changed
+- Account tabs are wider, evenly padded, and all the same width — the longest
+  account name sets the width for the whole row, so no name is cut short while
+  there is room. Too many tabs for the window shrink together and then the bar
+  scrolls, rather than turning into a ragged row.
+
 ## [1.0.1] - 2026-08-26
 
 ### Fixed
