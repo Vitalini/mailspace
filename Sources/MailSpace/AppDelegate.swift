@@ -136,13 +136,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        // Ordering matters: WebKit refuses to delete a data store that is still
-        // in use, so tear the webviews down before removing the store.
+        // Ordering matters twice over. `forget` goes first so a poll still in
+        // flight cannot write a stale count back after the account is gone. And
+        // WebKit refuses to delete a data store that is still in use, so every
+        // webview on it — the account's popup windows included — is torn down
+        // before `destroyDataStore`.
+        unreadPoller.forget(accountId: id)
+        navigationPolicy.closePopups(for: id)
         let session = sessions.removeValue(forKey: id)
         session?.detach()
         accountStore.remove(id: id)
         KeychainStore.shared.deletePassword(for: account.email)
-        unreadPoller.forget(accountId: id)
         windowController?.refresh()
         WebViewFactory.destroyDataStore(for: id)
     }

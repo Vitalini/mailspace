@@ -98,6 +98,39 @@ enum LinkRouter {
     }
 }
 
+/// Decides whether a crashed webview may be reloaded again.
+///
+/// A page that keeps killing its WebContent process would otherwise reload
+/// forever; after `limit` terminations inside `window` seconds the webview is
+/// left alone until the burst ages out. Pure logic with an injected clock so it
+/// can be tested without crashing a real process.
+struct CrashThrottle {
+    let limit: Int
+    let window: TimeInterval
+
+    private var bursts: [ObjectIdentifier: (count: Int, startedAt: Date)] = [:]
+
+    init(limit: Int = 3, window: TimeInterval = 60) {
+        self.limit = limit
+        self.window = window
+    }
+
+    /// Records one termination and answers whether a reload should follow.
+    mutating func shouldReload(_ key: ObjectIdentifier, now: Date = Date()) -> Bool {
+        var burst = bursts[key] ?? (count: 0, startedAt: now)
+        if now.timeIntervalSince(burst.startedAt) > window {
+            burst = (count: 0, startedAt: now)
+        }
+        burst.count += 1
+        bursts[key] = burst
+        return burst.count <= limit
+    }
+
+    mutating func forget(_ key: ObjectIdentifier) {
+        bursts[key] = nil
+    }
+}
+
 /// The single navigation/UI delegate shared by every account webview.
 ///
 /// - non-Google links leave for the default browser (R12)
@@ -108,7 +141,15 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Handles a `mailto:` link clicked inside a webview.
     var mailtoHandler: ((URL) -> Void)?
 
-    private var popupWindows: [ObjectIdentifier: NSWindow] = [:]
+    /// One in-app popup: the window, and the account whose data store it runs
+    /// on so removing that account can take its popups with it.
+    private struct Popup {
+        let window: NSWindow
+        let accountId: UUID?
+    }
+
+    private var popupWindows: [ObjectIdentifier: Popup] = [:]
+    private var crashThrottle = CrashThrottle()
 
     private static var downloadsDirectory: URL {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -172,8 +213,16 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
 
     /// KTD8: macOS may reclaim a background account's WebContent process under
     /// memory pressure. Reload so notifications and unread polling resume
-    /// instead of dying silently.
+    /// instead of dying silently — but a page that keeps crashing gets a few
+    /// attempts, not an endless reload loop.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard crashThrottle.shouldReload(ObjectIdentifier(webView)) else {
+            Log.error(
+                "web content process kept terminating for \(webView.url?.absoluteString ?? "an unloaded page")"
+                + "; not reloading again"
+            )
+            return
+        }
         webView.reload()
     }
 
@@ -296,19 +345,49 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         window.center()
         window.makeKeyAndOrderFront(nil)
 
-        popupWindows[ObjectIdentifier(popup)] = window
+        popupWindows[ObjectIdentifier(popup)] = Popup(
+            window: window,
+            accountId: configuration.websiteDataStore.identifier
+        )
         return popup
     }
 
+    /// Closes every popup running on this account's data store. WebKit refuses
+    /// to delete a store that is still in use, so account removal has to take
+    /// the account's popups down before `destroyDataStore`.
+    func closePopups(for accountId: UUID) {
+        for (key, popup) in popupWindows where popup.accountId == accountId {
+            popupWindows[key] = nil
+            crashThrottle.forget(key)
+            dismiss(popup.window)
+        }
+    }
+
     private func closePopup(hosting webView: WKWebView) {
-        guard let window = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
+        let key = ObjectIdentifier(webView)
+        guard let popup = popupWindows.removeValue(forKey: key) else { return }
+        crashThrottle.forget(key)
+        dismiss(popup.window)
+    }
+
+    /// Drops the popup's webview before the window goes, so nothing keeps the
+    /// account's data store alive.
+    private func dismiss(_ window: NSWindow) {
+        if let popup = window.contentView as? WKWebView {
+            popup.stopLoading()
+            popup.navigationDelegate = nil
+            popup.uiDelegate = nil
+        }
         window.contentView = nil
         window.close()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        popupWindows = popupWindows.filter { $0.value !== window }
+        for (key, popup) in popupWindows where popup.window === window {
+            popupWindows[key] = nil
+            crashThrottle.forget(key)
+        }
     }
 
     // MARK: - WKDownloadDelegate
