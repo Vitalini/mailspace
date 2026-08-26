@@ -27,6 +27,10 @@ final class UpdateController: NSObject {
     private let installedBundle: URL
 
     private var checker: UpdateChecker?
+    /// Held for the length of an install. The URLSession task's completion
+    /// handler captures the installer weakly, so without this the installer is
+    /// deallocated the moment `install` returns and the download dies silently.
+    private var installer: UpdateInstaller?
     private var window: UpdateWindowController?
     private var timer: Timer?
     private var checkInFlight = false
@@ -193,13 +197,15 @@ final class UpdateController: NSObject {
         // observation, and nothing about a failed attempt should survive into
         // the next one.
         let installer = UpdateInstaller(publicKey: publicKey)
-        installer.install(release, replacing: installedBundle, progress: progress) { result in
+        self.installer = installer
+        installer.install(release, replacing: installedBundle, progress: progress) { [weak self] result in
             switch result {
             case .success(let installed):
                 completion(.success(installed))
                 UpdateInstaller.relaunch(installed)
             case .failure(let error):
                 Log.error("update install failed: \(UpdateInstaller.describe(error))")
+                self?.installer = nil
                 completion(.failure(error))
             }
         }

@@ -303,6 +303,23 @@ case "$STORE_OUT" in
   *) fail "data store removal: $STORE_OUT" ;;
 esac
 
+# 7c. The updater's verify-and-swap, against the real signed app, in a temporary
+#     directory. This is the code that could corrupt an install, and every
+#     interesting part of it lives outside Swift — ditto round-tripping a
+#     bundle, SecStaticCodeCheckValidity against a pinned certificate, and
+#     replaceItemAt on an app bundle. Only meaningful when the app carries the
+#     real signing identity; an ad-hoc build has nothing to pin to.
+if [ "$SIGNED_WITH_IDENTITY" = "1" ]; then
+  UPDATE_OUT="$(MAILSPACE_SELFTEST=update MAILSPACE_UPDATE_FIXTURE="$APP_ABS" \
+    run_with_timeout 90 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+  case "$UPDATE_OUT" in
+    *"result=ok"*) pass "update verify-and-swap: $UPDATE_OUT" ;;
+    *) fail "update verify-and-swap: $UPDATE_OUT" ;;
+  esac
+else
+  echo "  note ad-hoc build — the update verify-and-swap probe needs the real signing identity."
+fi
+
 # 8. Real launch through LaunchServices: open the self-test bundle, confirm the
 #    process stays alive, then quit it. Same binary and same Info.plist keys as
 #    the app, minus the identity — so this proves the assembled bundle launches

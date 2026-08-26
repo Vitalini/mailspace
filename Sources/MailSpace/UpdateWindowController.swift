@@ -168,7 +168,15 @@ final class UpdateWindowController: NSObject, NSWindowDelegate {
         notesView.isSelectable = true
         notesView.drawsBackground = false
         notesView.textContainerInset = NSSize(width: 8, height: 8)
+        // Without all six of these the notes lay out on one unwrapped line and
+        // the scroll view scrolls sideways instead of down.
         notesView.autoresizingMask = [.width]
+        notesView.minSize = NSSize(width: 0, height: 0)
+        notesView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        notesView.isVerticallyResizable = true
+        notesView.isHorizontallyResizable = false
+        notesView.textContainer?.widthTracksTextView = true
+        notesView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -201,7 +209,13 @@ final class UpdateWindowController: NSObject, NSWindowDelegate {
         buttons.orientation = .horizontal
         buttons.spacing = 10
 
-        let buttonRow = NSStackView(views: [NSView(), buttons])
+        // A spacer that yields all its width so the buttons sit on the right.
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        buttons.setContentHuggingPriority(.required, for: .horizontal)
+
+        let buttonRow = NSStackView(views: [spacer, buttons])
         buttonRow.orientation = .horizontal
         buttonRow.distribution = .fill
 

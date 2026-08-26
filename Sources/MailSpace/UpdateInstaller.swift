@@ -148,7 +148,11 @@ final class UpdateInstaller: NSObject {
 
     // MARK: - The swap
 
-    private static func stageAndSwap(payload: Data, release: UpdateRelease, installedBundle: URL) throws -> URL {
+    /// Unpack, verify, replace. Not private so `MAILSPACE_SELFTEST=update` can
+    /// drive the whole thing against a real signed bundle in a temporary
+    /// directory — this is the code that would corrupt an install if it were
+    /// wrong, and a unit test cannot reach it.
+    static func stageAndSwap(payload: Data, release: UpdateRelease, installedBundle: URL) throws -> URL {
         let parent = installedBundle.deletingLastPathComponent()
         // Staged beside the target, so the replacement is a rename on one volume
         // rather than a copy across two.

@@ -29,6 +29,15 @@ import WebKit
 /// that only the top frame of `accounts.google.com` is answered, and that page
 /// scripts cannot see the handler at all.
 ///
+/// `MAILSPACE_SELFTEST=update` drives the updater's verify-and-swap against the
+/// real signed `MailSpace.app` (path in `MAILSPACE_UPDATE_FIXTURE`), inside a
+/// temporary directory: it packages the bundle the way `scripts/release.sh`
+/// does, unpacks it the way the installer does, checks it against the pinned
+/// designated requirement, and performs the atomic replacement. It also proves
+/// the requirement discriminates — this bundle, which differs only in its
+/// identifier, must be rejected — and that a version that disagrees with the
+/// release is refused. Nothing outside the temporary directory is touched.
+///
 /// `MAILSPACE_SELFTEST=store` builds a real `AccountSession`, uses its data
 /// store, then tears it down exactly the way account removal does and deletes
 /// the store — proof that "signed out and deleted from this Mac" is true.
@@ -51,6 +60,7 @@ enum SelfTest {
         case shim
         case autofill
         case store
+        case update
     }
 
     /// The throwaway identity self-tests run under. Assembled by
@@ -610,5 +620,147 @@ final class StoreRemovalProbe: NSObject, WKNavigationDelegate {
             }
             SelfTest.finish("store result=FAILED error=\(error.localizedDescription)")
         }
+    }
+}
+
+
+/// Drives the update installer's verify-and-swap end to end, against the real
+/// signed app, entirely inside a temporary directory.
+///
+/// A probe rather than a unit test because every interesting failure lives
+/// outside Swift: `ditto` round-tripping a bundle, `SecStaticCodeCheckValidity`
+/// against a pinned certificate, and `replaceItemAt` on an app bundle. This is
+/// the one piece of the updater that could corrupt an install, so it is proven
+/// on a real bundle rather than reasoned about.
+final class UpdateProbe {
+    private let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("mailspace-update-probe-\(UUID().uuidString)")
+
+    private func done(_ line: String) -> Never {
+        try? FileManager.default.removeItem(at: scratch)
+        SelfTest.finish(line)
+    }
+
+    func run() {
+        SelfTest.armWatchdog(60) { "update result=TIMEOUT" }
+
+        guard let fixturePath = ProcessInfo.processInfo.environment["MAILSPACE_UPDATE_FIXTURE"] else {
+            done("update result=SKIPPED reason=no-MAILSPACE_UPDATE_FIXTURE")
+        }
+        let fixture = URL(fileURLWithPath: fixturePath)
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            done("update result=FAILED step=fixture reason=no-app-at-\(fixture.path)")
+        }
+        guard
+            let plist = try? Data(contentsOf: fixture.appendingPathComponent("Contents/Info.plist")),
+            let info = (try? PropertyListSerialization.propertyList(from: plist, format: nil)) as? [String: Any],
+            let version = SemanticVersion((info["CFBundleShortVersionString"] as? String) ?? "")
+        else {
+            done("update result=FAILED step=fixture reason=unreadable-version")
+        }
+
+        // 1. The genuine app satisfies the requirement the installer demands.
+        do {
+            try UpdateSecurity.verifyCodeSignature(of: fixture)
+        } catch {
+            done("update result=FAILED step=genuine-signature error=\(UpdateInstaller.describe(error))")
+        }
+
+        // 2. …and the requirement actually discriminates. This bundle is the
+        //    same binary under a different identifier, which is the cheapest
+        //    possible impostor, and it has to be refused.
+        do {
+            try UpdateSecurity.verifyCodeSignature(of: Bundle.main.bundleURL)
+            done("update result=FAILED step=impostor-accepted bundle=\(Bundle.main.bundleIdentifier ?? "none")")
+        } catch {
+            // Expected.
+        }
+
+        // 3. Package it the way scripts/release.sh does.
+        do {
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        } catch {
+            done("update result=FAILED step=scratch error=\(error.localizedDescription)")
+        }
+        let archive = scratch.appendingPathComponent("MailSpace.zip")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", fixture.path, archive.path]
+        do {
+            try ditto.run()
+            ditto.waitUntilExit()
+        } catch {
+            done("update result=FAILED step=package error=\(error.localizedDescription)")
+        }
+        guard ditto.terminationStatus == 0, let payload = try? Data(contentsOf: archive) else {
+            done("update result=FAILED step=package reason=ditto-exit-\(ditto.terminationStatus)")
+        }
+
+        // 4. An "installed" copy to replace, beside it in the same directory.
+        let installed = scratch.appendingPathComponent("MailSpace.app")
+        let copy = Process()
+        copy.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        copy.arguments = [fixture.path, installed.path]
+        try? copy.run()
+        copy.waitUntilExit()
+        guard copy.terminationStatus == 0 else {
+            done("update result=FAILED step=stage-installed reason=ditto-exit-\(copy.terminationStatus)")
+        }
+        let originalInode = (try? FileManager.default.attributesOfItem(atPath: installed.path)[.systemFileNumber] as? Int) ?? nil
+
+        // 5. A release whose version disagrees with the app inside it must be
+        //    refused before anything is replaced.
+        let wrong = Self.release(version: SemanticVersion(version.major, version.minor, version.patch + 1))
+        do {
+            _ = try UpdateInstaller.stageAndSwap(payload: payload, release: wrong, installedBundle: installed)
+            done("update result=FAILED step=version-mismatch-accepted")
+        } catch {
+            // Expected.
+        }
+
+        // 6. The real thing.
+        let replaced: URL
+        do {
+            replaced = try UpdateInstaller.stageAndSwap(
+                payload: payload,
+                release: Self.release(version: version),
+                installedBundle: installed
+            )
+        } catch {
+            done("update result=FAILED step=swap error=\(UpdateInstaller.describe(error))")
+        }
+
+        // 7. What is there afterwards has to be a working, verifying app — and
+        //    nothing else may be left lying around next to it.
+        do {
+            try UpdateSecurity.verifyCodeSignature(of: replaced)
+            try UpdateSecurity.verifyIdentity(of: replaced, expecting: version)
+        } catch {
+            done("update result=FAILED step=after-swap error=\(UpdateInstaller.describe(error))")
+        }
+        let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: scratch.path)) ?? [])
+            .filter { $0.hasPrefix(".MailSpace-update-") || $0.hasSuffix(".app.old") }
+        guard leftovers.isEmpty else {
+            done("update result=FAILED step=cleanup leftovers=\(leftovers.joined(separator: ","))")
+        }
+        let newInode = (try? FileManager.default.attributesOfItem(atPath: replaced.path)[.systemFileNumber] as? Int) ?? nil
+
+        done(
+            "update result=ok version=\(version) genuineAccepted=1 impostorRejected=1 "
+            + "versionMismatchRejected=1 swapped=1 replacedInPlace=\(replaced.path == installed.path ? 1 : 0) "
+            + "inodeChanged=\(originalInode != newInode ? 1 : 0) bytes=\(payload.count)"
+        )
+    }
+
+    private static func release(version: SemanticVersion) -> UpdateRelease {
+        UpdateRelease(
+            version: version,
+            tag: "v\(version)",
+            title: "MailSpace \(version)",
+            notes: "",
+            assetURL: URL(string: "https://example.invalid/MailSpace-\(version).zip")!,
+            signatureURL: URL(string: "https://example.invalid/MailSpace-\(version).zip.sig")!,
+            assetSize: 0
+        )
     }
 }

@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var shimProbe: ShimProbe?
     private var autofillProbe: AutofillProbe?
     private var storeProbe: StoreRemovalProbe?
+    private var updateProbe: UpdateProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
@@ -73,6 +74,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         if SelfTest.mode == .store {
             storeProbe = StoreRemovalProbe()
             storeProbe?.run()
+            return
+        }
+        if SelfTest.mode == .update {
+            updateProbe = UpdateProbe()
+            updateProbe?.run()
             return
         }
 
