@@ -9,12 +9,17 @@ import WebKit
 ///
 /// `MAILSPACE_SELFTEST=login` instead loads the real Google sign-in page with
 /// the app's user agent and reports whether Google served the form or the
-/// "this browser or app may not be secure" block. Both modes are inert on a
-/// normal launch.
+/// "this browser or app may not be secure" block.
+///
+/// `MAILSPACE_SELFTEST=shim` exercises the notification shim against a local
+/// page: it proves permission is granted and that both `new Notification(…)`
+/// and `ServiceWorkerRegistration.showNotification(…)` reach the native
+/// handler. All modes are inert on a normal launch.
 enum SelfTest {
     enum Mode: String {
         case state
         case login
+        case shim
     }
 
     static var mode: Mode? {
@@ -125,6 +130,68 @@ final class LoginProbe: NSObject, WKNavigationDelegate {
                     + "title=\"\(title)\" url=\(url)"
                 )
             }
+        }
+    }
+}
+
+
+/// Drives the notification shim against a local page, so the JS-to-native
+/// plumbing can be checked without a Google sign-in.
+final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    private let webView: WKWebView
+    private var delivered: [String] = []
+    private var finished = false
+
+    private static let page = """
+    <!DOCTYPE html><html><body><script>
+      window.__probe = { permission: Notification.permission };
+      Notification.requestPermission(function (granted) { window.__probe.callback = granted; });
+      new Notification('Page title', { body: 'Page body', tag: 'page-tag' });
+      if (window.ServiceWorkerRegistration && window.ServiceWorkerRegistration.prototype.showNotification) {
+        window.ServiceWorkerRegistration.prototype.showNotification.call({}, 'Worker title', { body: 'Worker body' });
+        window.__probe.serviceWorkerOverridden = true;
+      }
+      Notification('No-new title');
+    </script></body></html>
+    """
+
+    override init() {
+        let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.addUserScript(NotificationShim.userScript)
+        webView = WebViewFactory.makeWebView(configuration: configuration)
+        super.init()
+        configuration.userContentController.add(self, name: NotificationShim.handlerName)
+        webView.navigationDelegate = self
+    }
+
+    func run(timeout: TimeInterval = 20) {
+        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://mail.google.com/"))
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, !self.finished else { return }
+            SelfTest.finish("shim result=timeout delivered=\(self.delivered.count)")
+        }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let payload = message.body as? [String: Any] else { return }
+        delivered.append((payload["title"] as? String) ?? "")
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.report()
+        }
+    }
+
+    private func report() {
+        guard !finished else { return }
+        finished = true
+        webView.evaluateJavaScript("JSON.stringify(window.__probe || {})") { [weak self] value, _ in
+            let probe = (value as? String) ?? "{}"
+            let titles = (self?.delivered ?? []).joined(separator: "|")
+            let count = self?.delivered.count ?? 0
+            SelfTest.finish("shim result=\(count == 3 ? "ok" : "PARTIAL") delivered=\(count) titles=\(titles) probe=\(probe)")
         }
     }
 }

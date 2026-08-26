@@ -1,22 +1,44 @@
 import AppKit
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating {
+final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating, NotificationRouting {
     let accountStore = AccountStore()
 
     private let navigationPolicy = NavigationPolicy()
     private let loginAutofill = LoginAutofill()
+    private let notificationBridge = NotificationBridge()
+    private let unreadPoller = UnreadPoller()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private var loginProbe: LoginProbe?
+    private var shimProbe: ShimProbe?
+    /// A mailto: URL that arrived before the window was ready (cold launch).
+    private var pendingMailto: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.build()
         loginAutofill.locator = self
+        notificationBridge.locator = self
+        notificationBridge.router = self
+        notificationBridge.onMailNotification = { [weak self] accountId in
+            self?.unreadPoller.refresh(accountId: accountId)
+        }
+        unreadPoller.mailWebViews = { [weak self] in
+            guard let self else { return [] }
+            return self.accountStore.accounts.compactMap { account in
+                guard account.mailEnabled, let webView = self.sessions[account.id]?.webView(for: .mail) else { return nil }
+                return (accountId: account.id, webView: webView)
+            }
+        }
 
         if SelfTest.mode == .login {
             loginProbe = LoginProbe()
             loginProbe?.run()
+            return
+        }
+        if SelfTest.mode == .shim {
+            shimProbe = ShimProbe()
+            shimProbe?.run()
             return
         }
 
@@ -28,6 +50,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         windowController = controller
         controller.restoreSelection()
         controller.showWindow()
+
+        notificationBridge.start()
+        unreadPoller.start()
+        if let pending = pendingMailto {
+            pendingMailto = nil
+            openMailto(pending)
+        }
 
         if SelfTest.mode == .state {
             SelfTest.schedule { [weak self] in
@@ -83,7 +112,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         sessions[id]?.syncEnabledViews(with: updated)
         sessions[id]?.loadIfNeeded()
+        if !updated.mailEnabled { unreadPoller.forget(accountId: id) }
         windowController?.refresh()
+        unreadPoller.refresh(accountId: id)
     }
 
     func requestRemoveAccount(id: UUID) {
@@ -103,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         session?.detach()
         accountStore.remove(id: id)
         KeychainStore.deletePassword(for: account.email)
+        unreadPoller.forget(accountId: id)
         windowController?.refresh()
         WebViewFactory.destroyDataStore(for: id)
     }
@@ -132,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         if let view = account.effectiveView {
             windowController?.select(accountId: account.id, view: view)
         }
+        unreadPoller.refresh(accountId: account.id)
     }
 
     @objc func showMailView(_ sender: Any?) {
@@ -142,13 +175,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         windowController?.selectView(.calendar)
     }
 
+    // MARK: - NotificationRouting
+
+    func focusAccount(_ accountId: UUID, view: AccountView) {
+        windowController?.focus(accountId: accountId, view: view)
+    }
+
+    // MARK: - mailto:
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let mailto = urls.first(where: { $0.scheme?.lowercased() == "mailto" }) else { return }
+        // On a cold launch the URL arrives before the window exists; hold it
+        // until the mail webview is there to receive it.
+        if windowController == nil {
+            pendingMailto = mailto
+            return
+        }
+        openMailto(mailto)
+    }
+
+    @objc func makeDefaultMailApp(_ sender: Any?) {
+        NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto") { error in
+            guard let error else { return }
+            FileHandle.standardError.write(
+                Data("MailSpace: could not become the default mail app: \(error.localizedDescription)\n".utf8)
+            )
+        }
+    }
+
+    private func openMailto(_ url: URL) {
+        guard let controller = windowController else { return }
+
+        // With no accounts there is nowhere to compose — show the first-run
+        // prompt instead of failing silently.
+        guard
+            let accountId = controller.selection?.accountId ?? accountStore.accounts.first(where: { $0.mailEnabled })?.id,
+            let account = accountStore.account(id: accountId), account.mailEnabled,
+            let webView = sessions[accountId]?.webView(for: .mail),
+            let compose = Self.composeURL(for: url)
+        else {
+            NSApp.activate(ignoringOtherApps: true)
+            controller.showWindow()
+            return
+        }
+
+        webView.load(URLRequest(url: compose))
+        controller.focus(accountId: accountId, view: .mail)
+    }
+
+    /// Hands the whole mailto payload to Gmail, which parses the recipients,
+    /// subject and body itself.
+    static func composeURL(for mailto: URL) -> URL? {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        guard let encoded = mailto.absoluteString.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+        return URL(string: "https://mail.google.com/mail/u/0/?extsrc=mailto&url=\(encoded)")
+    }
+
     // MARK: - Sessions
 
     @discardableResult
     private func makeSession(for account: Account) -> AccountSession {
         let session = AccountSession(
             account: account,
-            userScripts: [LoginAutofill.userScript],
+            userScripts: [NotificationShim.userScript, LoginAutofill.userScript],
+            messageHandlers: [NotificationShim.handlerName: notificationBridge],
             replyHandlers: [LoginAutofill.handlerName: loginAutofill]
         )
         session.setDelegates(navigationPolicy)
@@ -211,6 +302,8 @@ enum MainMenu {
     private static func fileMenuItem() -> NSMenuItem {
         let menu = NSMenu(title: "File")
         menu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Make MailSpace the Default Mail App", action: #selector(AppDelegate.makeDefaultMailApp(_:)), keyEquivalent: "")
         return submenuItem(menu)
     }
 
