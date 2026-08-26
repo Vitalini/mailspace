@@ -23,10 +23,15 @@ BIN="$SELFTEST_ABS/Contents/MacOS/MailSpace"
 REAL_BUNDLE_ID="com.vitalii.MailSpace"
 SELFTEST_BUNDLE_ID="com.vitalii.MailSpace.SelfTest"
 FAILED=0
+# A check that could not prove what it exists to prove. Counted separately from
+# a failure — nothing is known to be broken — but never silently: a skipped
+# check used to leave the run reporting PASS, which is the one thing it must not
+# do. An unproven check is not a passing one.
+SKIPPED=0
 
 pass() { echo "  ok   $*"; }
 fail() { echo "  FAIL $*"; FAILED=1; }
-skip() { echo "  SKIP $*"; }
+skip() { echo "  SKIP $*"; SKIPPED=$((SKIPPED + 1)); }
 
 plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
 
@@ -167,7 +172,12 @@ if [ $SELFTEST_STATUS -eq 0 ] && [ -n "$STATE_LINE" ]; then
 else
   fail "self-check failed (exit $SELFTEST_STATUS): $SELFTEST_OUT"
 fi
+# Only meaningful if the run produced a state line at all. A crashed self-check
+# has no account count to read, and this used to report the empty result as
+# "it is reading the real account list" — a second, invented failure on top of
+# the real one, pointing at the wrong thing.
 case "$STATE_LINE" in
+  "") ;;
   *"accounts=0"*) pass "self-test identity has its own (empty) account list" ;;
   *) fail "self-test run sees $(echo "$STATE_LINE" | sed -n 's/.*\(accounts=[0-9]*\).*/\1/p') — it is reading the real account list" ;;
 esac
@@ -187,6 +197,8 @@ if [ "${SMOKE_SKIP_NETWORK:-0}" != "1" ]; then
     *) fail "sign-in autofill: $AUTOFILL_OUT" ;;
   esac
 else
+  # Plain echo, not `skip`: the operator asked for these to be left out, so the
+  # run is doing what it was told rather than failing to prove something.
   echo "  skip network checks (SMOKE_SKIP_NETWORK=1)"
 fi
 
@@ -255,10 +267,16 @@ echo "         \"no application set to open the URL about:blank\" dialog may app
 echo "       * banners: nothing here can prove one was drawn on screen. Do Not Disturb"
 echo "         suppresses banners for every app while still delivering the notification."
 
-if [ $FAILED -eq 0 ]; then
-  echo "smoke: PASS"
-  exit 0
-else
+# Three outcomes, three exit codes. INCOMPLETE is not FAIL — nothing is known to
+# be broken — but it is not PASS either, and it has to reach the exit status or
+# a caller that only looks at `make smoke` learns nothing from it.
+if [ $FAILED -ne 0 ]; then
   echo "smoke: FAIL"
   exit 1
+elif [ $SKIPPED -ne 0 ]; then
+  echo "smoke: INCOMPLETE — $SKIPPED check(s) could not be proven; nothing failed"
+  exit 2
+else
+  echo "smoke: PASS"
+  exit 0
 fi

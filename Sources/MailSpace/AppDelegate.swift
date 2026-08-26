@@ -212,9 +212,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
     /// Deletes those at launch.
     ///
-    /// `fetchAllDataStoreIdentifiers` is what makes this safe to do at all: it
-    /// reports only stores that actually exist, and `remove(forIdentifier:)`
-    /// segfaults on an identifier with nothing on disk.
+    /// Asking WebKit which stores exist, rather than deriving the list from
+    /// `~/Library/WebKit`, keeps "a store" defined by the framework that owns
+    /// the layout — and means the sweep only ever hands `destroyDataStore` an
+    /// identifier WebKit itself just reported.
+    ///
+    /// Both calls go through `WebViewFactory`, which is where the reason lives:
+    /// on this path there is usually no webview yet, and WebKit's class-level
+    /// data-store APIs crash in a process that has not instantiated one.
     ///
     /// It is skipped whenever `accounts.json` did not read cleanly. A file that
     /// failed to parse leaves an empty account list, and sweeping against that
@@ -226,7 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         }
 
         let accounts = accountStore.accounts
-        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { identifiers in
+        WebViewFactory.dataStoreIdentifiers { identifiers in
             for orphan in Self.orphanedStores(onDisk: identifiers, claimedBy: accounts) {
                 WebViewFactory.destroyDataStore(for: orphan) { error in
                     guard let error else { return }
