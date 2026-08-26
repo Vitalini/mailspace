@@ -182,6 +182,56 @@ final class TabReorderingTests: XCTestCase {
         XCTAssertTrue(TabOrder.tabs(for: store.accounts).contains(TabRef(accountId: work.id, view: .mail)))
     }
 
+    /// The gap `testNewlyEnabledServiceLandsAtTheEnd` missed: it only enables a
+    /// service that was never on, so no stale slot exists. A service that is
+    /// switched *off* used to keep its index — `applyTabOrder` renumbers only
+    /// enabled tabs, so that index went stale, collided with whatever was
+    /// renumbered onto it, and the service reappeared wedged mid-bar instead of
+    /// at the end.
+    func testAReEnabledServiceLandsAtTheEndRatherThanItsOldSlot() {
+        let store = AccountStore(directory: directory)
+        let a = store.add(name: "A")
+        let b = store.add(name: "B")
+        XCTAssertEqual(TabOrder.tabs(for: store.accounts), [
+            TabRef(accountId: a.id, view: .mail),
+            TabRef(accountId: a.id, view: .calendar),
+            TabRef(accountId: b.id, view: .mail),
+            TabRef(accountId: b.id, view: .calendar)
+        ])
+
+        // Switch A's Calendar off — it must give its slot up, not keep it.
+        store.update(id: a.id, name: "A", email: "", mailEnabled: true, calendarEnabled: false, color: a.color)
+        XCTAssertNil(store.account(id: a.id)?.order(for: .calendar))
+
+        // Renumber the remaining tabs by dragging B's Mail to the front. This
+        // is what used to hand A's stale Calendar index to A's Mail tab.
+        store.moveTab(TabRef(accountId: b.id, view: .mail), to: 0)
+
+        // Switch A's Calendar back on.
+        store.update(id: a.id, name: "A", email: "", mailEnabled: true, calendarEnabled: true, color: a.color)
+
+        XCTAssertEqual(
+            TabOrder.tabs(for: store.accounts).last,
+            TabRef(accountId: a.id, view: .calendar),
+            "a re-enabled service belongs at the end of the tab bar"
+        )
+        // And no two tabs share a slot any more.
+        let orders = store.accounts.flatMap { account in
+            account.enabledViews.compactMap { account.order(for: $0) }
+        }
+        XCTAssertEqual(Set(orders).count, orders.count, "tab slots must be unique: \(orders)")
+    }
+
+    /// The disabled service's slot is really gone from disk, not just in memory.
+    func testADisabledServiceStoresNoTabSlot() {
+        let store = AccountStore(directory: directory)
+        let work = store.add(name: "Work")
+
+        store.update(id: work.id, name: "Work", email: "", mailEnabled: true, calendarEnabled: false, color: .blue)
+
+        XCTAssertNil(AccountStore(directory: directory).account(id: work.id)?.order(for: .calendar))
+    }
+
     func testMovingAnUnknownTabIsANoOp() {
         let (store, _, _) = makeStore()
         let before = TabOrder.tabs(for: store.accounts)

@@ -87,8 +87,14 @@ final class AccountStore {
         // The memberwise init starts from scratch, so carry the account's tab
         // positions across an edit — otherwise saving settings would shuffle
         // the tab bar.
+        //
+        // A service being switched off gives its slot up instead. `applyTabOrder`
+        // only renumbers *enabled* tabs, so a slot kept by a disabled one goes
+        // stale and starts colliding with whatever gets renumbered onto it —
+        // and switching the service back on then wedged it mid-bar rather than
+        // appending it, because `appendTabOrders` only fills slots that are nil.
         for view in AccountView.allCases {
-            updated.setOrder(existing.order(for: view), for: view)
+            updated.setOrder(updated.isEnabled(view) ? existing.order(for: view) : nil, for: view)
         }
         // Never leave the account pointing at a service it no longer offers.
         if !updated.isEnabled(updated.lastView), let fallback = updated.enabledViews.first {
