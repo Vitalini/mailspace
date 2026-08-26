@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "MailSpace",
             path: "Sources/MailSpace"
+        ),
+        .testTarget(
+            name: "MailSpaceTests",
+            dependencies: ["MailSpace"],
+            path: "Tests/MailSpaceTests"
         )
     ]
 )
