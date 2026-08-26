@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-26
+
 ### Fixed
 - A release note too long for one line stays part of its bullet in the update
   window, instead of breaking off into a stray line at the left margin.
