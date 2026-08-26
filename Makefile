@@ -1,11 +1,18 @@
 APP_NAME    := MailSpace
+BUNDLE_ID   := com.vitalii.MailSpace
 CONFIG      := release
 BUILD_DIR   := build
 APP         := $(BUILD_DIR)/$(APP_NAME).app
 ICON_SRC    := assets/icon-1024.png
 ICNS        := $(BUILD_DIR)/AppIcon.icns
 
-.PHONY: all build compile icon bundle sign run smoke test clean
+# Stable self-signed code-signing identity, created once by `make signing-cert`.
+# Without it the bundle is ad-hoc signed, which works but gives the app a new
+# identity on every rebuild — and therefore a fresh notification permission
+# prompt each time.
+SIGN_IDENTITY ?= MailSpace Self-Signed
+
+.PHONY: all build compile icon bundle sign signing-cert run smoke test clean
 
 all: build
 
@@ -27,8 +34,20 @@ bundle: compile icon
 	cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	printf 'APPL????' > $(APP)/Contents/PkgInfo
 
+## signing-cert - create the stable self-signed code-signing identity (once per Mac)
+signing-cert:
+	./scripts/make-signing-cert.sh
+
 sign: bundle
-	codesign --force --sign - --identifier com.vitalii.MailSpace $(APP)
+	@if security find-certificate -c "$(SIGN_IDENTITY)" >/dev/null 2>&1; then \
+		codesign --force --sign "$(SIGN_IDENTITY)" --identifier $(BUNDLE_ID) $(APP); \
+		echo "build: signed with \"$(SIGN_IDENTITY)\""; \
+	else \
+		codesign --force --sign - --identifier $(BUNDLE_ID) $(APP); \
+		echo "build: warning - no \"$(SIGN_IDENTITY)\" certificate, fell back to ad-hoc signing."; \
+		echo "build:          notifications still work, but macOS will ask for notification"; \
+		echo "build:          permission again after every rebuild. Run 'make signing-cert' once to stop that."; \
+	fi
 	@echo "build: $(APP) ready"
 
 ## run - build and launch the app

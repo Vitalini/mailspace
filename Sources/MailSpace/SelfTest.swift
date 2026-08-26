@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 import WebKit
 
 /// Headless checks driven by `scripts/smoke.sh` and by hand during QA.
@@ -11,10 +12,14 @@ import WebKit
 /// the app's user agent and reports whether Google served the form or the
 /// "this browser or app may not be secure" block.
 ///
-/// `MAILSPACE_SELFTEST=shim` exercises the notification shim against a local
-/// page: it proves permission is granted and that both `new Notification(…)`
-/// and `ServiceWorkerRegistration.showNotification(…)` reach the native
-/// handler.
+/// `MAILSPACE_SELFTEST=shim` exercises the whole notification path against a
+/// local page: `new Notification(…)` and
+/// `ServiceWorkerRegistration.showNotification(…)` go through the injected
+/// shim, the real `NotificationBridge` and on into `UNUserNotificationCenter`,
+/// and the probe reports the native authorization status, how many frames
+/// passed the real origin check, and how many notifications actually landed in
+/// Notification Center. Counting script messages alone would pass even if the
+/// native half were dead.
 ///
 /// `MAILSPACE_SELFTEST=autofill` loads the real Google sign-in page with the
 /// autofill script attached and a stub credential, then reads the identifier
@@ -157,9 +162,23 @@ final class LoginProbe: NSObject, WKNavigationDelegate {
 }
 
 
-/// Drives the notification shim against a local page, so the JS-to-native
-/// plumbing can be checked without a Google sign-in.
+/// Drives the notification path end to end against a local page: injected shim
+/// → `NotificationBridge` → `UNUserNotificationCenter`, so both the JS-to-native
+/// plumbing and native delivery can be checked without a Google sign-in.
+///
+/// The probe counts script messages, checks each message's frame against the
+/// real origin gate, *and* reads back what Notification Center actually holds.
+/// These are independent failures — the shim can deliver every message while
+/// the system drops every notification — and only the last one is what the
+/// user sees.
 final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    /// A fixed identifier so repeated probe runs reuse one throwaway data store
+    /// instead of leaving a new one behind each time.
+    private static let probeAccountId = UUID(uuidString: "5D9F2C71-0A4B-4E1E-9C3A-6B8F0D2E7A15")!
+
+    private let account: Account
+    private let bridge = NotificationBridge()
+    private let session: AccountSession
     private let webView: WKWebView
     private var delivered: [String] = []
     /// Of those, the ones whose frame passed the real origin check. The shim's
@@ -169,6 +188,10 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private var gated = 0
     private var lastOrigin = ""
     private var finished = false
+
+    private var authorization = "unknown"
+    private var alertSetting = "unknown"
+    private var nativeDelivered = -1
 
     private static let page = """
     <!DOCTYPE html><html><body><script>
@@ -184,19 +207,58 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     """
 
     override init() {
-        let configuration = SelfTest.makeProbeConfiguration()
-        configuration.userContentController.addUserScript(NotificationShim.userScript)
-        webView = WebViewFactory.makeWebView(configuration: configuration)
+        account = Account(id: Self.probeAccountId, name: "Probe", mailEnabled: true, calendarEnabled: false)
+        // The real session type, so the bridge's own webview→account lookup is
+        // the thing under test rather than a stand-in for it.
+        session = AccountSession(
+            account: account,
+            userScripts: [NotificationShim.userScript],
+            messageHandlers: [:]
+        )
+        webView = session.webView(for: .mail)!
         super.init()
-        configuration.userContentController.add(self, name: NotificationShim.handlerName)
+        bridge.locator = self
+        webView.configuration.userContentController.add(self, name: NotificationShim.handlerName)
         webView.navigationDelegate = self
     }
 
-    func run(timeout: TimeInterval = 20) {
-        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://mail.google.com/"))
+    func run(timeout: TimeInterval = 25) {
+        // Exactly what a normal launch does: register the delegate and ask for
+        // permission once.
+        bridge.start()
+
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self, !self.finished else { return }
             SelfTest.finish("shim result=timeout delivered=\(self.delivered.count)")
+        }
+
+        // Notification Center holds delivered notifications between runs, so a
+        // leftover from an earlier probe would inflate this run's count. Clear
+        // the probe's own — and only those, never the user's real mail
+        // notifications — before posting anything.
+        purgeProbeNotifications { [weak self] in
+            guard let self else { return }
+            SelfTest.presentOffscreen(self.webView)
+            self.webView.loadHTMLString(Self.page, baseURL: URL(string: "https://mail.google.com/"))
+        }
+    }
+
+    /// The bridge stamps every notification with the account name as subtitle,
+    /// which is what tells the probe's own notifications apart from real ones.
+    private func purgeProbeNotifications(then next: @escaping () -> Void) {
+        guard Bundle.main.bundleIdentifier != nil else {
+            next()
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { [account] delivered in
+            let mine = delivered
+                .filter { $0.request.content.subtitle == account.name }
+                .map(\.request.identifier)
+            if !mine.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: mine)
+            }
+            DispatchQueue.main.async(execute: next)
         }
     }
 
@@ -207,29 +269,94 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let origin = message.frameInfo.securityOrigin
         lastOrigin = "\(origin.protocol)://\(origin.host):\(origin.port)"
         if NotificationOrigin.isTrusted(message.frameInfo, view: .mail) { gated += 1 }
+
+        // Hand the message straight on to the real bridge, which is what turns
+        // it into a `UNNotificationRequest` — and which applies the same origin
+        // check itself, so an untrusted frame reaches the counter above but
+        // never Notification Center.
+        bridge.userContentController(userContentController, didReceive: message)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.report()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.readNotificationCenter()
+        }
+    }
+
+    /// Reads the native side back: what the system thinks we are allowed to do,
+    /// and what actually reached Notification Center.
+    private func readNotificationCenter() {
+        guard !finished else { return }
+        finished = true
+
+        guard Bundle.main.bundleIdentifier != nil else {
+            report()
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self, account] settings in
+            self?.authorization = Self.describe(settings.authorizationStatus)
+            self?.alertSetting = Self.describe(settings.alertSetting)
+            center.getDeliveredNotifications { notifications in
+                // Count only what this probe posted, so a real mail
+                // notification sitting in Notification Center cannot pass the
+                // check on the probe's behalf.
+                let mine = notifications.filter { $0.request.content.subtitle == account.name }
+                self?.nativeDelivered = mine.count
+                center.removeDeliveredNotifications(withIdentifiers: mine.map(\.request.identifier))
+                DispatchQueue.main.async { self?.report() }
+            }
         }
     }
 
     private func report() {
-        guard !finished else { return }
-        finished = true
         webView.evaluateJavaScript("JSON.stringify(window.__probe || {})") { [weak self] value, _ in
+            guard let self else { return }
             let probe = (value as? String) ?? "{}"
-            let titles = (self?.delivered ?? []).joined(separator: "|")
-            let count = self?.delivered.count ?? 0
-            let gated = self?.gated ?? 0
-            let origin = self?.lastOrigin ?? ""
-            let ok = count == 3 && gated == 3
+            let titles = self.delivered.joined(separator: "|")
+            let count = self.delivered.count
+            // All three halves have to hold: every shim message arrived, every
+            // one of them came from a frame the real origin check trusts, and
+            // Notification Center really is holding the notifications they
+            // produced. `auth` is reported but not gated on — whether the user
+            // has answered the permission prompt is their decision, not a
+            // defect in the build.
+            let ok = count == 3 && self.gated == 3 && self.nativeDelivered == 3
             SelfTest.finish(
-                "shim result=\(ok ? "ok" : "PARTIAL") delivered=\(count) trusted=\(gated) "
-                + "origin=\(origin) titles=\(titles) probe=\(probe)"
+                "shim result=\(ok ? "ok" : "PARTIAL") delivered=\(count) trusted=\(self.gated) "
+                + "native=\(self.nativeDelivered) auth=\(self.authorization) alert=\(self.alertSetting) "
+                + "origin=\(self.lastOrigin) titles=\(titles) probe=\(probe)"
             )
         }
+    }
+
+    private static func describe(_ status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .notDetermined: return "notDetermined"
+        case .denied: return "denied"
+        case .authorized: return "authorized"
+        case .provisional: return "provisional"
+        @unknown default: return "unknown(\(status.rawValue))"
+        }
+    }
+
+    private static func describe(_ setting: UNNotificationSetting) -> String {
+        switch setting {
+        case .notSupported: return "notSupported"
+        case .disabled: return "disabled"
+        case .enabled: return "enabled"
+        @unknown default: return "unknown(\(setting.rawValue))"
+        }
+    }
+}
+
+extension ShimProbe: SessionLocating {
+    func session(hosting webView: WKWebView) -> AccountSession? {
+        session.hosts(webView) ? session : nil
+    }
+
+    func account(for accountId: UUID) -> Account? {
+        accountId == account.id ? account : nil
     }
 }
 
