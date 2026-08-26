@@ -93,6 +93,18 @@ enum AccountColor: String, Codable, CaseIterable {
         }
     }
 
+    /// The colour as a dot, for the places an account is named in a list rather
+    /// than shown as a tab: the compose picker and the Settings pop-ups.
+    func dotImage(diameter: CGFloat = 10) -> NSImage {
+        let size = NSSize(width: diameter, height: diameter)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        nsColor.setFill()
+        NSBezierPath(ovalIn: NSRect(origin: .zero, size: size)).fill()
+        image.unlockFocus()
+        return image
+    }
+
     /// Default colour for the n-th account, so a new account is never the same
     /// colour as the one before it.
     static func forPosition(_ index: Int) -> AccountColor {
@@ -115,6 +127,13 @@ struct Account: Codable, Equatable, Identifiable {
     var calendarEnabled: Bool
     var lastView: AccountView
 
+    /// Per-account alert and badge participation (A2, A3, A4). All three default
+    /// to `true`, so an `accounts.json` written before they existed keeps
+    /// today's behaviour and gains the fields on its next save.
+    var notifyMail: Bool
+    var notifyCalendar: Bool
+    var countInBadge: Bool
+
     /// `nil` for an account written before colours existed. The store
     /// backfills those on load so no two accounts start out identical.
     private var explicitColor: AccountColor?
@@ -136,6 +155,7 @@ struct Account: Codable, Equatable, Identifiable {
         case id, name, email, mailEnabled, calendarEnabled, lastView
         case explicitColor = "color"
         case mailOrder, calendarOrder
+        case notifyMail, notifyCalendar, countInBadge
     }
 
     func order(for view: AccountView) -> Int? {
@@ -164,12 +184,18 @@ struct Account: Codable, Equatable, Identifiable {
         mailEnabled: Bool = true,
         calendarEnabled: Bool = true,
         color: AccountColor? = nil,
-        lastView: AccountView = .mail
+        lastView: AccountView = .mail,
+        notifyMail: Bool = true,
+        notifyCalendar: Bool = true,
+        countInBadge: Bool = true
     ) {
         self.id = id
         self.name = name
         self.email = email
         self.explicitColor = color
+        self.notifyMail = notifyMail
+        self.notifyCalendar = notifyCalendar
+        self.countInBadge = countInBadge
         // An account with nothing enabled would have no views at all; Mail is
         // the sensible floor.
         self.mailEnabled = (mailEnabled || calendarEnabled) ? mailEnabled : true
@@ -191,7 +217,10 @@ struct Account: Codable, Equatable, Identifiable {
             email: email,
             mailEnabled: mail,
             calendarEnabled: calendar,
-            lastView: lastView
+            lastView: lastView,
+            notifyMail: try container.decodeIfPresent(Bool.self, forKey: .notifyMail) ?? true,
+            notifyCalendar: try container.decodeIfPresent(Bool.self, forKey: .notifyCalendar) ?? true,
+            countInBadge: try container.decodeIfPresent(Bool.self, forKey: .countInBadge) ?? true
         )
         self.explicitColor = try container.decodeIfPresent(AccountColor.self, forKey: .explicitColor)
         self.mailOrder = try container.decodeIfPresent(Int.self, forKey: .mailOrder)

@@ -28,7 +28,10 @@ enum NotificationShim {
           window.webkit.messageHandlers.mailspaceNotify.postMessage({
             title: String(title == null ? '' : title),
             body: String(options.body == null ? '' : options.body),
-            tag: String(options.tag == null ? '' : options.tag)
+            tag: String(options.tag == null ? '' : options.tag),
+            // The page already knows when it does not want to make noise —
+            // which is why MailSpace has no sound picker of its own.
+            silent: !!options.silent
           });
         } catch (e) {
           // A page without the handler (or a sandboxed frame) simply gets no

@@ -100,7 +100,13 @@ final class AccountStore {
             mailEnabled: mailEnabled,
             calendarEnabled: calendarEnabled,
             color: color,
-            lastView: existing.lastView
+            lastView: existing.lastView,
+            // The account dialog knows nothing about the alert and badge
+            // flags, so an edit carries them across rather than resetting
+            // them to `true` through the memberwise init.
+            notifyMail: existing.notifyMail,
+            notifyCalendar: existing.notifyCalendar,
+            countInBadge: existing.countInBadge
         )
         // The memberwise init starts from scratch, so carry the account's tab
         // positions across an edit — otherwise saving settings would shuffle
@@ -134,6 +140,31 @@ final class AccountStore {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let index = accounts.firstIndex(where: { $0.id == id }) else { return }
         accounts[index].name = trimmed
+        save()
+    }
+
+    /// The three per-account switches the Accounts pane owns (A2, A3, A4).
+    enum Flag {
+        case notifyMail
+        case notifyCalendar
+        case countInBadge
+    }
+
+    /// Mirrors `setLastView`: one write, one save, no other state touched. The
+    /// Settings pane never reaches past this into the account record.
+    func setFlag(_ flag: Flag, to value: Bool, for id: UUID) {
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
+        switch flag {
+        case .notifyMail:
+            guard accounts[index].notifyMail != value else { return }
+            accounts[index].notifyMail = value
+        case .notifyCalendar:
+            guard accounts[index].notifyCalendar != value else { return }
+            accounts[index].notifyCalendar = value
+        case .countInBadge:
+            guard accounts[index].countInBadge != value else { return }
+            accounts[index].countInBadge = value
+        }
         save()
     }
 

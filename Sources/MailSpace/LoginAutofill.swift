@@ -32,6 +32,13 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
 
     weak var locator: SessionLocating?
 
+    private let settings: AppSettings
+
+    init(settings: AppSettings = .shared) {
+        self.settings = settings
+        super.init()
+    }
+
     /// The registration, world included, so no caller can put the handler in
     /// the page's world by accident.
     var registration: ScriptReplyHandler {
@@ -80,6 +87,10 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
     ) {
         guard
             message.name == Self.handlerName,
+            // The `DisableSignInAutofill` valve (KTD-S6), on the native side
+            // where it means something. The page-side hostname test protects
+            // nothing and is not where an off switch belongs.
+            !settings.disableSignInAutofill,
             Self.isTrustedOrigin(message.frameInfo),
             let webView = message.webView,
             let session = locator?.session(hosting: webView),

@@ -38,6 +38,14 @@ import WebKit
 /// identifier, must be rejected — and that a version that disagrees with the
 /// release is refused. Nothing outside the temporary directory is touched.
 ///
+/// `MAILSPACE_SELFTEST=settings` checks that `AppSettings.registerDefaults`
+/// populates the documented values, that a written value round-trips, and — the
+/// point of running it under a bundle rather than in `swift test` — that all of
+/// it happens in the throwaway defaults domain rather than the real app's.
+/// With `MAILSPACE_SETTINGS_SHOT=<directory>` it also renders both Settings
+/// panes into PNGs. The window is built at negative coordinates and ordered
+/// back, never front: nothing appears on any display.
+///
 /// `MAILSPACE_SELFTEST=store` builds a real `AccountSession`, uses its data
 /// store, then tears it down exactly the way account removal does and deletes
 /// the store — proof that "signed out and deleted from this Mac" is true.
@@ -61,6 +69,7 @@ enum SelfTest {
         case autofill
         case store
         case update
+        case settings
     }
 
     /// The throwaway identity self-tests run under. Assembled by
@@ -241,11 +250,16 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     /// instead of leaving a new one behind each time.
     private static let probeAccountId = UUID(uuidString: "5D9F2C71-0A4B-4E1E-9C3A-6B8F0D2E7A15")!
 
-    private let account: Account
+    /// `var` because the second round mutes it — exactly the flag the Accounts
+    /// pane writes.
+    private var account: Account
     private let bridge = NotificationBridge()
     private let session: AccountSession
     private let webView: WKWebView
     private var delivered: [String] = []
+    /// What the first round delivered, kept for the report once `delivered` is
+    /// reused by the muted round.
+    private var deliveredWhileAudible: [String] = []
     /// Of those, the ones whose frame passed the real origin check. The shim's
     /// handler has to live in the page world, so that check is the only thing
     /// keeping a third-party frame from raising native banners — it is worth
@@ -257,6 +271,14 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private var authorization = "unknown"
     private var alertSetting = "unknown"
     private var nativeDelivered = -1
+
+    /// The second round, with `notifyMail` off (A2). Its whole point is that
+    /// the script messages still arrive and pass the origin check while nothing
+    /// reaches Notification Center — which is only true if the guard sits on
+    /// the native side rather than in the injected page script.
+    private var mutedRound = false
+    private var mutedMessages = -1
+    private var mutedNative = -1
 
     private static let page = """
     <!DOCTYPE html><html><body><script>
@@ -349,7 +371,12 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            self?.readNotificationCenter()
+            guard let self else { return }
+            if self.mutedRound {
+                self.readMutedRound()
+            } else {
+                self.readNotificationCenter()
+            }
         }
     }
 
@@ -389,8 +416,40 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
                 }
                 self.nativeDelivered = mine.count
                 center.removeDeliveredNotifications(withIdentifiers: mine.map(\.request.identifier))
-                DispatchQueue.main.async { self.report() }
+                DispatchQueue.main.async { self.startMutedRound() }
             }
+        }
+    }
+
+    /// Round two: the same page, the same origin, the same bridge — with the
+    /// account's mail alerts switched off.
+    private func startMutedRound() {
+        mutedRound = true
+        // The first round's read-back armed this against a second `didFinish`;
+        // the second round is exactly that, and it is wanted.
+        finished = false
+        account.notifyMail = false
+        deliveredWhileAudible = delivered
+        delivered = []
+        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://mail.google.com/"))
+    }
+
+    private func readMutedRound() {
+        guard !finished else { return }
+        finished = true
+        mutedMessages = delivered.count
+
+        guard Bundle.main.bundleIdentifier != nil else {
+            report()
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { [weak self, account] notifications in
+            guard let self else { return }
+            let mine = notifications.filter { $0.request.content.subtitle == account.name }
+            self.mutedNative = mine.count
+            center.removeDeliveredNotifications(withIdentifiers: mine.map(\.request.identifier))
+            DispatchQueue.main.async { self.report() }
         }
     }
 
@@ -398,9 +457,13 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         webView.evaluateJavaScript("JSON.stringify(window.__probe || {})") { [weak self] value, _ in
             guard let self else { return }
             let probe = (value as? String) ?? "{}"
-            let titles = self.delivered.joined(separator: "|")
-            let count = self.delivered.count
-            let plumbing = count == 3 && self.gated == 3
+            let titles = self.deliveredWhileAudible.joined(separator: "|")
+            let count = self.deliveredWhileAudible.count
+            let plumbing = count == 3 && self.gated == 6
+            // A2, proven where it counts: the page still posted, the messages
+            // still reached the native side and still passed the origin check,
+            // and none of them became a notification.
+            let muteHolds = self.mutedMessages == 3 && self.mutedNative == 0
             let authorized = self.authorization == "authorized" || self.authorization == "provisional"
 
             // Three independent things have to hold: every shim message
@@ -414,6 +477,9 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             if !plumbing {
                 result = "FAILED"
                 reason = " reason=shim-to-bridge-plumbing-broken"
+            } else if self.nativeDelivered == 3 && !muteHolds {
+                result = "FAILED"
+                reason = " reason=muted-account-still-reached-notification-center"
             } else if self.nativeDelivered == 3 {
                 result = "ok"
             } else if !authorized {
@@ -426,7 +492,8 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
 
             SelfTest.finish(
                 "shim result=\(result)\(reason) delivered=\(count) trusted=\(self.gated) "
-                + "native=\(self.nativeDelivered) auth=\(self.authorization) alert=\(self.alertSetting) "
+                + "native=\(self.nativeDelivered) mutedMessages=\(self.mutedMessages) "
+                + "mutedNative=\(self.mutedNative) auth=\(self.authorization) alert=\(self.alertSetting) "
                 + "bundle=\(Bundle.main.bundleIdentifier ?? "none") "
                 + "origin=\(self.lastOrigin) titles=\(titles) probe=\(probe)"
             )
@@ -762,5 +829,298 @@ final class UpdateProbe {
             signatureURL: URL(string: "https://example.invalid/MailSpace-\(version).zip.sig")!,
             assetSize: 0
         )
+    }
+}
+
+/// Checks the settings domain, and optionally renders the Settings window.
+///
+/// Two things are only provable inside a bundle: that `registerDefaults` lands
+/// in the *throwaway* defaults domain (a `swift test` process has no bundle
+/// identity of its own to be wrong about), and that the window builds and lays
+/// out with real accounts in it.
+///
+/// The render is offscreen by construction — the window is moved to negative
+/// coordinates and ordered *back*, the same way every webview probe here does
+/// it. Nothing is ordered front and the app is never activated.
+final class SettingsProbe: NSObject, AccountHosting {
+    private let store: AccountStore
+    private var controller: SettingsWindowController?
+    /// What the pane asked the host to do, so "the checkbox re-totals the
+    /// badge" is an assertion rather than a hope.
+    private var badgeCalls: [Bool] = []
+
+    /// Its own directory under the temporary folder: a probe never writes the
+    /// account list of the app the user runs.
+    override init() {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mailspace-settings-probe-\(UUID().uuidString)", isDirectory: true)
+        store = AccountStore(directory: directory)
+        super.init()
+    }
+
+    // MARK: - AccountHosting
+
+    var accountStore: AccountStore { store }
+    func session(for accountId: UUID) -> AccountSession? { nil }
+    func requestAddAccount() {}
+    func requestEditAccount(id: UUID) {}
+    func requestRemoveAccount(id: UUID, presentedOn: NSWindow?) {}
+    func tabBecameVisible(accountId: UUID, view: AccountView) {}
+    func badgeInputsChanged(repoll: Bool) { badgeCalls.append(repoll) }
+
+    func run() {
+        SelfTest.armWatchdog(30) { "settings result=TIMEOUT" }
+
+        guard SelfTest.isSelfTestBundle else {
+            SelfTest.finish("settings result=FAILED reason=not-the-self-test-bundle")
+        }
+
+        let defaults = UserDefaults.standard
+        AppSettings.registerDefaults(in: defaults)
+        let settings = AppSettings(defaults: defaults)
+
+        var failures: [String] = []
+        func expect(_ condition: Bool, _ label: String) {
+            if !condition { failures.append(label) }
+        }
+        expect(settings.composeFrom == .ask, "composeFrom")
+        expect(settings.openLinksInBackground, "openLinksInBackground")
+        expect(settings.downloadFinishedAction == .notify, "downloadFinishedAction")
+        expect(settings.badgeScope == .primary, "badgeScope")
+        expect(settings.usesSystemDownloadDirectory, "downloadDirectory")
+        expect(settings.unreadPollSeconds == 60, "unreadPollSeconds")
+        expect(!settings.unreadUsePlainFeed, "unreadUsePlainFeed")
+        expect(!settings.disableSignInAutofill, "disableSignInAutofill")
+
+        // A written value round-trips, and it lands in this bundle's own domain.
+        settings.badgeScope = .everything
+        expect(settings.badgeScope == .everything, "badgeScope-roundtrip")
+        expect(
+            defaults.persistentDomain(forName: SelfTest.bundleIdentifier)?[AppSettings.Key.badgeScope] != nil,
+            "domain-is-the-self-test-one"
+        )
+        settings.badgeScope = .primary
+
+        guard failures.isEmpty else {
+            SelfTest.finish("settings result=FAILED failed=\(failures.joined(separator: ","))")
+        }
+
+        seedAccounts()
+        let controller = SettingsWindowController(
+            updates: UpdateController(settings: settings),
+            settings: settings,
+            accounts: self
+        )
+        self.controller = controller
+
+        let applied = live(controller, settings: settings)
+        guard applied.failures.isEmpty else {
+            SelfTest.finish("settings result=FAILED live=\(applied.failures.joined(separator: ","))")
+        }
+
+        guard let directory = ProcessInfo.processInfo.environment["MAILSPACE_SETTINGS_SHOT"] else {
+            SelfTest.finish(
+                "settings result=ok defaults=8 applied=\(applied.checked) "
+                + "domain=\(SelfTest.bundleIdentifier) render=skipped"
+            )
+        }
+        render(into: URL(fileURLWithPath: directory, isDirectory: true), applied: applied.checked)
+    }
+
+    /// Fires the panes' own controls the way a click does — `NSApp.sendAction`
+    /// on the control's real target and action — and asserts the value moved.
+    ///
+    /// This is the check a screenshot cannot make: that a control is wired to a
+    /// preference and to the code that applies it, rather than being a
+    /// checkbox that only remembers its own state.
+    private func live(_ controller: SettingsWindowController, settings: AppSettings) -> (checked: Int, failures: [String]) {
+        var failures: [String] = []
+        var checked = 0
+        func expect(_ condition: Bool, _ label: String) {
+            checked += 1
+            if !condition { failures.append(label) }
+        }
+
+        guard
+            let generalWindow = controller.windowForOffscreenRender(paneIndex: 0),
+            let generalView = generalWindow.contentViewController?.view
+        else { return (checked, ["no-general-pane"]) }
+        generalWindow.setFrameOrigin(NSPoint(x: -6000, y: -6000))
+        generalWindow.displayIfNeeded()
+
+        // G2
+        if let box: NSButton = Self.control(in: generalView, where: { $0.title.hasPrefix("Open links") }) {
+            box.state = .off
+            Self.click(box)
+            expect(!settings.openLinksInBackground, "G2-off")
+            box.state = .on
+            Self.click(box)
+            expect(settings.openLinksInBackground, "G2-on")
+        } else {
+            failures.append("G2-missing")
+        }
+
+        // G4
+        if let popup: NSPopUpButton = Self.control(in: generalView, where: { $0.itemTitles.contains("Notify me") }) {
+            popup.selectItem(withTitle: DownloadFinishedAction.reveal.displayName)
+            Self.click(popup)
+            expect(settings.downloadFinishedAction == .reveal, "G4-reveal")
+            popup.selectItem(withTitle: DownloadFinishedAction.notify.displayName)
+            Self.click(popup)
+            expect(settings.downloadFinishedAction == .notify, "G4-notify")
+        } else {
+            failures.append("G4-missing")
+        }
+
+        // G1 — the pop-up is rebuilt from the account list, so the third item is
+        // the first account.
+        if
+            let popup: NSPopUpButton = Self.control(in: generalView, where: { $0.itemTitles.contains("Ask me each time") }),
+            let first = store.accounts.first
+        {
+            popup.selectItem(withTitle: first.name)
+            Self.click(popup)
+            expect(settings.composeFrom == .fixed(first.id), "G1-fixed")
+            popup.selectItem(withTitle: "Ask me each time")
+            Self.click(popup)
+            expect(settings.composeFrom == .ask, "G1-ask")
+        } else {
+            failures.append("G1-missing")
+        }
+
+        guard
+            let accountsWindow = controller.windowForOffscreenRender(paneIndex: 1),
+            let accountsView = accountsWindow.contentViewController?.view
+        else { return (checked, failures + ["no-accounts-pane"]) }
+        accountsWindow.setFrameOrigin(NSPoint(x: -6000, y: -6000))
+        accountsWindow.displayIfNeeded()
+
+        guard let account = store.accounts.first else { return (checked, failures + ["no-account"]) }
+
+        // A2 and A4, through the table's own checkboxes.
+        for (label, flag) in [("Mail alerts", AccountStore.Flag.notifyMail), ("Dock badge", .countInBadge)] {
+            guard let box: NSButton = Self.control(
+                in: accountsView,
+                where: { $0.accessibilityLabel() == "\(label) — \(account.name)" }
+            ) else {
+                failures.append("A-\(flag)-missing")
+                continue
+            }
+            badgeCalls = []
+            box.state = .off
+            Self.click(box)
+            let stored = store.account(id: account.id)
+            expect(
+                flag == .notifyMail ? stored?.notifyMail == false : stored?.countInBadge == false,
+                "\(label)-off"
+            )
+            if flag == .countInBadge {
+                // A4 re-totals immediately; it must not wait for a poll.
+                expect(badgeCalls == [false], "\(label)-resums-the-badge")
+            }
+            box.state = .on
+            Self.click(box)
+        }
+
+        // A5
+        if let popup: NSPopUpButton = Self.control(
+            in: accountsView,
+            where: { $0.itemTitles.contains(BadgeScope.primary.displayName) }
+        ) {
+            badgeCalls = []
+            popup.selectItem(withTitle: BadgeScope.everything.displayName)
+            Self.click(popup)
+            expect(settings.badgeScope == .everything, "A5-everything")
+            // The number means something else now, so it is fetched again.
+            expect(badgeCalls == [true], "A5-repolls")
+            popup.selectItem(withTitle: BadgeScope.primary.displayName)
+            Self.click(popup)
+            expect(settings.badgeScope == .primary, "A5-primary")
+        } else {
+            failures.append("A5-missing")
+        }
+
+        return (checked, failures)
+    }
+
+    private static func click(_ control: NSControl) {
+        guard let action = control.action else { return }
+        NSApp.sendAction(action, to: control.target, from: control)
+    }
+
+    /// The first control of this kind anywhere in the pane that matches.
+    private static func control<T: NSControl>(in view: NSView, where matches: (T) -> Bool) -> T? {
+        if let control = view as? T, matches(control) { return control }
+        for subview in view.subviews {
+            if let found: T = control(in: subview, where: matches) { return found }
+        }
+        return nil
+    }
+
+    private func render(into directory: URL, applied: Int) {
+        guard let controller else {
+            SelfTest.finish("settings result=FAILED reason=no-controller")
+        }
+
+        var written: [String] = []
+        for (index, name) in [(0, "settings-general"), (1, "settings-accounts")] {
+            guard let window = controller.windowForOffscreenRender(paneIndex: index) else {
+                SelfTest.finish("settings result=FAILED reason=no-window pane=\(name)")
+            }
+            // Off every display, and ordered *back*: the probe must never put a
+            // window in front of whatever the user is doing.
+            window.setFrameOrigin(NSPoint(x: -6000, y: -6000))
+            window.orderBack(nil)
+            window.displayIfNeeded()
+
+            let target = directory.appendingPathComponent("\(name).png")
+            guard Self.capture(window, to: target) else {
+                SelfTest.finish("settings result=FAILED reason=capture-failed pane=\(name)")
+            }
+            written.append(target.lastPathComponent)
+        }
+        SelfTest.finish(
+            "settings result=ok accounts=\(store.accounts.count) applied=\(applied) "
+            + "rendered=\(written.joined(separator: ","))"
+        )
+    }
+
+    /// The account rows the render shows. Read from a source file when one is
+    /// named, so the picture carries the real names and tab colours rather than
+    /// invented ones; nothing is ever written back to it.
+    private func seedAccounts() {
+        guard store.accounts.isEmpty else { return }
+        let source = ProcessInfo.processInfo.environment["MAILSPACE_SETTINGS_SHOT_ACCOUNTS"]
+            .map { URL(fileURLWithPath: $0) }
+        if
+            let source,
+            let data = try? Data(contentsOf: source),
+            let records = try? JSONDecoder().decode([Account].self, from: data),
+            !records.isEmpty
+        {
+            for account in records {
+                store.add(
+                    name: account.name,
+                    email: account.email,
+                    mailEnabled: account.mailEnabled,
+                    calendarEnabled: account.calendarEnabled,
+                    color: account.color
+                )
+            }
+            return
+        }
+        store.add(name: "Personal", email: "personal@example.com", color: .blue)
+        store.add(name: "Work", email: "work@example.com", color: .orange)
+    }
+
+    /// Captures the window with its titlebar and toolbar: the theme frame is
+    /// the view that draws them, and it caches offscreen just as the content
+    /// view does.
+    private static func capture(_ window: NSWindow, to url: URL) -> Bool {
+        guard let target = window.contentView?.superview ?? window.contentView else { return false }
+        guard let rep = target.bitmapImageRepForCachingDisplay(in: target.bounds) else { return false }
+        target.cacheDisplay(in: target.bounds, to: rep)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: url)) != nil
     }
 }
