@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         NSApp.mainMenu = MainMenu.build()
         loginAutofill.locator = self
         navigationPolicy.mailtoHandler = { [weak self] url in self?.openMailto(url) }
+        navigationPolicy.onSignInCompleted = { [weak self] accountId in self?.signInCompleted(accountId) }
         notificationBridge.locator = self
         notificationBridge.router = self
         notificationBridge.onMailNotification = { [weak self] accountId in
@@ -244,6 +245,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     }
 
     // MARK: - Sessions
+
+    /// One account has just signed in. Its tabs share the data store, so they
+    /// only need re-navigating — the ones still sitting on a signed-out page.
+    private func signInCompleted(_ accountId: UUID) {
+        guard let session = sessions[accountId] else { return }
+        session.reloadSignedOutViews()
+        // The badge poll fetches from inside the mail webview, so it has to
+        // wait for the signed-in page to be the one it runs in; a poll fired
+        // now would still be in the signed-out origin and come back empty.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.unreadPoller.refresh(accountId: accountId)
+        }
+    }
 
     @discardableResult
     private func makeSession(for account: Account) -> AccountSession {

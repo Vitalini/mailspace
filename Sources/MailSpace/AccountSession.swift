@@ -96,6 +96,21 @@ final class AccountSession {
         }
     }
 
+    /// After a sign-in on this account's shared data store, brings every view
+    /// that is still on a signed-out page onto its real surface. Cookies are
+    /// already shared; Gmail and Calendar simply never re-ask for a session
+    /// once their signed-out page has rendered.
+    ///
+    /// A view already on its own app surface is never touched — that is where
+    /// an unsent draft lives, and skipping it is also what stops this from
+    /// looping: the test for "needs bringing back" is the same test that says
+    /// sign-in is done.
+    func reloadSignedOutViews() {
+        for (view, webView) in views where !AuthSurface.isSignedIn(webView.url, for: view) {
+            webView.load(URLRequest(url: view.url))
+        }
+    }
+
     /// Tears the session down before its data store can be deleted. WebKit
     /// refuses to remove a store that is still in use, so every webview must
     /// stop loading, drop its delegates and unregister its message handlers

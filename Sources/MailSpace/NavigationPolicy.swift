@@ -68,7 +68,7 @@ enum LinkRouter {
 
     /// True for `google.com` and its country variants (`google.co.uk`,
     /// `google.de`) plus any subdomain of them.
-    private static func isGoogleDomain(_ host: String) -> Bool {
+    static func isGoogleDomain(_ host: String) -> Bool {
         guard let range = host.range(of: "google.", options: .backwards) else { return false }
 
         let before = host[..<range.lowerBound]
@@ -95,6 +95,133 @@ enum LinkRouter {
             counter += 1
         } while FileManager.default.fileExists(atPath: candidate.path)
         return candidate
+    }
+}
+
+/// Tells a Google sign-in step apart from a signed-in Gmail/Calendar surface.
+///
+/// Two decisions hang off this, both in `NavigationPolicy`:
+/// - a "Sign in" link may take over the tab it was clicked in instead of
+///   opening a popup the tab never hears from again;
+/// - a webview that went through the sign-in chain and then landed on an app
+///   surface has finished authenticating, so its popup can close and the
+///   account's stale tabs can be brought onto their real surfaces.
+///
+/// The app side is a positive allowlist on purpose. Google's auth chain has no
+/// enumerable set of steps (identifier, password, TOTP, passkey, consent,
+/// speed bumps, chooser), so a missing entry there would close a popup
+/// mid-2FA; an unrecognised surface here just means "not done yet".
+/// Pure logic, kept next to `LinkRouter` so it can be tested.
+enum AuthSurface {
+    enum Kind: Equatable {
+        /// Part of the sign-in chain — the user is still authenticating.
+        case signIn
+        /// A signed-in Gmail/Calendar surface, i.e. one of MailSpace's own tabs.
+        case app(AccountView)
+        /// Everything else, marketing and help pages included.
+        case other
+    }
+
+    /// Auth hosts that are not `accounts.google.<tld>`: the YouTube sign-in
+    /// bridge, the device/passkey challenge helper, and the short sign-in host.
+    private static let signInHosts: Set<String> = [
+        "accounts.youtube.com",
+        "gds.google.com",
+        "signin.google.com"
+    ]
+
+    /// First path segment under `/mail` or `/calendar` that means a marketing
+    /// or documentation page rather than the product itself.
+    private static let nonAppSegments: Set<String> = ["about", "help", "intl", "policies", "support"]
+
+    /// Classifies on host and path only — query and fragment (`?pli=1`,
+    /// `?authuser=`, `#inbox`, `?view=cm`) never change what a page is.
+    static func classify(_ url: URL?) -> Kind {
+        guard
+            let url,
+            let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+            let host = url.host?.lowercased()
+        else { return .other }
+
+        if isSignInHost(host) { return .signIn }
+
+        let segments = url.path.split(separator: "/").map(String.init)
+        switch host {
+        case "mail.google.com", "mail.googlemail.com":
+            return isAppPath(segments, root: "mail") ? .app(.mail) : .other
+        case "calendar.google.com":
+            return isAppPath(segments, root: "calendar") ? .app(.calendar) : .other
+        default:
+            return .other
+        }
+    }
+
+    static func isSignInHost(_ host: String) -> Bool {
+        let host = host.lowercased()
+        if signInHosts.contains(host) { return true }
+        return host.hasPrefix("accounts.") && LinkRouter.isGoogleDomain(host)
+    }
+
+    /// True when this URL is the view's own signed-in surface — which is both
+    /// "authentication finished" and "this tab needs nothing done to it".
+    static func isSignedIn(_ url: URL?, for view: AccountView) -> Bool {
+        classify(url) == .app(view)
+    }
+
+    /// Whether a new-window request should take over the opener rather than
+    /// become a popup.
+    ///
+    /// Only a clicked link qualifies. A scripted `window.open` gets a real
+    /// window: its return value and the `window.opener` channel are part of the
+    /// flow Google runs, and Gmail's own print, compose-in-a-new-window and
+    /// "open in new window" all come through that way. And a window opened from
+    /// a signed-in surface is left alone whatever it is — that page can hold an
+    /// unsent draft.
+    static func shouldLoadInOpener(requested: URL, openerURL: URL?, isLinkActivated: Bool) -> Bool {
+        guard isLinkActivated, classify(requested) == .signIn else { return false }
+        if case .app = classify(openerURL) { return false }
+        return true
+    }
+
+    /// `/mail`, `/mail/`, `/mail/u/0/…` yes; `/mail/about/…`, `/calendar/help/…` no.
+    private static func isAppPath(_ segments: [String], root: String) -> Bool {
+        guard segments.first == root else { return false }
+        guard segments.count > 1 else { return true }
+        return !nonAppSegments.contains(segments[1])
+    }
+}
+
+/// A set of objects held weakly and compared by identity.
+///
+/// `ObjectIdentifier` alone is not enough to remember "this webview went
+/// through sign-in": the value is the object's address, and a later allocation
+/// can reuse it, which would hand a fresh popup someone else's history. Holding
+/// the object weakly makes a reused address fail the identity check instead.
+struct WeakObjectSet<Element: AnyObject> {
+    private struct Ref {
+        weak var object: AnyObject?
+    }
+
+    private var refs: [ObjectIdentifier: Ref] = [:]
+
+    var count: Int { refs.values.filter { $0.object != nil }.count }
+
+    mutating func insert(_ object: Element) {
+        refs = refs.filter { $0.value.object != nil }
+        refs[ObjectIdentifier(object)] = Ref(object: object)
+    }
+
+    func contains(_ object: Element) -> Bool {
+        refs[ObjectIdentifier(object)]?.object === object
+    }
+
+    /// Removes the object and says whether it really was in the set — the
+    /// one-shot check that keeps sign-in completion from firing twice.
+    @discardableResult
+    mutating func remove(_ object: Element) -> Bool {
+        let held = contains(object)
+        refs[ObjectIdentifier(object)] = nil
+        return held
     }
 }
 
@@ -141,6 +268,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Handles a `mailto:` link clicked inside a webview.
     var mailtoHandler: ((URL) -> Void)?
 
+    /// Fires once when a webview on an account's data store finishes the Google
+    /// sign-in chain, so that account's other tabs can leave their signed-out
+    /// pages behind.
+    var onSignInCompleted: ((UUID) -> Void)?
+
     /// One in-app popup: the window, and the account whose data store it runs
     /// on so removing that account can take its popups with it.
     private struct Popup {
@@ -150,6 +282,10 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
 
     private var popupWindows: [ObjectIdentifier: Popup] = [:]
     private var crashThrottle = CrashThrottle()
+    /// Webviews that have been through a sign-in step. Landing on an app
+    /// surface only means "signed in" for these — Gmail's own print and
+    /// compose popups land on the very same URLs.
+    private var sawSignIn = WeakObjectSet<WKWebView>()
 
     private static var downloadsDirectory: URL {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -211,6 +347,36 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         download.delegate = self
     }
 
+    /// Remembers that this webview is inside the sign-in chain. Provenance is
+    /// what separates a real sign-in from Gmail's print and compose popups,
+    /// which finish on the same `mail.google.com/mail/u/0/…` URLs.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard AuthSurface.classify(webView.url) == .signIn else { return }
+        sawSignIn.insert(webView)
+    }
+
+    /// Sign-in is finished the moment a webview that was authenticating settles
+    /// on an app surface. `didFinish` rather than `decidePolicyFor` is what
+    /// makes that safe: signed out, `mail.google.com/mail/u/0/` only ever
+    /// appears as a redirect hop back to `accounts.google.com`, so a *finished*
+    /// navigation there is itself the proof the session took.
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard case .app = AuthSurface.classify(webView.url) else { return }
+        // One shot: the account is reconciled once per sign-in, not once per
+        // page load afterwards.
+        guard sawSignIn.remove(webView) else { return }
+        let accountId = webView.configuration.websiteDataStore.identifier
+
+        // Never tear a webview down from inside its own navigation callback.
+        DispatchQueue.main.async { [weak self, weak webView] in
+            guard let self else { return }
+            // A no-op unless this webview is a popup — an in-place sign-in has
+            // no window to close.
+            if let webView { self.closePopup(hosting: webView) }
+            if let accountId { self.onSignInCompleted?(accountId) }
+        }
+    }
+
     /// KTD8: macOS may reclaim a background account's WebContent process under
     /// memory pressure. Reload so notifications and unread polling resume
     /// instead of dying silently — but a page that keeps crashing gets a few
@@ -246,7 +412,19 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
                 mailtoHandler?(mailto)
                 return nil
             case .allowInApp:
-                break
+                // A clicked "Sign in" on a signed-out Google page belongs to
+                // the tab, not to a window of its own: run the whole flow
+                // in-place so the user ends up signed in where they were
+                // looking. Returning nil without loading would swallow the
+                // click and look like a dead button.
+                if AuthSurface.shouldLoadInOpener(
+                    requested: requested,
+                    openerURL: webView.url,
+                    isLinkActivated: navigationAction.navigationType == .linkActivated
+                ) {
+                    webView.load(URLRequest(url: requested))
+                    return nil
+                }
             }
         }
         return presentPopup(configuration: configuration, windowFeatures: windowFeatures)
@@ -373,21 +551,30 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Drops the popup's webview before the window goes, so nothing keeps the
     /// account's data store alive.
     private func dismiss(_ window: NSWindow) {
+        detachContent(of: window)
+        window.close()
+    }
+
+    private func detachContent(of window: NSWindow) {
         if let popup = window.contentView as? WKWebView {
             popup.stopLoading()
             popup.navigationDelegate = nil
             popup.uiDelegate = nil
+            sawSignIn.remove(popup)
         }
         window.contentView = nil
-        window.close()
     }
 
+    /// A titlebar close never goes through `dismiss`, so the webview has to be
+    /// released here too — otherwise a hand-closed popup keeps loading on the
+    /// account's data store, which is exactly what blocks `destroyDataStore`.
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
         for (key, popup) in popupWindows where popup.window === window {
             popupWindows[key] = nil
             crashThrottle.forget(key)
         }
+        detachContent(of: window)
     }
 
     // MARK: - WKDownloadDelegate
