@@ -1,21 +1,3 @@
-# Changelog
-
-Everything MailSpace ships, written for the person deciding whether to click
-Update. `scripts/release.sh` publishes the section for the version being cut, so
-what is written here is exactly what the update window shows.
-
-Sections are `Added`, `Changed`, `Fixed`, `Removed`. One user-visible outcome per
-line, present tense, no commit hashes. Wrap at 80 columns and indent what wraps —
-a wrapped line belongs to the bullet above it, here and in the update window.
-
-## [Unreleased]
-
-### Fixed
-- A release note too long for one line stays part of its bullet in the update
-  window, instead of breaking off into a stray line at the left margin.
-
-## [1.0.0] - 2026-08-26
-
 ### Added
 - Gmail and Google Calendar in one window, as a flat row of tabs — one tab per
   account and service, switchable with ⌘1…⌘9 or ⇧⌘M and ⇧⌘K.
@@ -42,3 +24,4 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 - A tab that crashed or never loaded comes back when you select it or press ⌘R,
   instead of staying blank for the rest of the session.
 - A download in flight no longer strands the account's session.
+

@@ -12,7 +12,10 @@ let package = Package(
         .testTarget(
             name: "MailSpaceTests",
             dependencies: ["MailSpace"],
-            path: "Tests/MailSpaceTests"
+            path: "Tests/MailSpaceTests",
+            // The body of a real published release, kept verbatim so the release
+            // notes are tested against what GitHub actually serves.
+            resources: [.copy("Fixtures")]
         )
     ]
 )
