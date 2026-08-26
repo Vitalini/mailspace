@@ -13,15 +13,30 @@ import WebKit
 final class UnreadPoller {
     typealias MailWebViewProvider = () -> [(accountId: UUID, webView: WKWebView)]
 
+    /// Gmail hosts the feed fetch is same-origin from. A signed-out account's
+    /// mail webview sits on `accounts.google.com` instead, where the fetch is
+    /// cross-origin, gets no CORS headers and rejects — which inside the script
+    /// is indistinguishable from a network failure.
+    static let mailHosts: Set<String> = ["mail.google.com", "mail.googlemail.com"]
+
     /// Returns `{ ok, feed }`. `ok: false` means the poll never got an answer —
     /// a network error, or the 20s abort below — and the caller must keep the
     /// previous count rather than read it as zero unread. A 4xx *is* an answer
-    /// (signed out, feed retired), so it counts as zero.
+    /// (signed out, feed retired), so it counts as zero. So is "this page is
+    /// not Gmail": there is genuinely no unread mail to report from there, and
+    /// reporting it as a failure is what left a stale badge on a signed-out
+    /// account forever.
+    ///
+    /// The URL is host-relative so the fetch is same-origin whichever Gmail
+    /// host the webview is on.
     private static let feedScript = """
+    if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
+      return { ok: true, feed: '' };
+    }
     const controller = new AbortController();
     const deadline = setTimeout(function () { controller.abort(); }, 20000);
     try {
-      const response = await fetch('https://mail.google.com/mail/feed/atom', {
+      const response = await fetch('/mail/feed/atom', {
         credentials: 'include',
         cache: 'no-store',
         signal: controller.signal
@@ -81,9 +96,12 @@ final class UnreadPoller {
             // A poll that has not come back yet must not be stacked on by the
             // next 60s tick.
             guard !inFlight.contains(target.accountId) else { continue }
-            // A webview that has not loaded anything yet has no origin to
-            // fetch from.
-            guard target.webView.url != nil else {
+            // A webview that has not loaded anything yet, or that is sitting on
+            // the sign-in page because the account is signed out, has no Gmail
+            // feed to read. That is a definite zero, not a failed poll — a
+            // failed poll keeps the previous count, which is what left a
+            // signed-out account's stale number on the Dock badge indefinitely.
+            guard Self.canPoll(target.webView.url) else {
                 counts[target.accountId] = 0
                 continue
             }
@@ -92,6 +110,15 @@ final class UnreadPoller {
 
         pruneCounts(keeping: active)
         updateBadge()
+    }
+
+    /// Whether the feed can be read from the page this webview is on: only a
+    /// Gmail origin, where the fetch is same-origin and the account's cookies
+    /// apply.
+    static func canPoll(_ url: URL?) -> Bool {
+        guard let url, let scheme = url.scheme?.lowercased(), scheme == "https" else { return false }
+        guard let host = url.host?.lowercased() else { return false }
+        return mailHosts.contains(host)
     }
 
     /// Drops an account's contribution — after removal, or after Mail is
