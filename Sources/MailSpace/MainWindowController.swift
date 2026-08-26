@@ -23,6 +23,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private static let lastAccountDefaultsKey = "lastAccountId"
+    private static let frameAutosaveName: NSWindow.FrameAutosaveName = "MailSpaceMainWindow"
 
     private unowned let host: AccountHosting
     private var store: AccountStore { host.accountStore }
@@ -54,7 +55,6 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         // R9: MailSpace's chrome stays light next to light Gmail/Calendar,
         // whatever the system appearance is.
         window.appearance = NSAppearance(named: .aqua)
-        window.setFrameAutosaveName("MailSpaceMainWindow")
 
         buildLayout()
         emptyState.onAddAccount = { [weak self] in self?.host.requestAddAccount() }
@@ -103,12 +103,14 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     // MARK: - Lifecycle
 
     func showWindow() {
-        // `setFrameAutosaveName` restores a saved frame if there is one; centre
-        // the window only on a genuinely first run.
-        let hasSavedFrame = UserDefaults.standard.string(forKey: "NSWindow Frame \(window.frameAutosaveName)") != nil
-        if !hasSavedFrame {
+        // `setFrameUsingName` restores a saved frame and reports whether there
+        // was one, so a genuinely first run is the only run that centres. The
+        // autosave name is attached afterwards, so registering it can never
+        // overwrite the frame we are about to restore.
+        if !window.setFrameUsingName(Self.frameAutosaveName) {
             window.center()
         }
+        window.setFrameAutosaveName(Self.frameAutosaveName)
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -170,14 +172,36 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - Rendering
 
+    /// Brings the in-memory selection back in step with the store.
+    ///
+    /// Two things can strand it: the account disappearing, and the selected
+    /// service being switched off in the account dialog. The second used to
+    /// drop the window into the zero-accounts state even though the account
+    /// still had its other service. The fallback is the account's own
+    /// `effectiveView` — the same rule `AccountStore.update` heals `lastView`
+    /// with — and then the first account.
+    ///
+    /// Pure and static so it can be tested without an AppKit window.
+    static func reconciledSelection(_ current: Selection?, accounts: [Account]) -> Selection? {
+        var resolved = current
+        if let selection = resolved {
+            if let account = accounts.first(where: { $0.id == selection.accountId }) {
+                if !account.isEnabled(selection.view) {
+                    resolved = account.effectiveView.map { Selection(accountId: account.id, view: $0) }
+                }
+            } else {
+                resolved = nil
+            }
+        }
+        if resolved == nil, let first = accounts.first, let view = first.effectiveView {
+            resolved = Selection(accountId: first.id, view: view)
+        }
+        return resolved
+    }
+
     /// Rebuilds the tab bar, Accounts menu and content area from current state.
     func refresh() {
-        if let selection, store.account(id: selection.accountId) == nil {
-            self.selection = nil
-        }
-        if selection == nil, let first = store.accounts.first, let view = first.effectiveView {
-            selection = Selection(accountId: first.id, view: view)
-        }
+        selection = Self.reconciledSelection(selection, accounts: store.accounts)
 
         tabBar.rebuild(accounts: store.accounts, selection: selection)
         rebuildAccountsMenu()
