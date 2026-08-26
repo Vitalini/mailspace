@@ -110,11 +110,21 @@ else
   echo "  skip network checks (SMOKE_SKIP_NETWORK=1)"
 fi
 
-# 7. Notification shim: both Notification and showNotification reach native.
+# 7. Notifications end to end: both Notification and showNotification reach the
+#    native bridge, and Notification Center is actually holding what they
+#    produced. `auth` is reported but not gated on — answering the permission
+#    prompt is the user's call, not something a build can assert.
 SHIM_OUT="$(MAILSPACE_SELFTEST=shim run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
 case "$SHIM_OUT" in
-  *"result=ok"*) pass "notification shim: $SHIM_OUT" ;;
-  *) fail "notification shim: $SHIM_OUT" ;;
+  *"result=ok"*) pass "notifications reach Notification Center: $SHIM_OUT" ;;
+  *) fail "notifications: $SHIM_OUT" ;;
+esac
+case "$SHIM_OUT" in
+  *"auth=authorized"*) ;;
+  *"auth="*)
+    echo "  note notification permission is not granted yet — launch MailSpace and answer"
+    echo "       the prompt. If no prompt appears, see docs/notifications.md."
+    ;;
 esac
 
 # 8. Real launch: open the bundle, confirm the process stays alive, then quit it.
