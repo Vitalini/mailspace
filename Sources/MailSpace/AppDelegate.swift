@@ -4,6 +4,7 @@ import WebKit
 final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
     let accountStore = AccountStore()
 
+    private let navigationPolicy = NavigationPolicy()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private var loginProbe: LoginProbe?
@@ -98,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting {
     @discardableResult
     private func makeSession(for account: Account) -> AccountSession {
         let session = AccountSession(account: account)
+        session.setDelegates(navigationPolicy)
         session.loadIfNeeded()
         sessions[account.id] = session
         return session
