@@ -27,6 +27,8 @@ execution: code
 
 Add a Settings window (Cmd+,) with two panes — **General** (app-wide behaviour) and **Accounts** (per-account alert and badge participation, plus one app-level badge-scope popup). Nine controls total. App-level values live in `UserDefaults`; per-account values live on `Account` in the existing `accounts.json`. Account *editing* is not duplicated: the Accounts pane hosts only the new per-account toggles and an **Edit Account…** button that opens the existing `AccountEditor` sheet unchanged.
 
+Requirement 4d (per-tab unread counts) arrived after this plan was written and rides along as **U10**: each Mail tab shows its own account's unread number, rendered from the count `UnreadPoller` already collects. It adds no control — still nine.
+
 ### Problem Frame
 
 Every friction worth fixing in MailSpace today is one bug wearing different clothes: the app assumes which account you meant. It composes from whichever tab happened to be frontmost (`AppDelegate.mailtoAccount(selected:accounts:)`), it banners personal mail into a client call with no off switch short of deleting the tab, it counts Promotions in a Dock badge you have learned to distrust, and it throws every external link at the front of the screen. Mailplane's General pane was shown as an example, not a template: three of its six rows turn out to be measurably broken or unverifiable on this app (icon mode, open-hidden, start-at-login), and three collapse into one-control rows here.
@@ -52,12 +54,18 @@ Every friction worth fixing in MailSpace today is one bug wearing different clot
 - S12. The default-mail-app menu item tells the truth, including the stale-duplicate-bundle case.
 - S13. A failed download directory is surfaced instead of swallowed.
 
+**Per-tab unread counts (requirement 4d, added after the control list was frozen)**
+- S14. Each Mail tab shows its own account's unread count, and shows nothing — not `0` — when that count is zero or not yet known.
+- S15. A tab shows its own count even when the account is excluded from the Dock total; the Dock badge stays the sum of the *participating* accounts only.
+- S16. No new polling of Google. The tab count is the number `UnreadPoller` already fetches; a count on a tab costs zero extra requests.
+
 ### Key Decisions
 
 - **Settings are a confession that a default was wrong.** A candidate became a control only if two reasonable answers exist for this one person on different days. Everything else became a fixed default, an existing macOS affordance, a menu item, or a documented `defaults write` key. Governs the whole control list.
 - **No settings framework.** One struct, typed accessors, `registerDefaults`, direct reads at the point of use. No schema, no generic key-value editor, no plugin points.
 - **Account editing is not rewritten.** The Keychain-move-on-rename path in `AppDelegate.requestEditAccount` (`AppDelegate.swift:119-147`) is the riskiest code in the app and its failure mode is a sign-in that quietly breaks months later. The Accounts pane reuses `AccountEditor.run` behind a button. Governs U6.
 - **Security boundaries are not preferences.** The notification gate sits *next to*, never inside, `NotificationOrigin.isTrusted` (`NotificationBridge.swift:33-63`). `LinkRouter.inAppHosts` and `WebViewFactory.userAgent` are never exposed. Autofill gating, if ever added, stays on the native side of `LoginAutofill.userContentController`.
+- **A count on a tab is display, not a preference.** Requirement 4d does not extend the control list: the number a tab shows is the one A4 (who counts toward the Dock total) and A5 (what "unread" means) already govern, and the account it belongs to is the tab it sits on. There is no "show counts on tabs" checkbox and no per-tab opt-out. Governs U10.
 
 ### Scope Boundaries
 
@@ -75,6 +83,8 @@ See **Out of Scope** below — it is long on purpose, because most of the design
 - KTD-S4. **Everything applies live.** No control in this plan needs `setActivationPolicy`, a re-registration, or a relaunch. `UnreadPoller` is the one exception mechanically — its timer is built from a stored interval in `start()` (`UnreadPoller.swift:68-76`) — but the interval is not a control here, so no `stop()/start()` cycle is needed for anything shipped.
 - KTD-S5. **Cmd+, goes to Settings; `Account Settings…` loses its key equivalent.** The only genuine shortcut collision (`MainWindowController.swift:275`). No new non-standard shortcut is minted; account editing keeps three mouse routes plus the Settings > Accounts > Edit… button. Note the two menus are built in different places: the App menu once in `applicationDidFinishLaunching` (`AppDelegate.swift:405-416`), the Accounts menu on every `rebuildAccountsMenu` (`MainWindowController.swift:251`).
 - KTD-S6. **Rarely-touched valves are `defaults write` keys, not rows.** Exactly three, read at launch, documented in the README: `UnreadPollSeconds`, `UnreadUsePlainFeed`, `DisableSignInAutofill`. Promotion rule: if one is touched twice in a year it earns a row. This is a personal app compiled by its owner; a hidden key is an honest off switch, not a shipped preference.
+- KTD-S7. **One unread number per account, read once, rendered twice.** The per-tab count and the Dock badge are the same `UnreadPoller` value — no second fetch, no second timer, no Gmail API, no Calendar equivalent. The consequence for A4: `countInBadge` moves from the *polling* filter to the *summing* step, because an account filtered out of `mailWebViews` is never polled and so would have no count to put on its own tab — exactly what S15 forbids. Governs U10 and rewrites A4's implementation.
+- KTD-S8. **Counts update the tab bar in place, never through `refresh()`.** `MainWindowController.refresh()` (`:205-236`) tears the active webview out of its container, re-pins it, calls `makeFirstResponder` and fires `tabBecameVisible`. Driving that from a 60-second timer would move first responder out from under a half-written reply and re-trigger crashed-content-process recovery on a healthy tab. The poller's change callback walks the existing `AccountTabView`s and sets one property on each.
 
 ### Setting inventory
 
@@ -95,8 +105,10 @@ See **Out of Scope** below — it is long on purpose, because most of the design
 | A1 | **Account list** — colour swatch, name, email; one row per account, in tab-bar order. **Edit Account…** button. | reflects `accounts.json` | n/a | The button calls the existing `AccountEditor.run` / `AppDelegate.requestEditAccount` path unchanged. The pane never writes name, email, colour, service toggles or the Keychain password itself. |
 | A2 | **Mail alerts** — checkbox per row (disabled when the account has Mail off) | On | `Account.notifyMail` (Bool, `decodeIfPresent` default `true`) | One guard in `NotificationBridge.userContentController` (`:142-160`), which has already resolved `account` and `view` before calling `post`. Placed *after* `NotificationOrigin.isTrusted`, never merged into it. |
 | A3 | **Calendar alerts** — checkbox per row (disabled when the account has Calendar off) | On | `Account.notifyCalendar` (Bool, default `true`) | Same guard, keyed on the `view` already in hand at `:148`. |
-| A4 | **Count in Dock badge** — checkbox per row (disabled when the account has Mail off) | On | `Account.countInBadge` (Bool, default `true`) | The `mailWebViews` provider closure in `AppDelegate.applicationDidFinishLaunching` (`:44-50`) filters on `account.mailEnabled && account.countInBadge`; `UnreadPoller.updateBadge` (`:163-166`) is untouched. |
-| A5 | **Dock badge counts** — pop-up: *Primary inbox only* / *Everything in the inbox (includes Promotions and Social)*, app-level, at the foot of the pane | `Primary inbox only` | `BadgeScope` (String enum) | One-line change to the fetch URL in `UnreadPoller.feedScript` (`:32-51`): `/mail/feed/atom` vs `/mail/feed/atom/%5Esmartlabel_personal`. If the smart-label form is rejected, fall back to reading the count from the loaded page via the same `callAsyncJavaScript` path already in `poll` (`:132-154`). If both fail, the pop-up shows *Everything in the inbox* selected with the caption *"Primary count unavailable from Gmail"* — never a silent fallback under a Primary label. |
+| A4 | **Count in Dock badge** — checkbox per row (disabled when the account has Mail off) | On | `Account.countInBadge` (Bool, default `true`) | Applied at the **summing** step, not the polling step (KTD-S7): `UnreadPoller.updateBadge` (`:163-166`) totals only the accounts in a new `badgeParticipants()` set. The `mailWebViews` provider closure (`AppDelegate.swift:44-50`) keeps filtering on `account.mailEnabled` **alone**, so an account opted out of the Dock total is still polled and still carries its own count on its own tab (S15, U10). Side benefit: the total re-sums the moment the box is ticked, instead of after a poll cycle. |
+| A5 | **Dock badge counts** — pop-up: *Primary inbox only* / *Everything in the inbox (includes Promotions and Social)*, app-level, at the foot of the pane | `Primary inbox only` | `BadgeScope` (String enum) | One-line change to the fetch URL in `UnreadPoller.feedScript` (`:32-51`): `/mail/feed/atom` vs `/mail/feed/atom/%5Esmartlabel_personal`. If the smart-label form is rejected, fall back to reading the count from the loaded page via the same `callAsyncJavaScript` path already in `poll` (`:132-154`). If both fail, the pop-up shows *Everything in the inbox* selected with the caption *"Primary count unavailable from Gmail"* — never a silent fallback under a Primary label. Because there is one number per account, the scope applies to the tab counts and the Dock badge together and they can never disagree; the pop-up's label stays *Dock badge counts* even so, because that is where the choice is felt. |
+
+**Per-tab unread counts add no row.** U10 ships requirement 4d as display, not preference (Key Decisions). Its two genuine questions — which accounts count toward the Dock total, and what "unread" means — are A4 and A5, already here. What U10 changes above is A4's *implementation* (KTD-S7) and A5's *reach* (the scope covers both surfaces). Still nine controls.
 
 ### Behaviour fixes shipped alongside, with no control
 
@@ -154,11 +166,14 @@ final class AppSettings {
 
 - **The badge scope change is a visible behaviour change on day one** (47 → 3). That is the point; it is called out in the manual checklist so it is not mistaken for a regression.
 - **`downloadDidFinish` plus a destination map is the only genuinely new plumbing here.** The map must be keyed on the `WKDownload` object and cleared on both finish and failure (`:760-762`), or it leaks one entry per failed download for the process lifetime.
+- **The obvious wrong way to ship U10 is to call `refresh()` from the poller.** It is one line and it works on first look; what it costs is first responder every 60 seconds and a `tabBecameVisible` recovery pass on a tab that never crashed. KTD-S8 exists so that shortcut is not rediscovered under time pressure.
 - **The `.ask` compose sheet must be keyboard-only in practice** (arrow keys + Return, accounts in tab order with their colour dot). If it needs the mouse, the honest response is to change the default to *The account I'm looking at* and leave *Ask* as an option — not to keep a sheet that costs more than the mistake it prevents.
 
 ### Sequencing
 
-U1 → U2 → {U3, U4, U5} → U6 → U7 → U8 → U9. U9 is optional and drops cleanly if the rest runs long.
+U1 → U2 → {U3, U4, U5} → U6 → U7 → U10 → U8 → U9. U9 is optional and drops cleanly if the rest runs long.
+
+U10 is numbered out of band because it was added after U8 and U9 were written; renumbering would have invalidated every cross-reference in this document. It sits where it runs: after U7, whose scope decides what its number means.
 
 ---
 
@@ -172,12 +187,13 @@ Sources/MailSpace/
 ├── SettingsAccountsPane.swift     # NEW - A1..A5, hosts AccountEditor via a button
 ├── ComposeRouting.swift           # NEW - pure resolve(setting:selected:accounts:)
 ├── NotificationPolicy.swift       # NEW - pure shouldPost(account:view:)
-├── AppDelegate.swift              # menu wiring, openMailto, default-app menu validation
-├── MainWindowController.swift     # Cmd+, freed; Window > Reset Window Position
+├── UnreadCounts.swift             # NEW - pure tabLabel / tabTooltip / dockTotal (U10)
+├── AppDelegate.swift              # menu wiring, openMailto, default-app menu validation, counts wiring
+├── MainWindowController.swift     # Cmd+, freed; Window > Reset Window Position; in-place tab counts
 ├── NavigationPolicy.swift         # settings injection, background open, download dir + finish
 ├── NotificationBridge.swift       # per-tab guard, silent flag, willPresent suppression
 ├── NotificationShim.swift         # forward options.silent
-├── UnreadPoller.swift             # feed scope
+├── UnreadPoller.swift             # feed scope; per-account read, badge participants, change callback
 ├── Account.swift                  # +notifyMail, +notifyCalendar, +countInBadge
 ├── AccountStore.swift             # one setter for the three flags
 └── SelfTest.swift                 # +settings mode, extended shim mode
@@ -185,6 +201,7 @@ Sources/MailSpace/
 Tests/MailSpaceTests/
 ├── ComposeRoutingTests.swift      # NEW
 ├── NotificationPolicyTests.swift  # NEW
+├── UnreadCountsTests.swift        # NEW
 ├── AppSettingsTests.swift         # NEW
 ├── MailtoComposeTests.swift       # updated for the new resolver
 └── AccountStoreTests.swift        # updated for the three new fields
@@ -278,10 +295,10 @@ README.md                          # the three defaults-write keys
 - **Approach:**
   1. `NSTableView`: colour swatch, name/email, then the three checkboxes (Mail alerts, Calendar alerts, Count in Dock badge). A checkbox is disabled and unchecked-looking when the account has that service off — the truth is already in `Account.isEnabled(_:)` (`:203-204`).
   2. **Edit Account…** calls the existing `AppDelegate.requestEditAccount` (`:119-147`) path — the same `AccountEditor.run` sheet, the same `Result` type, the same Keychain-move-on-rename. Nothing is reimplemented; the rename path must not be touched by this unit at all.
-  3. `Account.countInBadge` added alongside U3's two flags (same `decodeIfPresent` pattern). The `mailWebViews` closure in `AppDelegate.applicationDidFinishLaunching` (`:44-50`) filters on it.
+  3. `Account.countInBadge` added alongside U3's two flags (same `decodeIfPresent` pattern). It is applied where the counts are **summed**, not where accounts are **polled**: `UnreadPoller.updateBadge` totals only the participating accounts, and the `mailWebViews` closure in `AppDelegate.applicationDidFinishLaunching` (`:44-50`) keeps filtering on `mailEnabled` alone. Filtering the provider would leave an excluded account unpolled and its tab permanently blank, which U10/S15 forbids (KTD-S7). If U10 is deferred, this stays true anyway — it costs nothing and re-sums instantly on toggle.
   4. The pane refreshes on the same account-changed notification the tab bar already uses.
-- **Test scenarios:** `AccountStore` round-trip including `countInBadge`; badge participation filter — two accounts, one opted out → only the other's webview reaches the poller.
-- **Verification:** untick *Count in Dock badge* for Personal → badge drops to the work count within one poll cycle; Edit Account… renames an account and its saved password still signs in after relaunch (the rename path is intact).
+- **Test scenarios:** `AccountStore` round-trip including `countInBadge`; badge participation — two accounts, one opted out → the opted-out account is still polled but contributes nothing to the total.
+- **Verification:** untick *Count in Dock badge* for Personal → the badge drops to the work count; Edit Account… renames an account and its saved password still signs in after relaunch (the rename path is intact).
 
 ### U7. Badge scope (A5, S8)
 
@@ -294,9 +311,50 @@ README.md                          # the three defaults-write keys
   2. If the smart-label form works: one-line change to the fetch URL in `feedScript` (`:32-51`) driven by `settings.badgeScope`. The `defaults write` valve `UnreadUsePlainFeed` forces the plain feed regardless, for the day the smart label breaks.
   3. If it does not: read the count from the loaded Gmail page via the `callAsyncJavaScript` path already in `poll` (`:132-154`) — `document.title` `"Inbox (N)"` or the Primary tab's `aria-label`. Brittler against markup changes, but it is Gmail's own number.
   4. If neither resolves: A5 shows *Everything in the inbox* selected with the caption *"Primary count unavailable from Gmail"*. No silent fallback under a Primary label (stop condition).
-  5. Changing the pop-up triggers an immediate re-poll, not a `stop()/start()` cycle — only the interval rebuilds the timer.
+  5. Changing the pop-up triggers an immediate re-poll, not a `stop()/start()` cycle — only the interval rebuilds the timer. Once U10 lands, that same re-poll moves the tab counts too; there is one number per account and the scope can never split between the Dock and the tabs.
 - **Test scenarios:** `AtomFeedParser` is unchanged and already covered; add a poller-level test that the scope setting selects the expected feed path string.
 - **Verification:** with Promotions unread present, the badge matches Gmail's own `Inbox (N)` on *Primary only* and exceeds it on *Everything*; switching the pop-up updates within one poll.
+
+### U10. Per-tab unread counts (S14, S15, S16 — requirement 4d)
+
+- **Goal:** each Mail tab carries its own account's unread number, so the Dock badge's total becomes attributable without opening a tab. Calendar tabs stay exactly as they are.
+- **Requirements:** S14, S15, S16
+- **Dependencies:** U6 (`countInBadge` exists; this unit moves where it is applied), U7 (the scope decides what the number means)
+- **Files:** `UnreadCounts.swift`, `UnreadPoller.swift`, `AppDelegate.swift`, `MainWindowController.swift`, `Tests/MailSpaceTests/UnreadCountsTests.swift`
+
+**What already exists, and what is missing.** The per-account number is real and correct today: `UnreadPoller.counts: [UUID: Int]` (`:55`) holds one entry per Mail-enabled account, fetched from that account's own webview so the account's cookies apply. What is missing is every step after that:
+
+- `counts` is `private` and its only consumer is `updateBadge()` (`:163-166`), which sums it into `NSApp.dockTile.badgeLabel` and throws the breakdown away. There is no per-account read and no "the numbers changed" signal.
+- `AccountTabBar.rebuild(accounts:selection:)` (`:405-425`) is handed accounts and a selection and nothing else; it also destroys and recreates every `AccountTabView` on each call, so it is the wrong entry point for a value that changes every minute.
+- `AccountTabView` (`:474-538`) lays out an icon and a label against `trailingAnchor -12`. There is no third slot.
+
+So: three small pieces of plumbing, no new data.
+
+**Approach:**
+
+1. **`UnreadCounts` — pure, own file, own tests**, the same shape as `ComposeRouting` and `NotificationPolicy` in this plan:
+   - `tabLabel(_ count: Int?) -> String?` — `nil` for `nil` **and** for `0`; `"1"…"999"`; `"999+"` above. `nil` (never polled) and `0` (polled, nothing unread) render identically, so neither needs a special case downstream.
+   - `tabTooltip(_ count: Int?) -> String?` — `nil` at zero/unknown, otherwise the exact number, grouped: `"4,231 unread"`. This is where the true figure lives once the pill caps.
+   - `dockTotal(_ counts: [UUID: Int], participants: Set<UUID>) -> Int`.
+2. **`UnreadPoller` publishes what it already knows.** Add `func count(for accountId: UUID) -> Int?` (a missing key is `nil` — unknown), `var badgeParticipants: () -> Set<UUID> = { [] }`, and `var onCountsChanged: (() -> Void)?` fired from `updateBadge()` — the single place where counts settle, already called from `refresh`, the poll completion and `forget`. `updateBadge` becomes `UnreadCounts.dockTotal(counts, participants: badgeParticipants())`.
+3. **`countInBadge` moves out of the polling filter** (KTD-S7). U6/A4 as originally written filtered `mailWebViews` on `account.mailEnabled && account.countInBadge`, which leaves an excluded account unpolled and therefore with a permanently blank tab — the one thing requirement 4d rules out. The provider (`AppDelegate.swift:44-50`) filters on `mailEnabled` only; `badgeParticipants` supplies `Set(accounts.filter { $0.mailEnabled && $0.countInBadge }.map(\.id))`. If U6 has already landed the other way, this unit changes it back.
+4. **Wiring follows the existing protocol, not a global.** `AccountHosting` gains `func unreadCount(for accountId: UUID) -> Int?` — the same shape as `session(for:)` — implemented in `AppDelegate` as `unreadPoller.count(for:)`. `AppDelegate` sets `unreadPoller.onCountsChanged = { [weak self] in self?.windowController?.refreshUnreadCounts() }`.
+5. **In-place update, never `refresh()`** (KTD-S8). `MainWindowController.refreshUnreadCounts()` calls a new `AccountTabBar.updateCounts(_:)`, which walks its existing arranged subviews and assigns `tabView.unreadCount`; `AccountTabView.unreadCount` is a `didSet` that sets the pill's string, hidden state, colours and tooltip. Nothing is torn down, the webview is not touched, first responder does not move. `rebuild` takes the count lookup as a third argument so a genuine rebuild (account added, tab dragged, service toggled) starts with the right number instead of flashing blank until the next tick.
+6. **The pill.** One new subview inside `AccountTabView`, Mail tabs only:
+   - **Where:** trailing end of the tab, after the label. The label's trailing constraint moves from `trailingAnchor, -12` to `pill.leadingAnchor, -6`; the pill pins to `trailingAnchor, -10`.
+   - **Shape:** capsule — height 16, corner radius 8, minimum width 20, 6pt horizontal padding. `widthAnchor <= 260` on the tab is unchanged.
+   - **Type:** `.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)`, so the pill does not jitter as the digits change between polls.
+   - **Colour:** fill `tint.withAlphaComponent(selected ? 0.28 : 0.14)`, text `.labelColor` when selected and `.secondaryLabelColor` when not. No new colours and no new shapes: this is the same "the account tint is always present, selection deepens it" rule the tab body (`:549-552`) and the icon (`:503`) already follow, at the same two strengths. Against the light chrome a low-alpha tint fill stays legible for all eight palette entries — the number is never white-on-saturated.
+   - **Selected vs unselected:** both show the count. Only the fill alpha and the text colour differ. Hiding it on the selected tab was considered and rejected: the selected tab's number is precisely the one that moves while he is watching it, and it would flicker in and out on every tab switch.
+   - **At zero or unknown:** `isHidden = true` and the pill contributes no width, so the tab shrinks back to icon + label. Never a `0`.
+   - **Large numbers:** capped at `999+`. His *Everything*-scope inboxes run past 4000, and four digits plus a separator eats the tab width that the account name needs. Gmail's own surfaces cap too; the exact number stays one hover away in the tooltip. With A5 on its default *Primary inbox only* the cap should almost never be reached — it is the guard for the *Everything* scope, not the normal case.
+   - **Truncation:** the label's compression resistance drops to `.defaultLow` and the pill's rises to `.required`, so a narrow tab truncates the account name and never the number.
+   - **Tooltip and accessibility:** the existing tooltip string (`:512-514`) gains `UnreadCounts.tabTooltip`; `accessibilityLabel` gains the same `"N unread"`.
+7. **Refresh cadence — nothing new goes to Google (S16).** The counts move on the existing 60s tick and on the existing event-driven refresh after a new-mail notification (`AppDelegate.swift:41-43` → `refresh(accountId:)`). One addition: a targeted `refresh(accountId:)` when a **Mail tab becomes visible**, so the count is right on return from a tab where he has just read everything, rather than up to 60 seconds later. It must be throttled to at most one poll per account per 10 seconds — `tabBecameVisible` (`AppDelegate.swift:161-166`) is called from *every* `refresh()`, not only from a user tab switch, and Cmd+1/Cmd+2 flipping would otherwise fire a burst. `UnreadPoller.inFlight` (`:59`) already prevents stacking; the throttle prevents the queue forming in the first place. Mail read **in place**, in a tab already on screen, corrects on the next tick — that is the lag the Dock badge has today and it does not justify a shorter interval, a second timer, or a per-tab poll. The fetch itself is unchanged: same-origin `/mail/feed/atom` from a webview that is loaded anyway. No Gmail API, no OAuth, no new host.
+8. **Signed out, disabled, removed — already correct upstream; leave them alone.** A signed-out account's webview sits on `accounts.google.com`, `canPoll` is false and the poller writes a definite `0` (`:104-107`), so the tab goes blank rather than carrying a stale number — the same fix that stopped the Dock badge lying. Mail switched off for an account removes it from `mailWebViews`, `pruneCounts` (`:156-161`) drops the entry, and the tab does not exist to badge. Account removed: `forget(accountId:)` (`:126-130`), which now also fires `onCountsChanged`. This unit adds no new staleness rule; it inherits the ones that already work.
+
+- **Test scenarios:** `tabLabel` — `nil`, `0`, `1`, `999`, `1000`, `4231`. `tabTooltip` — `nil` at `nil` and `0`, grouped exact string at `4231`. `dockTotal` — two accounts with one excluded totals only the included one; an account with no entry contributes `0`; an empty participant set totals `0`. **The S15 regression in one test:** an account excluded from `participants` contributes nothing to `dockTotal` while `count(for:)` still returns its own number.
+- **Verification:** `swift test` for the above; manual checklist items 14–17 for the pill itself, the truncation, the in-place update not disturbing focus, and the tab-switch re-poll.
 
 ### U8. Default-mail-app truth (G5, B3, B4) and Reset Window Position (B6)
 
@@ -342,6 +400,10 @@ README.md                          # the three defaults-write keys
 - `Account` / `AccountStore` — an `accounts.json` written before this change decodes with all three new flags `true`; round-trip preserves them.
 - `LinkRouter.safeFilename` / `uniqueDestination` against a *configured* base directory — the `../../` escape is still blocked when the base is user-chosen.
 - `DefaultMailApp` URL comparison helper — same path, trailing slash, different path.
+- `UnreadCounts.tabLabel` / `tabTooltip` — hidden at zero *and* at unknown, exact up to 999, `999+` above, grouped exact figure in the tooltip.
+- `UnreadCounts.dockTotal` — participation filter; and the S15 case in one assertion: an account excluded from the Dock total still returns its own `count(for:)`.
+
+Not unit-testable, so it goes to the manual checklist: the pill's legibility against each account tint, truncation on a narrow tab, that the in-place update does not disturb first responder, and the tab-switch re-poll.
 
 ### `MAILSPACE_SELFTEST` probes
 
@@ -367,6 +429,10 @@ Everything below runs under the throwaway `com.vitalii.MailSpace.SelfTest` ident
 11. Edit an account's email through Settings > Accounts > Edit Account… → the saved password still signs in after a relaunch (the Keychain rename path survived).
 12. `Window > Reset Window Position` recentres the window.
 13. Quit and relaunch → every setting persisted; an `accounts.json` from before this change still loads.
+14. Two mail accounts → each Mail tab carries its own number and the two add up to the Dock badge. Calendar tabs carry no number at all (by design — see Out of Scope).
+15. Untick *Count in Dock badge* for Personal → the Dock drops to Work's number and **Personal's tab keeps showing its own count**. This is requirement 4d; the regression to watch for is Personal's tab going blank.
+16. Switch A5 between *Primary only* and *Everything* → the tab numbers and the Dock badge move together, never to different scopes. On *Primary only* a tab matches Gmail's own `Inbox (N)`; on *Everything* a 4000+ inbox reads `999+` in the pill with the exact number in the tab's tooltip, and the tab does not grow.
+17. Read the visible tab's inbox to empty, switch away and back → the count is gone on return, not 60 seconds later. Sign an account out inside its tab → its count disappears within a poll cycle, with no stale number left behind. Turn Mail off for an account → its tab goes with it and nothing else changes. Start typing a reply and leave it for two minutes → the caret is still there (KTD-S8).
 
 ### Prerequisites that need Vitalii, neither privileged
 
@@ -394,12 +460,17 @@ Each of these was proposed, argued, and cut. Recorded so none of them is re-prop
 - **Window size/position options beyond the reset menu item.** Frame restore already works, including attaching the autosave name *after* the restore so registration cannot clobber it (`:107-117`). A checkbox for it would be decoration.
 - **Custom user agent and the in-app host allowlist.** `WebViewFactory.userAgent` (`:25-30`) is a maintenance constant to bump if Google tightens `disallowed_useragent` detection, and a wrong value breaks sign-in for every account at once. `LinkRouter.inAppHosts` (`NavigationPolicy.swift:10-15`) plus `isGoogleDomain` (`:106-115`) decide what runs inside an account's cookie jar with MailSpace's scripts injected — a security boundary with a look-alike-domain test in `LinkRouterTests`, not a preference. Neither is ever exposed.
 - **A Compose/Signatures pane, a theme toggle, settings sync, import from Mailplane, WebKit knobs (proxy, cache, JS).** Gmail owns compose and signatures; the light appearance is requirement R9, not an oversight; there is one Mac and one user; and every WebKit knob is a new way for one account to break differently from the others.
+- **A count, dot or badge on the Calendar tab.** There is no Calendar equivalent of `/mail/feed/atom`. Every candidate number — today's remaining events, a dot for an imminent one — needs a data source MailSpace does not have: the Calendar API with its own OAuth scopes and token storage, or DOM scraping of a page the app otherwise never injects a script into. Both are a new class of dependency for a number whose whole value is answered by clicking the tab that is already one click away, and MailSpace already delivers native reminders for the events that actually matter (requirement 3). A Calendar tab carries the account colour, the icon and the label, and nothing else. **This is a decision, not a gap** — do not re-propose it as symmetry with the Mail tab, and do not invent a Calendar poller for it.
+- **Deriving the tab count from the Gmail page title.** `document.title` is `"Inbox (3) - … - Gmail"`: free, push-shaped, no fetch at all, and wrong the moment he opens Sent, Starred or a search, because it counts whatever label is on screen. One number per account, from the atom feed, or the tab and the Dock disagree in a way nobody can debug. (U7's fallback (3) reaches for the same string; there it is a last resort for the *scope* of the number and inherits the same caveat, which is why it is a fallback and not the design.)
+- **Capping the Dock badge the way the tab pill caps.** Tab width is scarce, so the pill stops at `999+`; the Dock tile is not scarce, elides on its own, and `updateBadge` keeps printing the true total. The two surfaces showing `999+` and `4231` for the same mail is understandable; making the Dock lie to match the tab is not.
+- **A "show unread counts on tabs" checkbox, or a per-tab opt-out.** The count is display, not preference (Key Decisions). Its two real questions already have rows: A4 decides who counts toward the Dock total, A5 decides what "unread" means.
 - **A settings framework.** No schema, no plugin points, no generic defaults browser. One struct, typed accessors, direct reads.
 
 ## Definition of Done
 
-- U1–U8 implemented (U9 optional); `make build`, `make smoke` and `swift test` pass from a clean checkout.
-- Manual checklist 1–13 verified, pass/fail noted per item in the merge commit.
+- U1–U8 and U10 implemented (U9 optional); `make build`, `make smoke` and `swift test` pass from a clean checkout.
+- Manual checklist 1–17 verified, pass/fail noted per item in the merge commit.
+- Requirement 4d is met on both halves: every Mail tab shows its own count, and an account excluded from the Dock total still shows its own — verified together, since shipping only the first half is the failure mode.
 - An `accounts.json` and a `UserDefaults` domain from before this change load unchanged and gain the new fields on first save — verified, not assumed.
 - No control in the window requires a relaunch; anything that would have is in Out of Scope with its prerequisites written down.
 - The three `defaults write` keys documented in the README, or U9 explicitly deferred in the merge note.

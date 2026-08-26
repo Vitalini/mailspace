@@ -23,6 +23,11 @@ working, minimal, personal.
    - calendar event reminders.
    Clicking a notification opens the app on the right account/view.
 4. **Unread badge** on the Dock icon (total across accounts).
+4d. **Per-tab unread count**: each Mail tab shows its own account's unread
+   count in the tab itself, so the number is attributable without opening the
+   tab. The Dock badge stays the sum. Only accounts with "count in badge"
+   enabled contribute to the Dock total, but a tab shows its own count
+   regardless.
 4a. **Keychain-assisted login** (Mailplane-style): per-account Google credentials stored
    in the app's own Keychain items; when accounts.google.com login page shows up, the app
    auto-fills email (and password when available) via injected JS. 2FA stays manual.
