@@ -166,6 +166,77 @@ final class LinkRouterTests: XCTestCase {
         XCTAssertFalse(LinkRouter.matches(host: "google.com.evil.example", domain: "google.com"))
     }
 
+    // MARK: - What counts as a Google domain
+
+    func testGoogleDomainAcceptsGoogleAndItsCountryVariants() {
+        for host in [
+            "google.com",
+            "www.google.com",
+            "mail.google.com",
+            "accounts.google.com",
+            "google.de",
+            "google.co",
+            "drive.google.de",
+            "google.co.uk",
+            "accounts.google.co.uk",
+            "google.com.au",
+            "www.google.com.br",
+            // A fully-qualified name carries the root dot and is the same host.
+            "mail.google.com."
+        ] {
+            XCTAssertTrue(LinkRouter.isGoogleDomain(host), "expected a Google domain: \(host)")
+        }
+    }
+
+    /// The regression: the suffix test was "up to six letters and dots", which
+    /// is not "a Google country variant" — it is "anything short". Anyone who
+    /// owns `ev.io` can serve `google.ev.io`, and MailSpace loaded it inside
+    /// the account's session.
+    func testGoogleDomainRejectsShortSuffixesThatAreSomebodyElsesDomain() {
+        for host in [
+            "google.ev.io",
+            "google.hax.io",
+            "google.a.io",
+            "accounts.google.ev.io",
+            "google.b.co",
+            "google.x.y.z"
+        ] {
+            XCTAssertFalse(LinkRouter.isGoogleDomain(host), "must not be a Google domain: \(host)")
+            XCTAssertFalse(LinkRouter.isInApp(url("https://\(host)/signin")), "must not be in-app: \(host)")
+            XCTAssertNotEqual(
+                AuthSurface.classify(url("https://\(host)/signin")),
+                .signIn,
+                "must not be a sign-in host: \(host)"
+            )
+        }
+    }
+
+    func testGoogleDomainStillRejectsLookalikes() {
+        for host in [
+            "notgoogle.com",
+            "mygoogle.com",
+            "google.com.evil.example",
+            "google.com.phishing.example",
+            "googleusercontent.com.evil.example",
+            "google.info",
+            "google.evil.co"
+        ] {
+            XCTAssertFalse(LinkRouter.isGoogleDomain(host), "must not be a Google domain: \(host)")
+        }
+    }
+
+    // MARK: - Which navigations an SSO escort has any say over
+
+    func testOnlyForeignMainFrameNavigationsNeedAnEscort() {
+        XCTAssertTrue(LinkRouter.needsEscort(for: url("https://idp.company.example/saml"), isMainFrameTarget: true))
+        // Already staying in-app on its own merits: a pass must not be spent.
+        XCTAssertFalse(LinkRouter.needsEscort(for: url("https://mail.google.com/mail/u/0/"), isMainFrameTarget: true))
+        XCTAssertFalse(LinkRouter.needsEscort(for: url("about:blank"), isMainFrameTarget: true))
+        XCTAssertFalse(LinkRouter.needsEscort(for: url("mailto:a@b.com"), isMainFrameTarget: true))
+        // A subframe cannot navigate the page the user is looking at.
+        XCTAssertFalse(LinkRouter.needsEscort(for: url("https://doubleclick.net/ad"), isMainFrameTarget: false))
+    }
+
     // MARK: - Frame-aware routing
 
     /// The regression: only `.linkActivated` navigations left for the browser,
@@ -177,7 +248,7 @@ final class LinkRouterTests: XCTestCase {
             LinkRouter.destination(
                 for: url("https://attacker.example/landing"),
                 isMainFrameTarget: true,
-                isAuthenticating: false
+                isSSOEscorted: false
             ),
             .openExternally(url("https://attacker.example/landing"))
         )
@@ -190,7 +261,7 @@ final class LinkRouterTests: XCTestCase {
             LinkRouter.destination(
                 for: url("https://www.google.com/url?q=https://attacker.example/"),
                 isMainFrameTarget: true,
-                isAuthenticating: false
+                isSSOEscorted: false
             ),
             .openExternally(url("https://attacker.example/"))
         )
@@ -203,7 +274,7 @@ final class LinkRouterTests: XCTestCase {
             LinkRouter.destination(
                 for: url("https://doubleclick.net/ad?id=1"),
                 isMainFrameTarget: false,
-                isAuthenticating: false
+                isSSOEscorted: false
             ),
             .allowInApp
         )
@@ -212,13 +283,13 @@ final class LinkRouterTests: XCTestCase {
     /// A Workspace account signs in through its own identity provider, on a
     /// host MailSpace has never heard of. Booting that to the browser would
     /// leave the sign-in unfinishable — the browser cannot see this account's
-    /// data store.
-    func testForeignHostStaysInAppWhileAuthenticating() {
+    /// data store. Whether a pass exists at all is `SSOEscort`'s decision.
+    func testForeignHostStaysInAppWhileEscorted() {
         XCTAssertEqual(
             LinkRouter.destination(
                 for: url("https://idp.company.example/saml/sso"),
                 isMainFrameTarget: true,
-                isAuthenticating: true
+                isSSOEscorted: true
             ),
             .allowInApp
         )
@@ -230,7 +301,7 @@ final class LinkRouterTests: XCTestCase {
                 LinkRouter.destination(
                     for: url("https://mail.google.com/mail/u/0/"),
                     isMainFrameTarget: isMainFrame,
-                    isAuthenticating: false
+                    isSSOEscorted: false
                 ),
                 .allowInApp
             )
@@ -239,7 +310,7 @@ final class LinkRouterTests: XCTestCase {
                 LinkRouter.destination(
                     for: url("mailto:a@b.com"),
                     isMainFrameTarget: isMainFrame,
-                    isAuthenticating: false
+                    isSSOEscorted: false
                 ),
                 .compose(url("mailto:a@b.com"))
             )
@@ -248,7 +319,7 @@ final class LinkRouterTests: XCTestCase {
                 LinkRouter.destination(
                     for: url("about:blank"),
                     isMainFrameTarget: isMainFrame,
-                    isAuthenticating: true
+                    isSSOEscorted: true
                 ),
                 .allowInApp
             )

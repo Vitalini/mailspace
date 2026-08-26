@@ -64,7 +64,7 @@ enum LinkRouter {
     }
 
     /// The same decision, told which frame the navigation would take over and
-    /// whether the webview is part-way through a Google sign-in.
+    /// whether an `SSOEscort` covers it.
     ///
     /// Navigation *type* is deliberately not part of this. Gating the external
     /// hand-off on `.linkActivated` meant a `302`, a `window.location =` or a
@@ -76,15 +76,28 @@ enum LinkRouter {
     ///   Calendar embed foreign content — ads, maps, tracked images — and
     ///   sending those to the browser would open a window per embed. A
     ///   subframe cannot navigate the page the user is looking at, so it stays.
-    /// - `isAuthenticating`: the webview has committed a sign-in page and has
-    ///   not landed on an app surface yet. A Workspace account is redirected to
-    ///   its own identity provider on a host MailSpace has never heard of;
-    ///   handing that to the browser would leave the sign-in unfinishable,
-    ///   because the browser has no access to this account's data store.
-    static func destination(for requested: URL, isMainFrameTarget: Bool, isAuthenticating: Bool) -> Destination {
+    /// - `isSSOEscorted`: a live `SSOEscort` pass authorises this one hop off
+    ///   Google. A Workspace account is redirected to its own identity provider
+    ///   on a host MailSpace has never heard of; handing that to the browser
+    ///   would leave the sign-in unfinishable, because the browser has no
+    ///   access to this account's data store. Everything that keeps the pass
+    ///   narrow lives in `SSOEscort` — this function only obeys it.
+    static func destination(for requested: URL, isMainFrameTarget: Bool, isSSOEscorted: Bool) -> Destination {
         let decision = destination(for: requested)
         guard case .openExternally = decision else { return decision }
-        return isMainFrameTarget && !isAuthenticating ? decision : .allowInApp
+        return isMainFrameTarget && !isSSOEscorted ? decision : .allowInApp
+    }
+
+    /// Whether an `SSOEscort` has any say over this navigation at all: only a
+    /// whole page, on a host that would otherwise leave for the browser.
+    ///
+    /// The escort is consulted through this so a pass is never *spent* on a
+    /// navigation that was going to stay in-app regardless — every Gmail hop
+    /// would otherwise burn the budget a real sign-in needs.
+    static func needsEscort(for requested: URL, isMainFrameTarget: Bool) -> Bool {
+        guard isMainFrameTarget else { return false }
+        if case .openExternally = destination(for: requested) { return true }
+        return false
     }
 
     static func isInApp(_ url: URL) -> Bool {
@@ -103,15 +116,41 @@ enum LinkRouter {
 
     /// True for `google.com` and its country variants (`google.co.uk`,
     /// `google.de`) plus any subdomain of them.
+    ///
+    /// The suffix after `google.` used to be "up to six letters and dots",
+    /// which admits far more than country variants: `google.ev.io` and
+    /// `google.hax.io` both fit, and both are a subdomain anyone who owns
+    /// `ev.io` or `hax.io` can create — a look-alike that MailSpace would have
+    /// loaded inside the account's session. Google's public suffixes have three
+    /// shapes and no more, so they are matched as shapes.
     static func isGoogleDomain(_ host: String) -> Bool {
+        // A fully-qualified name may carry the root dot; it names the same host.
+        var host = host.lowercased()
+        if host.hasSuffix(".") { host.removeLast() }
+
         guard let range = host.range(of: "google.", options: .backwards) else { return false }
 
         let before = host[..<range.lowerBound]
         guard before.isEmpty || before.hasSuffix(".") else { return false }
 
-        let tld = host[range.upperBound...]
-        guard !tld.isEmpty, tld.count <= 6 else { return false }
-        return tld.allSatisfy { $0.isLetter || $0 == "." }
+        return isGoogleSuffix(String(host[range.upperBound...]))
+    }
+
+    /// `com`, a bare country code (`de`, `co`, `jp`), or a country code under
+    /// `co`/`com` (`co.uk`, `com.au`, `com.br`). Anything else is somebody
+    /// else's domain with `google` for a label.
+    private static func isGoogleSuffix(_ suffix: String) -> Bool {
+        let labels = suffix.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isLetter) }) else { return false }
+
+        switch labels.count {
+        case 1:
+            return labels[0] == "com" || labels[0].count == 2
+        case 2:
+            return (labels[0] == "co" || labels[0] == "com") && labels[1].count == 2
+        default:
+            return false
+        }
     }
 
     /// Reduces a server-supplied download name to something that can only land
@@ -300,6 +339,142 @@ enum AuthSurface {
     }
 }
 
+/// The narrow, expiring pass that lets one Google sign-in finish through a
+/// customer's identity provider — and nothing else — inside the account's
+/// webview.
+///
+/// What this replaces was a sticky per-webview flag. Any commit on an
+/// `accounts.google.<tld>` page set it; only a *Google* page that was neither
+/// sign-in nor app surface cleared it, and on a foreign host the rule was
+/// "keep". So the first foreign page to load under the flag kept the flag on
+/// for the next one, for the rest of the webview's life.
+///
+/// That was exploitable with no bug in Google at all. Mail a link to the
+/// genuine authorization endpoint with an attacker's `redirect_uri`
+/// (`accounts.google.com/o/oauth2/v2/auth?client_id=…&redirect_uri=https://evil.example/cb`):
+/// the real Google consent page commits and arms the flag, the user presses
+/// Continue, Google's `302` delivers the attacker's page into the account's
+/// data store — and the tab then stays in "follow anything" mode indefinitely.
+/// MailSpace has no address bar, so the page is indistinguishable from Google's
+/// own.
+///
+/// The pass is therefore narrow, spent, and short-lived:
+///
+/// - **Armed** only by committing a Google sign-in step that is not a
+///   *delegated* authorization endpoint. Those endpoints exist precisely to
+///   hand the browser to an arbitrary third-party `redirect_uri`; MailSpace is
+///   never that third party.
+/// - **Re-armed** with a fresh budget every time the chain comes back and
+///   commits another Google sign-in page — which is what a real SSO bounce
+///   does.
+/// - **Expires** after `timeToLive`, or after `hopBudget` escorted
+///   destinations, whichever comes first.
+/// - **Pinned** to one foreign host the moment a foreign page commits under
+///   it: after that only that host (and Google, which never needs a pass) may
+///   keep the tab. The IdP's own login POST still works; the attacker's landing
+///   page cannot move the tab anywhere else.
+/// - **Dropped** when the webview commits a Google page that is neither a
+///   sign-in step nor an app surface, when the sign-in completes, and when the
+///   webview is discarded.
+///
+/// The trade: an SSO chain that renders on one foreign host and then hands off
+/// to a *second* one — a separate MFA provider, say — loses the pass and gets
+/// the browser. That fails safe and the user can start the sign-in again;
+/// a pass that never ends does not.
+///
+/// Pure logic with an injected clock, so all of it is testable.
+enum SSOEscort {
+    /// One sign-in step's pass. Long enough for a password manager, a TOTP app
+    /// and a slow identity provider; short enough that a tab parked on a
+    /// sign-in page is not a standing invitation.
+    static let timeToLive: TimeInterval = 120
+
+    /// How many escorted *destinations* one pass may authorise. Server
+    /// redirects inside a navigation the pass already paid for are refunded
+    /// (`didReceiveServerRedirectForProvisionalNavigation`), so a long redirect
+    /// chain costs one.
+    static let hopBudget = 6
+
+    struct Pass: Equatable {
+        var armedAt: Date
+        var spent: Int = 0
+        /// The foreign host that has actually rendered under this pass, once
+        /// one has. From then on it is the only foreign host the pass covers.
+        var landedHost: String?
+    }
+
+    enum Outcome: Equatable {
+        /// Stays in the account's webview; keep this pass.
+        case allow(Pass)
+        /// The user's browser owns it.
+        case deny
+    }
+
+    /// Whether committing this URL may arm a pass.
+    static func arms(_ url: URL?) -> Bool {
+        guard let url, AuthSurface.classify(url) == .signIn else { return false }
+        return !isDelegatedAuthorization(url)
+    }
+
+    /// Google's OAuth authorization and consent endpoints — `/o/oauth2/v2/auth`,
+    /// `/signin/oauth/consent`, `/o/oauth2/postmessageRelay`. They are Google
+    /// pages on a Google host, and their entire purpose is to redirect to a
+    /// `redirect_uri` chosen by whoever registered the client. Anyone can
+    /// register one, so a pass armed here is a pass handed to a stranger.
+    static func isDelegatedAuthorization(_ url: URL) -> Bool {
+        url.path.split(separator: "/").contains { $0.lowercased().hasPrefix("oauth") }
+    }
+
+    /// The decision for one navigation that would otherwise leave for the
+    /// browser (see `LinkRouter.needsEscort`).
+    static func authorize(_ pass: Pass?, to url: URL, now: Date) -> Outcome {
+        guard var pass else { return .deny }
+        let age = now.timeIntervalSince(pass.armedAt)
+        guard age >= 0, age <= timeToLive else { return .deny }
+        guard pass.spent < hopBudget else { return .deny }
+        guard let host = url.host?.lowercased(), !host.isEmpty else { return .deny }
+        if let landed = pass.landedHost, landed != host { return .deny }
+
+        pass.spent += 1
+        return .allow(pass)
+    }
+
+    /// What committing `url` does to the pass.
+    static func afterCommit(_ pass: Pass?, of url: URL?, now: Date) -> Pass? {
+        if arms(url) { return Pass(armedAt: now) }
+
+        guard
+            let url,
+            let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+            let host = url.host?.lowercased(), !host.isEmpty
+        else {
+            // `about:blank`, `blob:`, `data:`, nothing at all: says neither way.
+            return pass
+        }
+
+        guard !LinkRouter.isInApp(url) else {
+            // An app surface is left alone — `didFinish` there is what completes
+            // the sign-in, and completing it drops the pass. Any other Google
+            // page ends the chain, delegated authorization endpoints included.
+            if case .app = AuthSurface.classify(url) { return pass }
+            return nil
+        }
+
+        // A foreign page rendered. The pass now covers that host and no other.
+        guard var pass else { return nil }
+        pass.landedHost = host
+        return pass
+    }
+
+    /// A server redirect inside a navigation the pass already authorised is
+    /// part of that navigation, not a new destination.
+    static func refunding(_ pass: Pass?) -> Pass? {
+        guard var pass else { return nil }
+        pass.spent = max(0, pass.spent - 1)
+        return pass
+    }
+}
+
 /// A set of objects held weakly and compared by identity.
 ///
 /// `ObjectIdentifier` alone is not enough to remember "this webview went
@@ -331,6 +506,46 @@ struct WeakObjectSet<Element: AnyObject> {
         let held = contains(object)
         refs[ObjectIdentifier(object)] = nil
         return held
+    }
+}
+
+/// A dictionary keyed by object identity, holding its keys weakly.
+///
+/// Same reason as `WeakObjectSet`: `ObjectIdentifier` is the object's address
+/// and the allocator reuses addresses, so a value left behind by a dead webview
+/// must not be handed to whatever is allocated there next — here that would be
+/// a fresh webview inheriting somebody else's live sign-in pass.
+struct WeakObjectMap<Key: AnyObject, Value> {
+    private struct Entry {
+        weak var key: AnyObject?
+        var value: Value
+    }
+
+    private var entries: [ObjectIdentifier: Entry] = [:]
+
+    var count: Int { entries.values.filter { $0.key != nil }.count }
+
+    subscript(key: Key) -> Value? {
+        get {
+            guard let entry = entries[ObjectIdentifier(key)], entry.key === key else { return nil }
+            return entry.value
+        }
+        set {
+            let id = ObjectIdentifier(key)
+            guard let newValue else {
+                entries[id] = nil
+                return
+            }
+            entries = entries.filter { $0.value.key != nil }
+            entries[id] = Entry(key: key, value: newValue)
+        }
+    }
+
+    @discardableResult
+    mutating func removeValue(forKey key: Key) -> Value? {
+        let existing = self[key]
+        entries[ObjectIdentifier(key)] = nil
+        return existing
     }
 }
 
@@ -394,7 +609,15 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Webviews that have been through a sign-in step. Landing on an app
     /// surface only means "signed in" for these — Gmail's own print and
     /// compose popups land on the very same URLs.
+    ///
+    /// Deliberately *not* the same state as `escorts`: this one may live as
+    /// long as the user takes to get through 2FA, because all it decides is
+    /// whether arriving on the inbox counts as a sign-in finishing. Letting a
+    /// page off Google is the other question entirely, and it expires.
     private var sawSignIn = WeakObjectSet<WKWebView>()
+    /// Live `SSOEscort` passes: the only thing that lets a foreign page take
+    /// over an account webview's main frame.
+    private var escorts = WeakObjectMap<WKWebView, SSOEscort.Pass>()
     /// Webviews the crash throttle has stopped reloading. Held so the tab has a
     /// way back: without one, three terminations left it blank until the app
     /// was restarted.
@@ -422,12 +645,14 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             return
         }
 
+        // A `nil` target frame is a new window, which is as much "a whole page
+        // the user will look at" as the main frame is.
+        let isMainFrameTarget = navigationAction.targetFrame?.isMainFrame ?? true
+        let isSSOEscorted = spendEscort(on: webView, requested: requested, isMainFrameTarget: isMainFrameTarget)
         let decision = LinkRouter.destination(
             for: requested,
-            // A `nil` target frame is a new window, which is as much "a whole
-            // page the user will look at" as the main frame is.
-            isMainFrameTarget: navigationAction.targetFrame?.isMainFrame ?? true,
-            isAuthenticating: sawSignIn.contains(webView)
+            isMainFrameTarget: isMainFrameTarget,
+            isSSOEscorted: isSSOEscorted
         )
 
         switch decision {
@@ -443,6 +668,22 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         case .openExternally(let url):
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
+        }
+    }
+
+    /// Asks this webview's `SSOEscort` pass to cover one navigation, and spends
+    /// a step of it when it does. Only ever consulted for a navigation that
+    /// would otherwise leave for the browser, so ordinary Gmail traffic cannot
+    /// burn the budget a real sign-in needs.
+    private func spendEscort(on webView: WKWebView, requested: URL, isMainFrameTarget: Bool) -> Bool {
+        guard LinkRouter.needsEscort(for: requested, isMainFrameTarget: isMainFrameTarget) else { return false }
+
+        switch SSOEscort.authorize(escorts[webView], to: LinkRouter.unwrapRedirect(requested), now: Date()) {
+        case .allow(let pass):
+            escorts[webView] = pass
+            return true
+        case .deny:
+            return false
         }
     }
 
@@ -473,6 +714,15 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         case .clear: sawSignIn.remove(webView)
         case .keep: break
         }
+        // The off-Google pass is kept separately and on much stricter terms;
+        // see `SSOEscort`.
+        escorts[webView] = SSOEscort.afterCommit(escorts[webView], of: webView.url, now: Date())
+    }
+
+    /// A `302` inside a navigation the pass already authorised is that same
+    /// navigation, so it must not cost another destination out of the budget.
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        escorts[webView] = SSOEscort.refunding(escorts[webView])
     }
 
     /// Sign-in is finished the moment a webview that was authenticating settles
@@ -495,6 +745,9 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// stray window. `sawSignIn.remove` reports membership exactly once, so
     /// whichever ending arrives first wins and the other is a no-op.
     private func completeSignIn(for webView: WKWebView) {
+        // Whatever else happens, the sign-in is over: nothing has any further
+        // business leaving Google in this webview.
+        escorts.removeValue(forKey: webView)
         guard sawSignIn.remove(webView) else { return }
         let accountId = webView.configuration.websiteDataStore.identifier
 
@@ -555,6 +808,7 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         crashThrottle.forget(ObjectIdentifier(webView))
         stalled.remove(webView)
         sawSignIn.remove(webView)
+        escorts.removeValue(forKey: webView)
     }
 
     // MARK: - WKUIDelegate
