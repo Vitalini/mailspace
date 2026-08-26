@@ -44,6 +44,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         )
         super.init()
 
+        // The controller holds the only strong reference to the window, so
+        // AppKit must not release it on close — otherwise Cmd+W followed by a
+        // Dock click (applicationShouldHandleReopen) touches a freed window.
+        window.isReleasedWhenClosed = false
         window.title = "MailSpace"
         window.delegate = self
         window.minSize = NSSize(width: 860, height: 560)

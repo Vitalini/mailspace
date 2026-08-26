@@ -283,6 +283,9 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             backing: .buffered,
             defer: false
         )
+        // `popupWindows` is the only owner; letting AppKit release the window
+        // on a titlebar close would over-release it.
+        window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: .aqua)
         window.contentView = popup
         // Closing from the titlebar never reaches `webViewDidClose` — only a
