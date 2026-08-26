@@ -126,6 +126,135 @@ final class LinkRouterTests: XCTestCase {
         XCTAssertTrue(LinkRouter.isInApp(LinkRouter.unwrapRedirect(wrapped)))
     }
 
+    /// The regression: `hasSuffix("google.com")` has no dot boundary, so a
+    /// look-alike domain's `/url?q=` unwrapped to a Google target — and since
+    /// the webview then navigates to the *original* URL, the look-alike loaded
+    /// inside the account's session, cookies and injected handlers included.
+    func testUnwrapIgnoresLookalikeHosts() {
+        for candidate in [
+            "https://notgoogle.com/url?q=https://mail.google.com/mail/u/0/",
+            "https://mygoogle.com/url?q=https://mail.google.com/mail/u/0/",
+            "https://google.com.evil.example/url?q=https://mail.google.com/mail/u/0/",
+            "https://evilgooglemail.com/url?q=https://mail.google.com/mail/u/0/"
+        ] {
+            let wrapped = url(candidate)
+            XCTAssertEqual(LinkRouter.unwrapRedirect(wrapped), wrapped, "must not unwrap: \(candidate)")
+            XCTAssertEqual(
+                LinkRouter.destination(for: wrapped),
+                .openExternally(wrapped),
+                "must go to the browser as itself: \(candidate)"
+            )
+        }
+    }
+
+    /// …while Gmail's own wrapper, on a real Google host, still unwraps.
+    func testUnwrapStillWorksForRealGoogleHosts() {
+        for host in ["www.google.com", "google.com", "www.google.co.uk", "mail.googlemail.com"] {
+            let wrapped = url("https://\(host)/url?q=https://example.com/x")
+            XCTAssertEqual(
+                LinkRouter.unwrapRedirect(wrapped).absoluteString,
+                "https://example.com/x",
+                "must unwrap: \(host)"
+            )
+        }
+    }
+
+    func testHostMatchingRequiresADotBoundary() {
+        XCTAssertTrue(LinkRouter.matches(host: "google.com", domain: "google.com"))
+        XCTAssertTrue(LinkRouter.matches(host: "mail.google.com", domain: "google.com"))
+        XCTAssertFalse(LinkRouter.matches(host: "notgoogle.com", domain: "google.com"))
+        XCTAssertFalse(LinkRouter.matches(host: "google.com.evil.example", domain: "google.com"))
+    }
+
+    // MARK: - Frame-aware routing
+
+    /// The regression: only `.linkActivated` navigations left for the browser,
+    /// so a 302, a `window.location =` or a form POST rendered an arbitrary
+    /// site inside the account's cookie jar. The frame decides now, not the
+    /// navigation type.
+    func testForeignMainFrameNavigationLeavesWhateverDroveIt() {
+        XCTAssertEqual(
+            LinkRouter.destination(
+                for: url("https://attacker.example/landing"),
+                isMainFrameTarget: true,
+                isAuthenticating: false
+            ),
+            .openExternally(url("https://attacker.example/landing"))
+        )
+    }
+
+    /// A new window (`targetFrame == nil`, passed as a main-frame target) is a
+    /// whole page too.
+    func testForeignNewWindowLeaves() {
+        XCTAssertEqual(
+            LinkRouter.destination(
+                for: url("https://www.google.com/url?q=https://attacker.example/"),
+                isMainFrameTarget: true,
+                isAuthenticating: false
+            ),
+            .openExternally(url("https://attacker.example/"))
+        )
+    }
+
+    /// Gmail and Calendar embed foreign subframes — ads, maps, tracked images.
+    /// Those must stay in the page, or every embed opens a browser window.
+    func testForeignSubframesStayInPage() {
+        XCTAssertEqual(
+            LinkRouter.destination(
+                for: url("https://doubleclick.net/ad?id=1"),
+                isMainFrameTarget: false,
+                isAuthenticating: false
+            ),
+            .allowInApp
+        )
+    }
+
+    /// A Workspace account signs in through its own identity provider, on a
+    /// host MailSpace has never heard of. Booting that to the browser would
+    /// leave the sign-in unfinishable — the browser cannot see this account's
+    /// data store.
+    func testForeignHostStaysInAppWhileAuthenticating() {
+        XCTAssertEqual(
+            LinkRouter.destination(
+                for: url("https://idp.company.example/saml/sso"),
+                isMainFrameTarget: true,
+                isAuthenticating: true
+            ),
+            .allowInApp
+        )
+    }
+
+    func testGoogleHostsAndMailtoAreUnaffectedByTheFrameRules() {
+        for isMainFrame in [true, false] {
+            XCTAssertEqual(
+                LinkRouter.destination(
+                    for: url("https://mail.google.com/mail/u/0/"),
+                    isMainFrameTarget: isMainFrame,
+                    isAuthenticating: false
+                ),
+                .allowInApp
+            )
+            // A mailto: still composes wherever it was clicked.
+            XCTAssertEqual(
+                LinkRouter.destination(
+                    for: url("mailto:a@b.com"),
+                    isMainFrameTarget: isMainFrame,
+                    isAuthenticating: false
+                ),
+                .compose(url("mailto:a@b.com"))
+            )
+            // And a page-driven scheme never reaches NSWorkspace.
+            XCTAssertEqual(
+                LinkRouter.destination(
+                    for: url("about:blank"),
+                    isMainFrameTarget: isMainFrame,
+                    isAuthenticating: true
+                ),
+                .allowInApp
+            )
+        }
+    }
+
     // MARK: - Download destinations
 
     func testUniqueDestinationUsesSuggestedNameWhenFree() throws {
@@ -159,6 +288,53 @@ final class LinkRouterTests: XCTestCase {
         XCTAssertEqual(
             LinkRouter.uniqueDestination(in: directory, filename: "").lastPathComponent,
             "download"
+        )
+    }
+
+    /// `suggestedFilename` is whatever the server's `Content-Disposition` said.
+    /// A path in it used to resolve straight out of ~/Downloads, and the
+    /// collision loop never caught it because the escaped path was new.
+    func testSuggestedFilenameCannotEscapeTheDownloadDirectory() throws {
+        let directory = try makeTemporaryDirectory()
+        for hostile in [
+            "../../Library/LaunchAgents/x.plist",
+            "../x.plist",
+            "/etc/cron.d/x",
+            "/../../x",
+            "subdir/x.plist",
+            "..",
+            ".",
+            "/",
+            "",
+            "   "
+        ] {
+            let destination = LinkRouter.uniqueDestination(in: directory, filename: hostile)
+            XCTAssertEqual(
+                destination.deletingLastPathComponent().standardizedFileURL,
+                directory.standardizedFileURL,
+                "escaped ~/Downloads with: \(hostile)"
+            )
+            XCTAssertFalse(destination.lastPathComponent.contains("/"), "kept a separator: \(hostile)")
+        }
+    }
+
+    func testSafeFilenameKeepsTheLastComponentAndFallsBackSensibly() {
+        XCTAssertEqual(LinkRouter.safeFilename("report.pdf"), "report.pdf")
+        XCTAssertEqual(LinkRouter.safeFilename("../../Library/LaunchAgents/x.plist"), "x.plist")
+        XCTAssertEqual(LinkRouter.safeFilename("/etc/hosts"), "hosts")
+        XCTAssertEqual(LinkRouter.safeFilename("  spaced.txt  "), "spaced.txt")
+        for empty in ["", "   ", ".", "..", "...", "/"] {
+            XCTAssertEqual(LinkRouter.safeFilename(empty), "download", "expected the fallback for: \(empty)")
+        }
+    }
+
+    /// A traversing name still collides properly once it has been reduced.
+    func testSanitizedNameStillGetsTheCollisionSuffix() throws {
+        let directory = try makeTemporaryDirectory()
+        try Data().write(to: directory.appendingPathComponent("x.plist"))
+        XCTAssertEqual(
+            LinkRouter.uniqueDestination(in: directory, filename: "../../x.plist").lastPathComponent,
+            "x (2).plist"
         )
     }
 

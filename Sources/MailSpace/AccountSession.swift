@@ -7,6 +7,19 @@ protocol SessionLocating: AnyObject {
     func account(for accountId: UUID) -> Account?
 }
 
+/// Told when a webview is being discarded, so per-webview state the delegate
+/// keeps does not outlive it.
+///
+/// `ObjectIdentifier` is the object's address, and the allocator reuses
+/// addresses: without this, a webview that exhausted its crash budget would
+/// hand that exhausted budget to whatever webview is allocated there next.
+protocol WebViewDiscarding: AnyObject {
+    func webViewWasDiscarded(_ webView: WKWebView)
+}
+
+/// What `AccountSession` needs of the object driving its webviews.
+typealias AccountSessionDelegate = NSObject & WKNavigationDelegate & WKUIDelegate & WebViewDiscarding
+
 /// One account's live browser session: an isolated `WKWebsiteDataStore` plus a
 /// webview for each service the account has enabled.
 ///
@@ -22,13 +35,13 @@ final class AccountSession {
 
     private let configuration: WKWebViewConfiguration
     private var views: [AccountView: WKWebView] = [:]
-    private weak var delegate: (NSObject & WKNavigationDelegate & WKUIDelegate)?
+    private weak var delegate: AccountSessionDelegate?
 
     init(
         account: Account,
         userScripts: [WKUserScript] = [],
         messageHandlers: [String: WKScriptMessageHandler] = [:],
-        replyHandlers: [String: WKScriptMessageHandlerWithReply] = [:]
+        replyHandlers: [ScriptReplyHandler] = []
     ) {
         self.accountId = account.id
         self.displayName = account.name
@@ -57,7 +70,7 @@ final class AccountSession {
         views.values.contains { $0 === webView }
     }
 
-    func setDelegates<D: NSObject & WKNavigationDelegate & WKUIDelegate>(_ delegate: D) {
+    func setDelegates<D: AccountSessionDelegate>(_ delegate: D) {
         self.delegate = delegate
         for webView in webViews {
             webView.navigationDelegate = delegate
@@ -111,10 +124,14 @@ final class AccountSession {
         }
     }
 
-    /// Tears the session down before its data store can be deleted. WebKit
-    /// refuses to remove a store that is still in use, so every webview must
-    /// stop loading, drop its delegates and unregister its message handlers
-    /// first.
+    /// Tears the session down before its data store can be deleted.
+    ///
+    /// WebKit refuses to remove a store anything still references, and this
+    /// object is one of those things: `configuration` holds the store for the
+    /// session's whole lifetime. Dropping the webviews is therefore not
+    /// enough — the configuration is pointed at a throwaway in-memory store as
+    /// well, and the caller has to let the session itself go (see
+    /// `AppDelegate.requestRemoveAccount`).
     func detach() {
         for webView in webViews {
             teardown(webView)
@@ -122,6 +139,7 @@ final class AccountSession {
         views.removeAll()
         configuration.userContentController.removeAllUserScripts()
         configuration.userContentController.removeAllScriptMessageHandlers()
+        configuration.websiteDataStore = .nonPersistent()
     }
 
     private func teardown(_ webView: WKWebView) {
@@ -129,6 +147,9 @@ final class AccountSession {
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         webView.removeFromSuperview()
-        webView.loadHTMLString("", baseURL: nil)
+        // Deliberately no final load: this webview is on its way out, and
+        // starting a fresh one would put the account's data store back in use
+        // at the exact moment the caller is trying to delete it.
+        delegate?.webViewWasDiscarded(webView)
     }
 }

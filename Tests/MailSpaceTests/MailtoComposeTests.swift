@@ -39,3 +39,48 @@ final class MailtoComposeTests: XCTestCase {
         XCTAssertNoThrow(try compose("mailto:"))
     }
 }
+
+/// Which account a `mailto:` is composed in.
+final class MailtoAccountTests: XCTestCase {
+    private func account(_ name: String, mail: Bool) -> Account {
+        Account(name: name, mailEnabled: mail, calendarEnabled: true)
+    }
+
+    func testTheSelectedAccountComposesWhenItHasMail() {
+        let work = account("Work", mail: true)
+        let personal = account("Personal", mail: true)
+
+        XCTAssertEqual(
+            AppDelegate.mailtoAccount(selected: personal.id, accounts: [work, personal]),
+            personal.id
+        )
+    }
+
+    /// The regression: `selected ?? firstMailEnabled` short-circuits on any
+    /// non-nil selection, and one is always installed while an account exists.
+    /// So a `mailto:` arriving with a Calendar-only account selected was
+    /// dropped — the window just came to the front.
+    func testACalendarOnlyAccountHandsOffToTheFirstMailAccount() {
+        let family = account("Family", mail: false)
+        let work = account("Work", mail: true)
+
+        XCTAssertEqual(
+            AppDelegate.mailtoAccount(selected: family.id, accounts: [family, work]),
+            work.id
+        )
+    }
+
+    func testAStaleSelectionFallsBackToTheFirstMailAccount() {
+        let work = account("Work", mail: true)
+
+        XCTAssertEqual(AppDelegate.mailtoAccount(selected: UUID(), accounts: [work]), work.id)
+        XCTAssertEqual(AppDelegate.mailtoAccount(selected: nil, accounts: [work]), work.id)
+    }
+
+    func testNoMailAccountAnywhereMeansNoCompose() {
+        let family = account("Family", mail: false)
+
+        XCTAssertNil(AppDelegate.mailtoAccount(selected: family.id, accounts: [family]))
+        XCTAssertNil(AppDelegate.mailtoAccount(selected: nil, accounts: []))
+    }
+}

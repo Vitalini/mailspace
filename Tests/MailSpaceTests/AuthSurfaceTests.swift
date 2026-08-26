@@ -23,7 +23,10 @@ final class AuthSurfaceTests: XCTestCase {
             "https://accounts.google.co.uk/ServiceLogin",
             "https://accounts.youtube.com/accounts/SetSID",
             "https://gds.google.com/web/challenge",
-            "https://signin.google.com/o/oauth2/auth"
+            "https://signin.google.com/o/oauth2/auth",
+            // Renders mid-chain for EU users; if it were classified as an
+            // ordinary Google page it would read as the chain ending.
+            "https://consent.google.com/m?continue=https://mail.google.com/"
         ] {
             XCTAssertEqual(AuthSurface.classify(url(candidate)), .signIn, "expected a sign-in step: \(candidate)")
         }
@@ -132,6 +135,83 @@ final class AuthSurfaceTests: XCTestCase {
             openerURL: url("https://calendar.google.com/calendar/u/0/r"),
             isLinkActivated: true
         ))
+    }
+
+    // MARK: - Sign-up is not sign-in
+
+    /// Creating a *new* Google account is not this tab's sign-in finishing:
+    /// there is no session the tab is waiting on, and the identity it produces
+    /// is not the one the account record and its Keychain item describe. So it
+    /// gets its own window instead of taking over an existing account's tab.
+    func testSignUpIsNotASignInStep() {
+        for candidate in [
+            "https://accounts.google.com/signup/v2/webcreateaccount?flowName=GlifWebSignIn",
+            "https://accounts.google.com/SignUp",
+            "https://accounts.google.com/lifecycle/flows/signup?continue=https://mail.google.com/",
+            "https://accounts.google.co.uk/signup/v2/createaccount"
+        ] {
+            XCTAssertEqual(AuthSurface.classify(url(candidate)), .other, "sign-up is not sign-in: \(candidate)")
+        }
+    }
+
+    func testSignUpKeepsItsOwnWindow() {
+        XCTAssertFalse(AuthSurface.shouldLoadInOpener(
+            requested: url("https://accounts.google.com/signup/v2/webcreateaccount"),
+            openerURL: url("https://www.google.com/gmail/about/"),
+            isLinkActivated: true
+        ))
+    }
+
+    /// The neighbouring path must not be caught by the same rule.
+    func testSignInPathsAreStillSignIn() {
+        XCTAssertEqual(AuthSurface.classify(url("https://accounts.google.com/v3/signin/identifier")), .signIn)
+        XCTAssertEqual(AuthSurface.classify(url("https://accounts.google.com/signin/challenge/pwd")), .signIn)
+    }
+
+    // MARK: - Provenance
+
+    func testSignInStepsRecordProvenance() {
+        XCTAssertEqual(AuthSurface.provenance(for: url("https://accounts.google.com/v3/signin/identifier")), .record)
+        XCTAssertEqual(AuthSurface.provenance(for: url("https://gds.google.com/web/challenge")), .record)
+    }
+
+    /// An app surface must not clear on commit: `didFinish` is what consumes
+    /// the flag, and clearing here would take it one callback too early.
+    func testAppSurfacesLeaveProvenanceForDidFinish() {
+        XCTAssertEqual(AuthSurface.provenance(for: url("https://mail.google.com/mail/u/0/")), .keep)
+        XCTAssertEqual(AuthSurface.provenance(for: url("https://calendar.google.com/calendar/u/0/r")), .keep)
+    }
+
+    /// The gap: a tab that touched `accounts.google.com` at launch and bounced
+    /// to the marketing page kept the flag, so a much later arrival on an app
+    /// surface read as a fresh sign-in and yanked the account's other tabs.
+    func testGooglePagesThatAreNeitherSignInNorAppClearProvenance() {
+        for candidate in [
+            "https://www.google.com/gmail/about/",
+            "https://mail.google.com/mail/about/",
+            "https://workspace.google.com/intl/en/gmail/",
+            "https://myaccount.google.com/security",
+            "https://drive.google.com/file/d/abc/preview",
+            "https://accounts.google.com/signup/v2/webcreateaccount"
+        ] {
+            XCTAssertEqual(AuthSurface.provenance(for: url(candidate)), .clear, "should clear: \(candidate)")
+        }
+    }
+
+    /// A foreign host is left alone: mid sign-in that is the account's identity
+    /// provider, and clearing there would strand the tabs the sign-in is
+    /// supposed to bring back. Nothing else reaches a foreign host in an
+    /// account webview's main frame.
+    func testForeignHostsLeaveProvenanceAlone() {
+        for candidate in [
+            "https://idp.company.example/saml/sso",
+            "https://login.microsoftonline.com/common/oauth2/authorize",
+            "about:blank",
+            "blob:https://accounts.google.com/2b4f-1"
+        ] {
+            XCTAssertEqual(AuthSurface.provenance(for: url(candidate)), .keep, "should keep: \(candidate)")
+        }
+        XCTAssertEqual(AuthSurface.provenance(for: nil), .keep)
     }
 
     /// Gmail's own popups — print, compose, open-in-new-window, Drive previews

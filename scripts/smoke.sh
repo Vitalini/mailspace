@@ -110,11 +110,22 @@ else
   echo "  skip network checks (SMOKE_SKIP_NETWORK=1)"
 fi
 
-# 7. Notification shim: both Notification and showNotification reach native.
+# 7. Notification shim: both Notification and showNotification reach native,
+#    and every delivery came from a frame that passes the origin check.
 SHIM_OUT="$(MAILSPACE_SELFTEST=shim run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
 case "$SHIM_OUT" in
   *"result=ok"*) pass "notification shim: $SHIM_OUT" ;;
   *) fail "notification shim: $SHIM_OUT" ;;
+esac
+
+# 7b. Account removal really deletes the account's browser session. WebKit
+#     refuses to remove a data store anything still references, and it only
+#     ever said so on stderr — while the removal dialog told the user the
+#     Google session was gone from the Mac.
+STORE_OUT="$(MAILSPACE_SELFTEST=store run_with_timeout 60 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$STORE_OUT" in
+  *"result=ok"*) pass "data store removal: $STORE_OUT" ;;
+  *) fail "data store removal: $STORE_OUT" ;;
 esac
 
 # 8. Real launch: open the bundle, confirm the process stays alive, then quit it.

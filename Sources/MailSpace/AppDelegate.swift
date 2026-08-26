@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
     private var autofillProbe: AutofillProbe?
+    private var storeProbe: StoreRemovalProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
@@ -47,6 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         if SelfTest.mode == .autofill {
             autofillProbe = AutofillProbe()
             autofillProbe?.run()
+            return
+        }
+        if SelfTest.mode == .store {
+            storeProbe = StoreRemovalProbe()
+            storeProbe?.run()
             return
         }
 
@@ -126,6 +132,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         unreadPoller.refresh(accountId: id)
     }
 
+    /// The user has just brought this tab up. A webview the crash throttle
+    /// stopped reloading gets another go now that someone is looking at it —
+    /// the throttle exists to stop a reload loop, not to retire the tab for the
+    /// rest of the session.
+    func tabBecameVisible(accountId: UUID, view: AccountView) {
+        guard let webView = sessions[accountId]?.webView(for: view) else { return }
+        navigationPolicy.recoverIfStalled(webView)
+    }
+
     func requestRemoveAccount(id: UUID) {
         guard let account = accountStore.account(id: id) else { return }
 
@@ -139,17 +154,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         // Ordering matters twice over. `forget` goes first so a poll still in
         // flight cannot write a stale count back after the account is gone. And
-        // WebKit refuses to delete a data store that is still in use, so every
-        // webview on it — the account's popup windows included — is torn down
-        // before `destroyDataStore`.
+        // WebKit refuses to delete a data store anything still references, so
+        // every webview on it — the account's popup windows included — has to
+        // be gone before `destroyDataStore`.
         unreadPoller.forget(accountId: id)
         navigationPolicy.closePopups(for: id)
-        let session = sessions.removeValue(forKey: id)
-        session?.detach()
+        // Scoped on purpose: detaching is not enough, the session object itself
+        // has to die, because its configuration holds the data store for its
+        // whole lifetime. Measured — with the session still in scope every
+        // removal attempt failed with "Data store is in use", however long it
+        // waited, and the dialog above had already promised the opposite.
+        if let session = sessions.removeValue(forKey: id) {
+            session.detach()
+        }
         accountStore.remove(id: id)
         KeychainStore.shared.deletePassword(for: account.email)
         windowController?.refresh()
-        WebViewFactory.destroyDataStore(for: id)
+
+        let name = account.name
+        WebViewFactory.destroyDataStore(for: id) { error in
+            guard let error else { return }
+            Self.reportDataStoreRemovalFailure(name: name, error: error)
+        }
+    }
+
+    /// The removal dialog promises the Google session is deleted from this Mac.
+    /// When it is not, the user has to hear about it — a stderr line is not an
+    /// answer to a promise made in a modal.
+    private static func reportDataStoreRemovalFailure(name: String, error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "“\(name)” was removed, but its Google session is still on this Mac"
+        alert.informativeText =
+            "macOS would not delete the stored session: \(error.localizedDescription). "
+            + "Quitting MailSpace releases it; nothing in the app can reach that account any more."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - SessionLocating
@@ -189,6 +229,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         windowController?.selectView(.calendar)
     }
 
+    /// ⌘R. Also the way out of a tab the crash throttle has given up on, which
+    /// is why it clears the crash record rather than only reloading.
+    @objc func reloadCurrentTab(_ sender: Any?) {
+        guard
+            let selection = windowController?.selection,
+            let webView = sessions[selection.accountId]?.webView(for: selection.view)
+        else { return }
+
+        navigationPolicy.clearCrashThrottle(for: webView)
+        if webView.url == nil {
+            webView.load(URLRequest(url: selection.view.url))
+        } else {
+            webView.reload()
+        }
+    }
+
     // MARK: - NotificationRouting
 
     func focusAccount(_ accountId: UUID, view: AccountView) {
@@ -215,14 +271,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         }
     }
 
+    /// Which account composes a `mailto:` — the selected one while it has Mail
+    /// switched on, otherwise the first account that does.
+    ///
+    /// `selected ?? firstMailEnabled` does not work: `??` short-circuits on any
+    /// non-nil selection, and `reconciledSelection` installs one whenever there
+    /// is an account at all. So the fallback was dead code, and a `mailto:`
+    /// arriving while a Calendar-only account was selected was dropped on the
+    /// floor — the app just came to the front.
+    static func mailtoAccount(selected: UUID?, accounts: [Account]) -> UUID? {
+        if
+            let selected,
+            let account = accounts.first(where: { $0.id == selected }),
+            account.mailEnabled
+        {
+            return selected
+        }
+        return accounts.first(where: { $0.mailEnabled })?.id
+    }
+
     private func openMailto(_ url: URL) {
         guard let controller = windowController else { return }
 
-        // With no accounts there is nowhere to compose — show the first-run
-        // prompt instead of failing silently.
+        // With no Mail-enabled account there is nowhere to compose — show the
+        // first-run prompt instead of failing silently.
         guard
-            let accountId = controller.selection?.accountId ?? accountStore.accounts.first(where: { $0.mailEnabled })?.id,
-            let account = accountStore.account(id: accountId), account.mailEnabled,
+            let accountId = Self.mailtoAccount(
+                selected: controller.selection?.accountId,
+                accounts: accountStore.accounts
+            ),
             let webView = sessions[accountId]?.webView(for: .mail),
             let compose = Self.composeURL(for: url)
         else {
@@ -265,7 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
             account: account,
             userScripts: [NotificationShim.userScript, LoginAutofill.userScript],
             messageHandlers: [NotificationShim.handlerName: notificationBridge],
-            replyHandlers: [LoginAutofill.handlerName: loginAutofill]
+            replyHandlers: [loginAutofill.registration]
         )
         session.setDelegates(navigationPolicy)
         session.loadIfNeeded()
@@ -356,6 +433,10 @@ enum MainMenu {
         mail.keyEquivalentModifierMask = [.command, .shift]
         let calendar = menu.addItem(withTitle: "Calendar", action: #selector(AppDelegate.showCalendarView(_:)), keyEquivalent: "k")
         calendar.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(.separator())
+        // The visible way back from a tab the crash throttle gave up on, and
+        // the only one when that tab is the only tab there is to select.
+        menu.addItem(withTitle: "Reload Tab", action: #selector(AppDelegate.reloadCurrentTab(_:)), keyEquivalent: "r")
         return submenuItem(menu)
     }
 

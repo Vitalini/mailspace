@@ -8,15 +8,69 @@ import WebKit
 /// password fields. It never presses Next — the user submits, so 2FA and any
 /// challenge screen stay entirely manual.
 ///
-/// The script is a no-op on every host except `accounts.google.com`, so the
-/// password is never handed to Gmail's or Calendar's page context.
+/// Two things keep the password off every page that is not Google's sign-in,
+/// and the page-side hostname check is neither of them — it runs in the page,
+/// so it protects nothing a hostile script cannot skip:
+///
+/// - the handler is registered in a **dedicated content world**, so
+///   `window.webkit.messageHandlers.mailspaceAutofill` does not exist for any
+///   script the page itself runs;
+/// - the handler **checks the asking frame's own security origin** before it
+///   touches the Keychain, so even a script that did reach it gets nothing
+///   unless it is the top frame of `https://accounts.google.com`.
 final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
     static let handlerName = "mailspaceAutofill"
 
+    /// The isolated world the assist runs in.
+    ///
+    /// Isolated worlds share the document but not the JavaScript globals, so
+    /// the script can still read and fill Google's form while page scripts see
+    /// neither it nor the message handler registered alongside it. Registering
+    /// in `.page` — which is what this used to do — exposed the handler to
+    /// every frame of every page an account webview loads.
+    static let contentWorld = WKContentWorld.world(name: "MailSpaceAutofill")
+
     weak var locator: SessionLocating?
 
+    /// The registration, world included, so no caller can put the handler in
+    /// the page's world by accident.
+    var registration: ScriptReplyHandler {
+        ScriptReplyHandler(name: Self.handlerName, handler: self, contentWorld: Self.contentWorld)
+    }
+
     static var userScript: WKUserScript {
-        WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        // Main frame only: the handler answers no other frame anyway, so
+        // injecting into subframes would only widen the surface.
+        WKUserScript(
+            source: source,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: contentWorld
+        )
+    }
+
+    /// Whether a frame may be handed the account's Google password.
+    ///
+    /// Exact host, https, default port, top frame — nothing else. In
+    /// particular `lh3.googleusercontent.com` is allow-listed for in-app
+    /// navigation (`LinkRouter`), so "some Google-ish host" would not be a
+    /// meaningful bar. Pure so it can be tested without a live frame.
+    static func isTrustedOrigin(scheme: String, host: String, port: Int, isMainFrame: Bool) -> Bool {
+        guard isMainFrame else { return false }
+        guard scheme.lowercased() == "https" else { return false }
+        guard host.lowercased() == "accounts.google.com" else { return false }
+        // WebKit reports 0 for a scheme's own default port.
+        return port == 0 || port == 443
+    }
+
+    static func isTrustedOrigin(_ frame: WKFrameInfo) -> Bool {
+        let origin = frame.securityOrigin
+        return isTrustedOrigin(
+            scheme: origin.protocol,
+            host: origin.host,
+            port: origin.port,
+            isMainFrame: frame.isMainFrame
+        )
     }
 
     func userContentController(
@@ -26,11 +80,14 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
     ) {
         guard
             message.name == Self.handlerName,
+            Self.isTrustedOrigin(message.frameInfo),
             let webView = message.webView,
             let session = locator?.session(hosting: webView),
             let account = locator?.account(for: session.accountId),
             !account.email.isEmpty
         else {
+            // Nothing, and nothing logged either: the caller is not entitled to
+            // know whether an account or a stored password exists.
             replyHandler([String: String](), nil)
             return
         }
@@ -46,6 +103,8 @@ final class LoginAutofill: NSObject, WKScriptMessageHandlerWithReply {
     (function () {
       if (window.__mailspaceAutofill) { return; }
       window.__mailspaceAutofill = true;
+      // Belt to the native side's braces: the handler checks the frame's real
+      // security origin, so this only saves the pointless work elsewhere.
       if (location.hostname !== 'accounts.google.com') { return; }
 
       var EMAIL = '#identifierId, input[type=email]:not([disabled]), input[name="identifier"]:not([disabled])';

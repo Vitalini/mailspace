@@ -18,7 +18,13 @@ import WebKit
 ///
 /// `MAILSPACE_SELFTEST=autofill` loads the real Google sign-in page with the
 /// autofill script attached and a stub credential, then reads the identifier
-/// field back — proof that the fill lands on the page Google actually serves.
+/// field back — proof that the fill lands on the page Google actually serves,
+/// that only the top frame of `accounts.google.com` is answered, and that page
+/// scripts cannot see the handler at all.
+///
+/// `MAILSPACE_SELFTEST=store` builds a real `AccountSession`, uses its data
+/// store, then tears it down exactly the way account removal does and deletes
+/// the store — proof that "signed out and deleted from this Mac" is true.
 /// All modes are inert on a normal launch.
 enum SelfTest {
     enum Mode: String {
@@ -26,6 +32,7 @@ enum SelfTest {
         case login
         case shim
         case autofill
+        case store
     }
 
     static var mode: Mode? {
@@ -155,6 +162,12 @@ final class LoginProbe: NSObject, WKNavigationDelegate {
 final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private let webView: WKWebView
     private var delivered: [String] = []
+    /// Of those, the ones whose frame passed the real origin check. The shim's
+    /// handler has to live in the page world, so that check is the only thing
+    /// keeping a third-party frame from raising native banners — it is worth
+    /// proving against a real load rather than only in a unit test.
+    private var gated = 0
+    private var lastOrigin = ""
     private var finished = false
 
     private static let page = """
@@ -190,6 +203,10 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let payload = message.body as? [String: Any] else { return }
         delivered.append((payload["title"] as? String) ?? "")
+
+        let origin = message.frameInfo.securityOrigin
+        lastOrigin = "\(origin.protocol)://\(origin.host):\(origin.port)"
+        if NotificationOrigin.isTrusted(message.frameInfo, view: .mail) { gated += 1 }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -205,7 +222,13 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             let probe = (value as? String) ?? "{}"
             let titles = (self?.delivered ?? []).joined(separator: "|")
             let count = self?.delivered.count ?? 0
-            SelfTest.finish("shim result=\(count == 3 ? "ok" : "PARTIAL") delivered=\(count) titles=\(titles) probe=\(probe)")
+            let gated = self?.gated ?? 0
+            let origin = self?.lastOrigin ?? ""
+            let ok = count == 3 && gated == 3
+            SelfTest.finish(
+                "shim result=\(ok ? "ok" : "PARTIAL") delivered=\(count) trusted=\(gated) "
+                + "origin=\(origin) titles=\(titles) probe=\(probe)"
+            )
         }
     }
 }
@@ -218,6 +241,10 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
 
     private let webView: WKWebView
     private var finished = false
+    /// Whether the asking frame passed the real origin check. Reported so the
+    /// smoke run proves the gate against the page Google actually serves, not
+    /// just against a fixture.
+    private var trustedOrigin = false
 
     override init() {
         let configuration = SelfTest.makeProbeConfiguration()
@@ -225,7 +252,7 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
         webView = WebViewFactory.makeWebView(configuration: configuration)
         super.init()
         configuration.userContentController.addScriptMessageHandler(
-            self, contentWorld: .page, name: LoginAutofill.handlerName
+            self, contentWorld: LoginAutofill.contentWorld, name: LoginAutofill.handlerName
         )
         webView.navigationDelegate = self
     }
@@ -244,6 +271,12 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
         didReceive message: WKScriptMessage,
         replyHandler: @escaping (Any?, String?) -> Void
     ) {
+        // The same gate the real handler applies before it reads the Keychain.
+        guard LoginAutofill.isTrustedOrigin(message.frameInfo) else {
+            replyHandler([String: String](), nil)
+            return
+        }
+        trustedOrigin = true
         replyHandler(["email": Self.probeEmail], nil)
     }
 
@@ -263,20 +296,103 @@ final class AutofillProbe: NSObject, WKScriptMessageHandlerWithReply, WKNavigati
     }
 
     private func report() {
+        // Read the field back from the page's own world, and separately ask
+        // that world whether it can see the handler at all: it must not, or the
+        // isolation the fix relies on is not there.
         let js = """
         var field = document.querySelector('#identifierId, input[type=email], input[name="identifier"]');
         return {
           fieldFound: !!field,
           value: field ? field.value : '',
-          filled: window.__mailspaceFilled || null
+          handlerVisibleToPage: !!(window.webkit
+            && window.webkit.messageHandlers
+            && window.webkit.messageHandlers.mailspaceAutofill)
         };
         """
-        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { result in
+        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { [trustedOrigin] result in
             let dict = (try? result.get()) as? [String: Any] ?? [:]
             let value = (dict["value"] as? String) ?? ""
             let found = (dict["fieldFound"] as? Bool) ?? false
-            let ok = value == Self.probeEmail
-            SelfTest.finish("autofill result=\(ok ? "ok" : "FAILED") fieldFound=\(found ? 1 : 0) value=\(value)")
+            let leaked = (dict["handlerVisibleToPage"] as? Bool) ?? true
+            let ok = value == Self.probeEmail && trustedOrigin && !leaked
+            SelfTest.finish(
+                "autofill result=\(ok ? "ok" : "FAILED") fieldFound=\(found ? 1 : 0) "
+                + "gated=\(trustedOrigin ? 1 : 0) pageCanReachHandler=\(leaked ? 1 : 0) value=\(value)"
+            )
+        }
+    }
+}
+
+
+/// Proves an account's browser session really can be deleted from disk.
+///
+/// A probe rather than a unit test because the whole failure lives in WebKit's
+/// process model, and it was invisible: `WKWebsiteDataStore.remove` refuses
+/// while anything still references the store, and the refusal only reached a
+/// stderr line — so the removal dialog's promise that the Google session is
+/// "deleted from this Mac" was false while the cookies stayed put.
+///
+/// Runs the real `AccountSession` through the real teardown and then the real
+/// `destroyDataStore`. Needs no network: a local page on a Gmail origin puts
+/// the store in use just as effectively as Gmail itself does.
+final class StoreRemovalProbe: NSObject, WKNavigationDelegate {
+    private static let page = """
+    <!DOCTYPE html><html><body>probe<script>
+      try { localStorage.setItem('mailspace', 'probe'); } catch (e) {}
+      document.cookie = 'mailspace=probe';
+    </script></body></html>
+    """
+
+    private let account = Account(name: "MailSpace store probe")
+    private var session: AccountSession?
+    private var settled = false
+
+    func run(timeout: TimeInterval = 40) {
+        let session = AccountSession(account: account)
+        self.session = session
+
+        guard let webView = session.webView(for: .mail) else {
+            SelfTest.finish("store result=FAILED reason=no-webview")
+        }
+        SelfTest.presentOffscreen(webView)
+        webView.navigationDelegate = self
+        webView.loadHTMLString(Self.page, baseURL: URL(string: "https://mail.google.com/")!)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, !self.settled else { return }
+            SelfTest.finish("store result=timeout")
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { settle() }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        settle()
+    }
+
+    private func settle() {
+        guard !settled else { return }
+        settled = true
+        // Let the page's storage writes land before anything is torn down.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.removeStore()
+        }
+    }
+
+    private func removeStore() {
+        let identifier = account.id
+        // The same shape as `AppDelegate.requestRemoveAccount`: detach, then let
+        // the session itself go. Its configuration holds the data store for its
+        // whole lifetime, so detaching alone leaves the store in use and every
+        // removal attempt fails however long it waits.
+        session?.detach()
+        session = nil
+
+        WebViewFactory.destroyDataStore(for: identifier) { error in
+            guard let error else {
+                SelfTest.finish("store result=ok removed=1")
+            }
+            SelfTest.finish("store result=FAILED error=\(error.localizedDescription)")
         }
     }
 }

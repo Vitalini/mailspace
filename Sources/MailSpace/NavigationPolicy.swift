@@ -17,10 +17,15 @@ enum LinkRouter {
     /// Gmail routes outbound clicks through `https://www.google.com/url?q=…`.
     /// Unwrap it so the real destination decides in-app versus external —
     /// otherwise every external link would look like a Google link.
+    ///
+    /// The host test is `isGoogleDomain`, not a bare `hasSuffix`: without the
+    /// dot boundary `notgoogle.com/url?q=…` unwrapped too, and since the
+    /// webview then navigates to the *original* URL rather than the unwrapped
+    /// one, a look-alike domain got to load inside the account's session.
     static func unwrapRedirect(_ url: URL) -> URL {
         guard
             let host = url.host?.lowercased(),
-            host.hasSuffix("google.com") || host.hasSuffix("googlemail.com"),
+            isGoogleDomain(host) || matches(host: host, domain: "googlemail.com"),
             url.path == "/url",
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
             let target = items.first(where: { $0.name == "q" || $0.name == "url" })?.value,
@@ -58,12 +63,42 @@ enum LinkRouter {
         return isInApp(url) ? .allowInApp : .openExternally(url)
     }
 
+    /// The same decision, told which frame the navigation would take over and
+    /// whether the webview is part-way through a Google sign-in.
+    ///
+    /// Navigation *type* is deliberately not part of this. Gating the external
+    /// hand-off on `.linkActivated` meant a `302`, a `window.location =` or a
+    /// form POST put an arbitrary site inside the account's cookie jar, with
+    /// MailSpace's injected scripts attached — `google.com/url?q=…` followed as
+    /// `.other`, redirected, and the redirect was `.other` again.
+    ///
+    /// - `isMainFrameTarget`: false only for a subframe load. Gmail and
+    ///   Calendar embed foreign content — ads, maps, tracked images — and
+    ///   sending those to the browser would open a window per embed. A
+    ///   subframe cannot navigate the page the user is looking at, so it stays.
+    /// - `isAuthenticating`: the webview has committed a sign-in page and has
+    ///   not landed on an app surface yet. A Workspace account is redirected to
+    ///   its own identity provider on a host MailSpace has never heard of;
+    ///   handing that to the browser would leave the sign-in unfinishable,
+    ///   because the browser has no access to this account's data store.
+    static func destination(for requested: URL, isMainFrameTarget: Bool, isAuthenticating: Bool) -> Destination {
+        let decision = destination(for: requested)
+        guard case .openExternally = decision else { return decision }
+        return isMainFrameTarget && !isAuthenticating ? decision : .allowInApp
+    }
+
     static func isInApp(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
         guard let host = url.host?.lowercased() else { return false }
 
-        if inAppHosts.contains(where: { host == $0 || host.hasSuffix(".\($0)") }) { return true }
+        if inAppHosts.contains(where: { matches(host: host, domain: $0) }) { return true }
         return isGoogleDomain(host)
+    }
+
+    /// `host` is `domain` itself or a subdomain of it. The dot matters:
+    /// `notgoogle.com` is not `google.com`.
+    static func matches(host: String, domain: String) -> Bool {
+        host == domain || host.hasSuffix(".\(domain)")
     }
 
     /// True for `google.com` and its country variants (`google.co.uk`,
@@ -79,10 +114,28 @@ enum LinkRouter {
         return tld.allSatisfy { $0.isLetter || $0 == "." }
     }
 
+    /// Reduces a server-supplied download name to something that can only land
+    /// inside the download directory.
+    ///
+    /// `suggestedFilename` comes from the `Content-Disposition` header, so it
+    /// is whatever the server said. `../../Library/LaunchAgents/x.plist`
+    /// resolved straight out of `~/Downloads` — and the collision loop never
+    /// fired to catch it, because the escaped path was a new one.
+    static func safeFilename(_ suggested: String) -> String {
+        let last = (suggested as NSString).lastPathComponent
+        let trimmed = last.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !trimmed.isEmpty,
+            !trimmed.contains("/"),           // `lastPathComponent` of "/" is "/"
+            !trimmed.allSatisfy({ $0 == "." }) // ".", "..", "…"
+        else { return "download" }
+        return trimmed
+    }
+
     /// Picks a non-colliding destination in `directory`, appending " (2)",
     /// " (3)" … the way Safari does.
     static func uniqueDestination(in directory: URL, filename: String) -> URL {
-        let name = filename.isEmpty ? "download" : filename
+        let name = safeFilename(filename)
         var candidate = directory.appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
 
@@ -123,9 +176,14 @@ enum AuthSurface {
     }
 
     /// Auth hosts that are not `accounts.google.<tld>`: the YouTube sign-in
-    /// bridge, the device/passkey challenge helper, and the short sign-in host.
+    /// bridge, the device/passkey challenge helper, the short sign-in host, and
+    /// the "Before you continue" consent screen, which renders in the middle of
+    /// the chain for EU users. That last one matters for `provenance` — a page
+    /// that actually renders mid-chain and is not listed here would be read as
+    /// the chain ending.
     private static let signInHosts: Set<String> = [
         "accounts.youtube.com",
+        "consent.google.com",
         "gds.google.com",
         "signin.google.com"
     ]
@@ -143,9 +201,18 @@ enum AuthSurface {
             let host = url.host?.lowercased()
         else { return .other }
 
-        if isSignInHost(host) { return .signIn }
+        let segments = url.path.split(separator: "/").map { $0.lowercased() }
 
-        let segments = url.path.split(separator: "/").map(String.init)
+        if isSignInHost(host) {
+            // Creating a *brand new* Google account is not this tab's sign-in
+            // finishing: there is no session the tab is waiting on, and the
+            // identity that comes out of it is not the one the account record,
+            // its name and its Keychain item describe. So it is an ordinary
+            // page — it gets its own window rather than taking over the tab of
+            // an account that already exists.
+            return segments.contains("signup") ? .other : .signIn
+        }
+
         switch host {
         case "mail.google.com", "mail.googlemail.com":
             return isAppPath(segments, root: "mail") ? .app(.mail) : .other
@@ -153,6 +220,48 @@ enum AuthSurface {
             return isAppPath(segments, root: "calendar") ? .app(.calendar) : .other
         default:
             return .other
+        }
+    }
+
+    /// What a webview should remember about its sign-in after committing a page.
+    enum Provenance: Equatable {
+        /// A sign-in step: this webview is authenticating.
+        case record
+        /// The chain ended somewhere that is neither a sign-in step nor an app
+        /// surface. Forget it — otherwise a much later, unrelated arrival on an
+        /// app surface reads as a sign-in that has just finished and yanks the
+        /// account's other tabs onto their home surfaces.
+        case clear
+        /// Says nothing either way; whatever is recorded stands.
+        case keep
+    }
+
+    /// Only a *Google* page that is neither a sign-in step nor an app surface
+    /// ends the chain — the marketing page a signed-out tab bounces to, a Drive
+    /// preview, `myaccount.google.com`.
+    ///
+    /// A foreign host is left alone on purpose: a Workspace account signs in
+    /// through its own identity provider on a host MailSpace cannot recognise,
+    /// and clearing there would strand the very tabs the sign-in exists to
+    /// bring back. Nothing else reaches a foreign host in an account webview's
+    /// main frame — `NavigationPolicy` hands those to the browser unless this
+    /// same flag is already set.
+    ///
+    /// The trade this makes: if Google ever routes the chain through a Google
+    /// host that is not an auth host, completion is missed and the user is back
+    /// to closing the popup by hand. That is recoverable; a flag that never
+    /// clears silently reloads tabs out from under them.
+    static func provenance(for url: URL?) -> Provenance {
+        switch classify(url) {
+        case .signIn:
+            return .record
+        case .app:
+            // `didFinish` is what consumes the flag here; clearing on commit
+            // would take it one callback too early.
+            return .keep
+        case .other:
+            guard let url else { return .keep }
+            return LinkRouter.isInApp(url) ? .clear : .keep
         }
     }
 
@@ -264,7 +373,7 @@ struct CrashThrottle {
 /// - Google popups (sign-in, print) open as in-app child windows on the same
 ///   session, using the exact configuration WebKit hands over (KTD7)
 /// - downloads land in `~/Downloads` (R13)
-final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
+final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate, WebViewDiscarding {
     /// Handles a `mailto:` link clicked inside a webview.
     var mailtoHandler: ((URL) -> Void)?
 
@@ -286,6 +395,10 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// surface only means "signed in" for these — Gmail's own print and
     /// compose popups land on the very same URLs.
     private var sawSignIn = WeakObjectSet<WKWebView>()
+    /// Webviews the crash throttle has stopped reloading. Held so the tab has a
+    /// way back: without one, three terminations left it blank until the app
+    /// was restarted.
+    private var stalled = WeakObjectSet<WKWebView>()
 
     private static var downloadsDirectory: URL {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -309,7 +422,15 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             return
         }
 
-        switch LinkRouter.destination(for: requested) {
+        let decision = LinkRouter.destination(
+            for: requested,
+            // A `nil` target frame is a new window, which is as much "a whole
+            // page the user will look at" as the main frame is.
+            isMainFrameTarget: navigationAction.targetFrame?.isMainFrame ?? true,
+            isAuthenticating: sawSignIn.contains(webView)
+        )
+
+        switch decision {
         case .allowInApp:
             decisionHandler(.allow)
 
@@ -320,12 +441,6 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             decisionHandler(.cancel)
 
         case .openExternally(let url):
-            // Only user-initiated navigation leaves the app: a redirect or a
-            // subframe load inside Gmail must not be hijacked.
-            guard navigationAction.navigationType == .linkActivated else {
-                decisionHandler(.allow)
-                return
-            }
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
         }
@@ -347,12 +462,17 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         download.delegate = self
     }
 
-    /// Remembers that this webview is inside the sign-in chain. Provenance is
-    /// what separates a real sign-in from Gmail's print and compose popups,
-    /// which finish on the same `mail.google.com/mail/u/0/…` URLs.
+    /// Keeps the webview's sign-in provenance in step with what it just landed
+    /// on. Provenance is what separates a real sign-in from Gmail's print and
+    /// compose popups, which finish on the same `mail.google.com/mail/u/0/…`
+    /// URLs — and clearing it is what stops a tab that merely passed through
+    /// `accounts.google.com` from claiming a sign-in hours later.
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        guard AuthSurface.classify(webView.url) == .signIn else { return }
-        sawSignIn.insert(webView)
+        switch AuthSurface.provenance(for: webView.url) {
+        case .record: sawSignIn.insert(webView)
+        case .clear: sawSignIn.remove(webView)
+        case .keep: break
+        }
     }
 
     /// Sign-in is finished the moment a webview that was authenticating settles
@@ -362,8 +482,19 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// navigation there is itself the proof the session took.
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard case .app = AuthSurface.classify(webView.url) else { return }
-        // One shot: the account is reconciled once per sign-in, not once per
-        // page load afterwards.
+        completeSignIn(for: webView)
+    }
+
+    /// Ends the sign-in this webview was running — once, whichever way it ends.
+    ///
+    /// Two endings reach here. The webview settles on an app surface
+    /// (`didFinish`), or Google closes its own popup once auth is done, the
+    /// `window.opener` pattern OAuth flows use (`webViewDidClose`). Only the
+    /// first was handled, so a popup Google closed itself vanished tidily while
+    /// the owning tab sat on the signed-out page — the original bug, minus the
+    /// stray window. `sawSignIn.remove` reports membership exactly once, so
+    /// whichever ending arrives first wins and the other is a no-op.
+    private func completeSignIn(for webView: WKWebView) {
         guard sawSignIn.remove(webView) else { return }
         let accountId = webView.configuration.websiteDataStore.identifier
 
@@ -385,11 +516,45 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         guard crashThrottle.shouldReload(ObjectIdentifier(webView)) else {
             Log.error(
                 "web content process kept terminating for \(webView.url?.absoluteString ?? "an unloaded page")"
-                + "; not reloading again"
+                + "; not reloading again until the tab is selected or reloaded by hand"
             )
+            // Remembered rather than abandoned: the throttle exists to stop a
+            // reload loop, not to retire the tab for the rest of the session.
+            stalled.insert(webView)
             return
         }
         webView.reload()
+    }
+
+    /// Gives a webview the throttle gave up on another chance, and says whether
+    /// there was anything to recover. Driven by the user bringing the tab up,
+    /// so the retry rate is bounded by them rather than by the crashing page.
+    @discardableResult
+    func recoverIfStalled(_ webView: WKWebView) -> Bool {
+        guard stalled.remove(webView) else { return false }
+        crashThrottle.forget(ObjectIdentifier(webView))
+        webView.reload()
+        return true
+    }
+
+    /// Wipes the crash record for a webview the user has explicitly reloaded,
+    /// so a deliberate retry always starts from a full burst.
+    func clearCrashThrottle(for webView: WKWebView) {
+        crashThrottle.forget(ObjectIdentifier(webView))
+        stalled.remove(webView)
+    }
+
+    // MARK: - WebViewDiscarding
+
+    /// The throttle and the provenance set are keyed by object identity, and
+    /// the allocator reuses addresses: a webview dropped by
+    /// `AccountSession.syncEnabledViews` (Mail switched off, then on again)
+    /// would otherwise hand its exhausted crash budget to the fresh webview
+    /// that lands at the same address.
+    func webViewWasDiscarded(_ webView: WKWebView) {
+        crashThrottle.forget(ObjectIdentifier(webView))
+        stalled.remove(webView)
+        sawSignIn.remove(webView)
     }
 
     // MARK: - WKUIDelegate
@@ -431,6 +596,10 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     }
 
     func webViewDidClose(_ webView: WKWebView) {
+        // Google closing its own sign-in popup is the auth finishing just as
+        // much as landing on the inbox is; the owning tab has to be told either
+        // way. One-shot, so this cannot double up with the `didFinish` path.
+        completeSignIn(for: webView)
         closePopup(hosting: webView)
     }
 
@@ -536,15 +705,12 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     func closePopups(for accountId: UUID) {
         for (key, popup) in popupWindows where popup.accountId == accountId {
             popupWindows[key] = nil
-            crashThrottle.forget(key)
             dismiss(popup.window)
         }
     }
 
     private func closePopup(hosting webView: WKWebView) {
-        let key = ObjectIdentifier(webView)
-        guard let popup = popupWindows.removeValue(forKey: key) else { return }
-        crashThrottle.forget(key)
+        guard let popup = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
         dismiss(popup.window)
     }
 
@@ -560,7 +726,9 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             popup.stopLoading()
             popup.navigationDelegate = nil
             popup.uiDelegate = nil
-            sawSignIn.remove(popup)
+            // The single place every per-webview record is forgotten, so no
+            // popup teardown path can leave one behind.
+            webViewWasDiscarded(popup)
         }
         window.contentView = nil
     }
@@ -572,7 +740,6 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         guard let window = notification.object as? NSWindow else { return }
         for (key, popup) in popupWindows where popup.window === window {
             popupWindows[key] = nil
-            crashThrottle.forget(key)
         }
         detachContent(of: window)
     }

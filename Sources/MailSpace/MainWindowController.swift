@@ -8,6 +8,8 @@ protocol AccountHosting: AnyObject {
     func requestAddAccount()
     func requestEditAccount(id: UUID)
     func requestRemoveAccount(id: UUID)
+    /// This tab is now the visible one.
+    func tabBecameVisible(accountId: UUID, view: AccountView)
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -227,6 +229,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         // Hand focus straight to the page so Gmail's own shortcuts work
         // without an extra click (R15).
         window.makeFirstResponder(webView)
+        // Bringing a tab up is also the cue to revive one whose content process
+        // kept crashing; the user asking to see it is the bound on how often
+        // that is retried.
+        host.tabBecameVisible(accountId: selection.accountId, view: selection.view)
     }
 
     private func pin(_ view: NSView, in container: NSView) {
