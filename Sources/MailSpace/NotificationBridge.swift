@@ -200,9 +200,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // the user which account the notification came from.
         content.subtitle = account.name
         content.body = body
-        // B2: Gmail marks its own quiet notifications `silent`, and that flag
-        // used to be read off the options object and thrown away.
-        content.sound = silent ? nil : .default
+        content.sound = NotificationPolicy.sound(silent: silent)
         content.userInfo = [
             InfoKey.accountId: account.id.uuidString,
             InfoKey.view: view.rawValue

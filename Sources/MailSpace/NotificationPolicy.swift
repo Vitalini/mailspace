@@ -1,4 +1,4 @@
-import Foundation
+import UserNotifications
 
 /// Whether a web notification is allowed to become a native one, and how it is
 /// allowed to arrive.
@@ -15,6 +15,16 @@ enum NotificationPolicy {
         case .mail: return account.notifyMail
         case .calendar: return account.notifyCalendar
         }
+    }
+
+    /// B2. Gmail's own `silent` flag, which the shim used to read off the
+    /// options object and throw away.
+    ///
+    /// This is why there is no sound picker: the page already knows when it
+    /// does not want to make noise, and macOS's per-app notification settings
+    /// can override the rest.
+    static func sound(silent: Bool) -> UNNotificationSound? {
+        silent ? nil : .default
     }
 
     /// B1. No banner for the tab already on screen.

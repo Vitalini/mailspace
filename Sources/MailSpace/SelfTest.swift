@@ -848,6 +848,10 @@ final class SettingsProbe: NSObject, AccountHosting {
     /// What the pane asked the host to do, so "the checkbox re-totals the
     /// badge" is an assertion rather than a hope.
     private var badgeCalls: [Bool] = []
+    /// And which account command each button reached. The pane must call these
+    /// and never a parallel implementation, so "the button is wired to
+    /// `AccountHosting`" is worth asserting rather than reading.
+    private var hostCalls: [String] = []
 
     /// Its own directory under the temporary folder: a probe never writes the
     /// account list of the app the user runs.
@@ -862,9 +866,13 @@ final class SettingsProbe: NSObject, AccountHosting {
 
     var accountStore: AccountStore { store }
     func session(for accountId: UUID) -> AccountSession? { nil }
-    func requestAddAccount() {}
-    func requestEditAccount(id: UUID) {}
-    func requestRemoveAccount(id: UUID, presentedOn: NSWindow?) {}
+    func requestAddAccount() { hostCalls.append("add") }
+    func requestEditAccount(id: UUID) { hostCalls.append("edit:\(id.uuidString)") }
+    /// Records the ask and stops there: no dialog, no teardown. What is under
+    /// test here is that the pane's − reaches this function at all.
+    func requestRemoveAccount(id: UUID, presentedOn: NSWindow?) {
+        hostCalls.append("remove:\(id.uuidString)")
+    }
     func tabBecameVisible(accountId: UUID, view: AccountView) {}
     func badgeInputsChanged(repoll: Bool) { badgeCalls.append(repoll) }
 
@@ -1020,6 +1028,28 @@ final class SettingsProbe: NSObject, AccountHosting {
             }
             box.state = .on
             Self.click(box)
+        }
+
+        // A1 — the three commands, every one of them through `AccountHosting`.
+        // A parallel implementation in the pane would leave these empty.
+        if let table: NSTableView = Self.control(in: accountsView, where: { _ in true }) {
+            table.selectRowIndexes([0], byExtendingSelection: false)
+        }
+        for (label, expected) in [
+            ("Add Account", "add"),
+            ("Edit Account…", "edit:\(account.id.uuidString)"),
+            ("Remove Account", "remove:\(account.id.uuidString)")
+        ] {
+            guard let button: NSButton = Self.control(
+                in: accountsView,
+                where: { $0.accessibilityLabel() == label || $0.title == label }
+            ) else {
+                failures.append("button-\(expected)-missing")
+                continue
+            }
+            hostCalls = []
+            Self.click(button)
+            expect(hostCalls == [expected], "button-\(expected)")
         }
 
         // A5

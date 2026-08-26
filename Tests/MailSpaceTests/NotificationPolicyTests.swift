@@ -52,6 +52,19 @@ final class NotificationPolicyTests: XCTestCase {
         XCTAssertFalse(NotificationPolicy.shouldPost(account: calendarOnly, view: .mail))
     }
 
+    // MARK: - B2
+
+    func testGmailsSilentFlagSilencesTheNotification() {
+        XCTAssertNil(NotificationPolicy.sound(silent: true))
+        XCTAssertNotNil(NotificationPolicy.sound(silent: false))
+    }
+
+    /// The shim has to send the flag at all — it used to read `options.silent`
+    /// onto its own object and then post without it.
+    func testTheShimForwardsTheSilentFlag() {
+        XCTAssertTrue(NotificationShim.userScript.source.contains("silent: !!options.silent"))
+    }
+
     // MARK: - B1
 
     func testTheTabOnScreenGetsNoBanner() {
