@@ -86,6 +86,7 @@ final class RecoveryProbe: NSObject, TabRecyclerHost, WKNavigationDelegate {
     private var notes: [String] = []
     private var stallSignals = 0
     private var markedStalled = 0
+    private var clearedStalled = 0
     private var finished = false
 
     override init() {
@@ -139,6 +140,11 @@ final class RecoveryProbe: NSObject, TabRecyclerHost, WKNavigationDelegate {
     }
 
     func markRecycleStalled(_ webView: WKWebView, target url: URL) { markedStalled += 1 }
+
+    /// Counted, not just accepted: the probe reports whether the token the
+    /// stall put on the tab was actually taken off again by the rescue, which
+    /// is the state leak `p3` now checks for.
+    func clearRecycleStall(_ webView: WKWebView) { clearedStalled += 1 }
 
     func recycleStallsChanged() { stallSignals += 1 }
 
@@ -218,12 +224,18 @@ final class RecoveryProbe: NSObject, TabRecyclerHost, WKNavigationDelegate {
         let served = link.servedLoads
         let stillDead = recycler.hasFailedLoad(webView)
         let flagged = recycler.stalledAccounts.contains(accountId)
+        // The state leak this probe used to walk straight past: the pill and
+        // the `!` came down while the tab kept its stall token, which made it
+        // unrecyclable for the rest of the session and earned it one
+        // unexplained full reload the next time the user looked at it.
+        let tokenReturned = clearedStalled > 0
         notes.append("p3_pageServed=\(served)")
         notes.append("p3_cameBackByItself=\(!stillDead && served > 0 ? 1 : 0)")
         notes.append("p3_warningCleared=\(flagged ? 0 : 1)")
+        notes.append("p3_stallTokenCleared=\(tokenReturned ? 1 : 0)")
         notes.append("p3_url=\(webView.url?.absoluteString ?? "none")")
 
-        let recovered = !stillDead && served > 0 && !flagged
+        let recovered = !stillDead && served > 0 && !flagged && tokenReturned
         let wasDead = notes.contains("p2_tabIsDead=1")
         let wasQuietWhileOffline = notes.contains("p1_recycled=1")
         let result = (recovered && wasDead && wasQuietWhileOffline) ? "ok" : "FAILED"

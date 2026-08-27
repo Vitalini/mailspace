@@ -553,8 +553,17 @@ final class LinkRouterTests: XCTestCase {
         }
     }
 
-    /// The address is the user's. It goes to Google or nowhere — a look-alike
-    /// host must never be handed it.
+    /// The address is the user's. It goes to a Google *product* or nowhere.
+    ///
+    /// "A Google host" was the wrong test and is not the one any more.
+    /// `isGoogleProperty` is host-shape only, so every `*.google.com` name
+    /// passed it — including the ones that serve third-party code.
+    /// `script.google.com` is the concrete case: anybody can deploy an Apps
+    /// Script web app that anyone can access, mail or calendar-invite the
+    /// link, and read `e.parameter.authuser` server-side in `doGet`. Clicking
+    /// it told the attacker exactly which MailSpace account opened his link —
+    /// a fact the click would not otherwise have carried.
+    /// `sites.google.com` is the same shape through an embedded gadget.
     func testTheAddressNeverTravelsToANonGoogleHost() {
         for candidate in [
             "https://example.com/article",
@@ -562,12 +571,39 @@ final class LinkRouterTests: XCTestCase {
             "https://notgoogle.com/",
             "https://google.ev.io/document",
             "https://docs.google.com@evil.example/document",
-            "https://www.youtube.com/watch?v=abc"
+            "https://www.youtube.com/watch?v=abc",
+            // Google hosts that serve somebody else's code.
+            "https://script.google.com/macros/s/AKfycb/exec",
+            "https://sites.google.com/view/someones-page",
+            "https://script.googleusercontent.com/macros/echo"
         ] {
             XCTAssertEqual(
                 LinkRouter.forBrowser(url(candidate), accountEmail: "me@example.com"),
                 url(candidate),
                 "must not carry the address: \(candidate)"
+            )
+        }
+    }
+
+    /// And the products it is actually for still get it — the allowlist is a
+    /// tightening, not a removal.
+    func testTheProductHostsStillCarryTheAddress() {
+        for candidate in [
+            "https://docs.google.com/document/d/1a2b/edit",
+            "https://drive.google.com/drive/my-drive",
+            "https://meet.google.com/abc-defg-hij",
+            "https://calendar.google.com/calendar/r/eventedit",
+            "https://groups.google.com/g/some-group",
+            "https://keep.google.com/",
+            "https://photos.google.com/",
+            "https://chat.google.com/",
+            "https://contacts.google.com/",
+            "https://tasks.google.com/"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.forBrowser(url(candidate), accountEmail: "me@example.com").query,
+                "authuser=me@example.com",
+                "must resolve to the right identity: \(candidate)"
             )
         }
     }

@@ -180,8 +180,9 @@ enum LinkRouter {
     /// `authuser=<address>` asks Google for the right one by name.
     ///
     /// Narrow on purpose:
-    /// - only a Google host, because the address is the user's and has no
-    ///   business travelling to anyone else's server;
+    /// - only a first-party Google *product* host, from `authuserHosts`,
+    ///   because the address is the user's and has no business travelling to
+    ///   anyone else's server;
     /// - only when the link does not already name an account, so Google's own
     ///   `authuser=` and `/u/N/` always win;
     /// - the address, never the `/u/N` index, because every MailSpace account
@@ -191,7 +192,7 @@ enum LinkRouter {
     static func forBrowser(_ url: URL, accountEmail: String?) -> URL {
         guard
             let email = accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines), !email.isEmpty,
-            isGoogleProperty(url),
+            takesAuthuser(url),
             !namesAnAccount(url),
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         else { return url }
@@ -204,6 +205,46 @@ enum LinkRouter {
         components.percentEncodedQueryItems =
             (components.percentEncodedQueryItems ?? []) + [URLQueryItem(name: "authuser", value: encoded)]
         return components.url ?? url
+    }
+
+    /// The Google product hosts the account address may be attached to.
+    ///
+    /// An allowlist rather than `isGoogleProperty`, which is host-*shape* only
+    /// — every `*.google.com` name passes it, and several of those serve
+    /// third-party-authored code that can read the query string. The concrete
+    /// one is `script.google.com`: anybody can deploy an Apps Script web app
+    /// that anyone can access, mail or calendar-invite the link, and read
+    /// `e.parameter.authuser` server-side in `doGet`. `sites.google.com` is the
+    /// same shape through an embedded gadget reading `location.search`. Neither
+    /// is in `inAppHosts` and neither classifies as `.app`, so both were
+    /// handed to the browser with the owner's address appended — disclosing
+    /// which MailSpace account opened the link, to a party who otherwise learns
+    /// nothing from the click, and contradicting the invariant this function's
+    /// own comment states.
+    ///
+    /// Only the products a signed-in Google identity actually resolves matter
+    /// here; a host that is not on the list simply goes to the browser
+    /// unchanged, which is what happened before the tagging existed at all.
+    private static let authuserHosts = [
+        "calendar.google.com",
+        "chat.google.com",
+        "contacts.google.com",
+        "docs.google.com",
+        "drive.google.com",
+        "groups.google.com",
+        "keep.google.com",
+        "mail.google.com",
+        "mail.googlemail.com",
+        "meet.google.com",
+        "photos.google.com",
+        "tasks.google.com",
+        "www.google.com"
+    ]
+
+    /// Whether this link may carry the account address to the browser.
+    static func takesAuthuser(_ url: URL) -> Bool {
+        guard let host = webHost(of: url) else { return false }
+        return authuserHosts.contains(host)
     }
 
     /// Whether the link already says which Google account it is for: `authuser`
@@ -1047,6 +1088,20 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// pressing ⌘R then brings it back exactly as it does for a crash.
     func markStalled(_ webView: WKWebView) {
         stalled.insert(webView)
+    }
+
+    /// Takes a webview back off the stall list without reloading it.
+    ///
+    /// The counterpart to `markStalled`, for a tab that has already come back
+    /// on its own — the recycler's automatic rescue when the network returns,
+    /// and any commit on a webview it had given up on. `recoverIfStalled`
+    /// removes the token *and* re-navigates, which is the wrong pair of things
+    /// to do to a page that is already loaded: it would throw away the scroll
+    /// position and whatever was typed since. Leaving the token on instead is
+    /// what used to make a healed tab unrecyclable and then reload it the next
+    /// time the user looked at it.
+    func clearStalled(_ webView: WKWebView) {
+        stalled.remove(webView)
     }
 
     /// Whether any popup window is open on this account's data store — a

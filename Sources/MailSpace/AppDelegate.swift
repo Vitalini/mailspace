@@ -63,9 +63,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// up says a request can leave this Mac; only this says one arrives.
     private var lastReachedGoogleAt: Date?
     private let pathMonitor = NWPathMonitor()
-    /// Accounts the recycler reports as having a dead Mail tab, and the ones
-    /// already notified about, so the banner is one per episode.
-    private var notifiedStalls: Set<UUID> = []
+    /// The tabs the recycler reports as dead that have already been notified
+    /// about, so the banner is one per tab per episode. Per *tab*: a
+    /// per-account record let a Calendar failure claim the account's one slot
+    /// and silence a later Mail failure entirely.
+    private var notifiedStalls: Set<TabRef> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A self-test never runs as the app the user relies on. Its probes talk
@@ -401,10 +403,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         health.signedOutAccounts
     }
 
-    func stalledAccounts() -> Set<UUID> {
-        tabRecycler.stalledAccounts
-    }
-
     func stalledTabs() -> Set<TabRef> {
         tabRecycler.stalledTabs
     }
@@ -425,9 +423,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         RecycleDecision.reachability(
             pathIsSatisfied: networkIsUp,
             lastReachedGoogleAt: lastReachedGoogleAt,
-            probesAreRunning: accountStore.accounts.contains { $0.mailEnabled },
+            probes: probeActivity,
             now: Date()
         )
+    }
+
+    /// Whether the feed probe can actually run right now — which is not the
+    /// question "is Mail switched on", and reading it as that one is what held
+    /// the health monitor shut with the very condition it exists to report.
+    /// See `RecycleDecision.ProbeActivity`.
+    ///
+    /// Asked of the same provider the poller itself polls, and classified with
+    /// the same function, so the two can never disagree about which tabs are
+    /// issuing a fetch.
+    private var probeActivity: RecycleDecision.ProbeActivity {
+        var sawStranded = false
+        for target in unreadPoller.mailWebViews() {
+            switch UnreadPoller.reading(for: target.webView.url) {
+            case .poll:
+                // One tab issuing the fetch is enough: its verdict is the
+                // app-wide answer, and its silence is app-wide evidence.
+                return .polling
+            case .definiteZero:
+                // Google's own sign-in page. Nothing is being asked of Google
+                // from this tab and nothing ever will be until the user signs
+                // in, so this tab contributes no evidence either way — but it
+                // is not the portal shape either, so it must not veto.
+                continue
+            case .noAnswer:
+                sawStranded = true
+            }
+        }
+        return sawStranded ? .stranded : .idle
     }
 
     /// The feed probe got an answer out of Google — or did not.
@@ -486,20 +513,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     /// Shared with `AssumptionProbe`, which settles that it actually sees a
-    /// Gmail-shaped inline reply — G18 rests on that the way the other guards
-    /// rest on `url` tracking a fragment change.
+    /// Gmail-shaped inline reply *and* an `<input>`-only page — G18 rests on
+    /// that the way the other guards rest on `url` tracking a fragment change.
+    ///
+    /// The two halves ask one question between them and must therefore agree on
+    /// what "typable" means. They did not: `focused` handled `<input>` with a
+    /// text-like type, `dirty` queried only
+    /// `contenteditable`/`g_editable`/`role="textbox"`/`textarea` and never
+    /// visited an `<input>` at all. Google Calendar's quick-create bubble has
+    /// no contenteditable anywhere — its "Add title" field is a plain
+    /// `<input type="text">` whose textbox role is *implicit*, and an attribute
+    /// selector matches an attribute, never a computed role. G3 sees nothing
+    /// either, because the bubble changes no path segment. So the moment the
+    /// user clicked a time chip in the same bubble, `focused` went false,
+    /// `dirty` stayed 0, and a half-written event was destroyed with no log
+    /// line and no recorded block. Gmail's "Create filter" criteria sheet was
+    /// in the same blind spot.
     static let editorProbeScript = """
-    const active = document.activeElement;
-    const focused = !!(active && (
-      active.isContentEditable ||
-      active.tagName === 'TEXTAREA' ||
-      (active.tagName === 'INPUT' && /^(text|search|email|url|tel)$/i.test(active.type || 'text'))
+    // One definition, used by both halves. Anything this calls typable is
+    // something the user can be in the middle of writing, so anything the
+    // focused half would protect the dirty half must also count.
+    const typableInput = /^(text|search|email|url|tel)$/i;
+    const isTypable = (node) => !!(node && (
+      node.isContentEditable ||
+      node.tagName === 'TEXTAREA' ||
+      (node.tagName === 'INPUT' && typableInput.test(node.type || 'text'))
     ));
+
+    const focused = isTypable(document.activeElement);
     let dirty = 0;
     const boxes = document.querySelectorAll(
-      '[contenteditable="true"], [g_editable="true"], [role="textbox"], textarea'
+      '[contenteditable="true"], [g_editable="true"], [role="textbox"], textarea, input'
     );
     for (const box of boxes) {
+      // `input` is in the selector wholesale, so the type filter is what keeps
+      // a checkbox, a radio or a password field from counting — exactly the
+      // types the focused half already excludes.
+      if (box.tagName === 'INPUT' && !typableInput.test(box.type || 'text')) { continue; }
       // Hidden nodes do not count. Gmail keeps offscreen templates around, and
       // one of those holding text permanently would block every rebuild in the
       // app — silently, for the twelve hours before the persistent-block log
@@ -518,22 +568,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         navigationPolicy.markStalled(webView)
     }
 
+    func clearRecycleStall(_ webView: WKWebView) {
+        navigationPolicy.clearStalled(webView)
+    }
+
+    /// A tab died, or came back. Repaint, re-badge, and say so once per tab per
+    /// episode.
+    ///
+    /// Everything here is resolved to the *tab*, not to the account. The pill
+    /// already was; the notification, its click target, its log line and the
+    /// Dock `!` were not, so a Calendar tab that would not load announced
+    /// "Mail is not loading", took the click to the Mail tab — which was
+    /// working, and which `recoverIfStalled` therefore declined to rescue —
+    /// and stamped a `!` on an unread count that was perfectly accurate. The
+    /// dead Calendar tab was left untouched, one tab over, still wearing the
+    /// only correct signal in the set.
+    ///
+    /// The notification bookkeeping is per tab for the same reason: a
+    /// per-account record meant that once a Calendar failure had claimed the
+    /// account's slot, its Mail tab dying later was never announced at all.
     func recycleStallsChanged() {
-        let stalled = tabRecycler.stalledAccounts
-        unreadPoller.setStalled(stalled)
+        let stalled = tabRecycler.stalledTabs
+        // The `!` says "this unread number is not the whole truth", which only a
+        // dead *Mail* tab can make true.
+        unreadPoller.setStalled(tabRecycler.stalledMailAccounts)
         windowController?.refresh()
 
         notifiedStalls.formIntersection(stalled)
-        for accountId in stalled where !notifiedStalls.contains(accountId) {
-            notifiedStalls.insert(accountId)
-            guard let account = accountStore.account(id: accountId) else { continue }
-            Log.error("account \(accountId.uuidString.prefix(8)) has a mail tab that will not load")
+        for tab in stalled where !notifiedStalls.contains(tab) {
+            notifiedStalls.insert(tab)
+            guard let account = accountStore.account(id: tab.accountId) else { continue }
+            Log.error(
+                "account \(tab.accountId.uuidString.prefix(8)) has a "
+                + "\(tab.view.rawValue) tab that will not load"
+            )
             notificationBridge.post(
-                title: "\(account.name) — Mail is not loading",
+                title: "\(account.name) — \(tab.view.displayName) is not loading",
                 body: "MailSpace could not reload this tab. Click to try again.",
-                tag: "mailspace-tab-stalled",
+                tag: "mailspace-tab-stalled-\(tab.view.rawValue)",
                 account: account,
-                view: .mail
+                view: tab.view
             )
         }
     }
@@ -618,6 +692,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // nothing reaches Google — a portal, a router with no upstream — and
         // every observation taken in that window is about the network, not
         // about the session.
+        //
+        // This is only safe because `reachability` now separates "a probe ran
+        // and nothing came back" from "no probe can run at all". It did not:
+        // a signed-out account issues no fetch ever, which read as an unproven
+        // network, which froze every observation here at BUSY — so the monitor
+        // could never confirm the sign-out that was causing the freeze.
         if reachability != .up { return true }
         // A sign-in that is actually happening. Google `pushState`s through its
         // steps rather than committing a document per step, so the `didCommit`
@@ -908,11 +988,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         navigationPolicy.reload(target.webView, baseURL: target.baseURL)
     }
 
-    /// ⌥⌘R — a diagnostic, not the feature. Automatic recycling is what keeps
-    /// memory and sync healthy; this exists so a recycle can be provoked on
-    /// demand while verifying that it does. Deliberately not on plain ⌘R, which
-    /// is load-bearing for crash-throttle recovery. One line in the View menu
-    /// and this method are the whole of it.
+    /// ⌥⌘R — a diagnostic, not the feature. It reloads every tab in place, so
+    /// it is the way to get fresh documents everywhere after a sign-in or a
+    /// Google-side change without clicking through the tabs by hand.
+    ///
+    /// It is **not** a way to provoke a recycle, and the comment here used to
+    /// say it was. `NavigationPolicy.reload` is `WKWebView.reload()` — the
+    /// in-process path `AccountSession.recycle` exists to avoid, and the one
+    /// `make bench` measures at 426 MB sustained against 11 MB for replacement.
+    /// Nothing in this method goes near `TabRecycler`, the guard set or
+    /// `performRecycle`, so sampling memory after pressing it says nothing
+    /// about whether recycling works. `make bench` is the answer to that
+    /// question, and `make recovery` to the failure path.
+    ///
+    /// Deliberately not on plain ⌘R, which is load-bearing for crash-throttle
+    /// recovery. One line in the View menu and this method are the whole of it.
     @objc func reloadAllTabs(_ sender: Any?) {
         for session in sessions.values {
             for webView in session.webViews {
@@ -1201,8 +1291,9 @@ enum MainMenu {
         // The visible way back from a tab the crash throttle gave up on, and
         // the only one when that tab is the only tab there is to select.
         menu.addItem(withTitle: "Reload Tab", action: #selector(AppDelegate.reloadCurrentTab(_:)), keyEquivalent: "r")
-        // Diagnostic only. Tabs are rebuilt automatically once they have been
-        // open half a day; this is the lever for provoking one on demand.
+        // Diagnostic only, and an in-place reload of every tab — not a recycle.
+        // Tabs are rebuilt automatically once they have been open half a day;
+        // `make bench` is what proves that path reclaims what it claims to.
         let reloadAll = menu.addItem(withTitle: "Reload All Tabs", action: #selector(AppDelegate.reloadAllTabs(_:)), keyEquivalent: "r")
         reloadAll.keyEquivalentModifierMask = [.command, .option]
         return submenuItem(menu)

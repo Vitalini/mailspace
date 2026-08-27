@@ -19,10 +19,11 @@ protocol AccountHosting: AnyObject {
     func tabWasDeselected(accountId: UUID, view: AccountView)
     /// Accounts the health monitor currently reports as signed out.
     func signedOutAccounts() -> Set<UUID>
-    /// Accounts whose Mail tab failed to reload and has not come back.
-    func stalledAccounts() -> Set<UUID>
-    /// The same fact per tab, so a dead Calendar tab is marked on the Calendar
-    /// tab rather than on its working Mail sibling.
+    /// Tabs whose webview failed to reload and has not come back, per tab, so
+    /// a dead Calendar tab is marked on the Calendar tab rather than on its
+    /// working Mail sibling. There is deliberately no account-level version:
+    /// having one is what got the notification, its click target and the Dock
+    /// `!` pointed at the wrong tab.
     func stalledTabs() -> Set<TabRef>
     /// This account's own unread count, or `nil` when nothing is known. One
     /// number per account, read once and rendered twice — this and the Dock

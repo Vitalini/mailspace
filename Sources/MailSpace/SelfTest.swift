@@ -990,7 +990,6 @@ final class SettingsProbe: NSObject, AccountHosting {
     func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool) {}
     func tabWasDeselected(accountId: UUID, view: AccountView) {}
     func signedOutAccounts() -> Set<UUID> { [] }
-    func stalledAccounts() -> Set<UUID> { [] }
     func stalledTabs() -> Set<TabRef> { [] }
     func unreadCount(for accountId: UUID) -> Int? { nil }
     func calendarCountdownSeconds(for accountId: UUID) -> Int? { nil }

@@ -334,6 +334,10 @@ final class BenchProbe: NSObject, WKNavigationDelegate {
 ///    and stay quiet on an inbox that has none? G18 is the only guard standing
 ///    between a background tab and a rebuilt-away reply, and a selector that
 ///    matched nothing would fail open with no symptom at all.
+/// 4. Does it see text in a plain `<input type="text">` when focus has already
+///    moved off it? That is Calendar's quick-create bubble and Gmail's filter
+///    sheet — no `contenteditable` anywhere, no URL change to give it away —
+///    and it is the case that shipped broken while assumption 3 stayed green.
 ///
 /// Offline: the document is `loadHTMLString` against a Gmail base URL, so
 /// nothing is fetched and no account is involved.
@@ -435,13 +439,73 @@ final class AssumptionProbe: NSObject, WKNavigationDelegate {
                     self.runEditorProbe { typed in
                         let seesReply = RecycleDecision.hasLiveEditor(typed)
                         let urlIsSilent = (self.webView.url).map { !RecycleDecision.hasOpenCompose($0) } ?? false
+                        self.checkInputOnlyPage(
+                            tracked: tracked,
+                            quietOK: quietOK,
+                            seesReply: seesReply,
+                            urlIsSilent: urlIsSilent,
+                            before: before,
+                            after: after
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Assumption 4. The page has **no contenteditable at all** — just an
+    /// `<input type="text">` with something typed into it, and focus moved off
+    /// it onto a button.
+    ///
+    /// This is the shape of Google Calendar's quick-create bubble and of
+    /// Gmail's "Create filter" criteria sheet, and it is the case that shipped
+    /// broken: the probe's `dirty` half never visited an `<input>`, so with
+    /// focus moved away the whole eighteen-guard stack answered "no work here"
+    /// and the typed event was destroyed. Nothing in the suite covered it —
+    /// every other assumption here is about a `contenteditable`.
+    ///
+    /// Two halves, because a fix that made everything count would be as wrong
+    /// as one that counted nothing: a checkbox is not somebody's unsaved work,
+    /// and treating it as one would retire that tab from recycling for good.
+    private func checkInputOnlyPage(
+        tracked: Bool,
+        quietOK: Bool,
+        seesReply: Bool,
+        urlIsSilent: Bool,
+        before: String,
+        after: URL?
+    ) {
+        let bubble = """
+        document.body.innerHTML =
+          '<input id="title" type="text" style="width:300px;height:24px">' +
+          '<input id="allday" type="checkbox" checked>' +
+          '<button id="chip" style="width:80px;height:24px">10:00</button>';
+        document.getElementById('title').value = 'Budget review with Dana';
+        document.getElementById('chip').focus();
+        """
+        webView.evaluateJavaScript(bubble) { [weak self] _, _ in
+            guard let self else { return }
+            self.runEditorProbe { typed in
+                // Focus is on a button, so `focused` is false by design — the
+                // whole point is that `dirty` has to carry this one alone.
+                let seesInput = RecycleDecision.hasLiveEditor(typed)
+                let focusIsElsewhere = typed?.focused == false
+                self.webView.evaluateJavaScript(
+                    "document.getElementById('title').value = '';"
+                ) { _, _ in
+                    self.runEditorProbe { empty in
+                        // A ticked checkbox and an empty title is not work.
+                        let checkboxIgnored = !RecycleDecision.hasLiveEditor(empty)
                         let ok = tracked && self.sawEvent && quietOK && seesReply && urlIsSilent
+                            && seesInput && focusIsElsewhere && checkboxIgnored
                         SelfTest.finish(
                             "assume result=\(ok ? "ok" : "PROBLEM") "
                             + "fragmentTracked=\(tracked ? 1 : 0) localMonitorSawKey=\(self.sawEvent ? 1 : 0) "
                             + "quietPageHasNoEditor=\(quietOK ? 1 : 0) "
                             + "inlineReplySeen=\(seesReply ? 1 : 0) "
                             + "inlineReplyInvisibleToTheUrl=\(urlIsSilent ? 1 : 0) "
+                            + "typedInputSeenWithFocusElsewhere=\(seesInput && focusIsElsewhere ? 1 : 0) "
+                            + "emptyInputAndCheckboxIgnored=\(checkboxIgnored ? 1 : 0) "
                             + "before=\(before) after=\(after?.absoluteString ?? "none")"
                         )
                     }

@@ -31,17 +31,22 @@ a wrapped line belongs to the bullet above it, here and in the update window.
   keeps the label and the thread you were on, and waits while you are typing,
   while a message is being written, while an event is being edited, while a
   download or a sign-in is running, and while the network is down. Switch it
-  off in Settings ▸ General.
+  off in Settings ▸ General. A tab it decides to leave alone holds up only
+  itself: the rest of your tabs are still rebuilt on schedule.
 - Once a day or so, the tab you are actually looking at is rebuilt too — but
   only after you have left it alone for a minute and a half. You will see it
   blink once and come back where you were.
 - An account whose Google session has expired now says so: an orange warning on
   its Mail tab, an exclamation mark on the Dock badge, and one notification.
-  Clicking the tab takes you straight to the sign-in page.
+  Clicking the tab takes you straight to the sign-in page. It works when the
+  expired account is the only one you have, which is the case it matters most
+  in.
 - A tab that will not load now says so, the same way a signed-out account does:
   an orange warning on the tab, an exclamation mark on the Dock badge, and one
-  notification. It comes back on its own as soon as the network does, and
-  clicking the tab loads it immediately.
+  notification. The warning names the tab that is actually broken — a Calendar
+  tab that will not load says Calendar, and clicking the notification takes you
+  to it. It comes back on its own as soon as the network does, and clicking the
+  tab loads it immediately.
 - `View ▸ Reload All Tabs` (⌥⌘R) reloads every tab by hand. It is a diagnostic;
   the automatic rebuild above is what actually keeps things healthy.
 
@@ -86,7 +91,17 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 - A reply you are part-way through writing is no longer thrown away by a
   rebuild. Gmail's inline reply never showed in the address, so only a
   popped-out compose was protected; MailSpace now asks the page itself whether
-  anything is being typed into it, without reading a word of it.
+  anything is being typed into it, without reading a word of it. That covers
+  ordinary text fields too — a calendar event you have titled but not saved, or
+  a Gmail filter you are part-way through describing — including after you have
+  clicked away from the field and left the text sitting there.
+- A tab that came back on its own after a failed rebuild is treated as healthy
+  again: it goes back into the rebuild rotation, and clicking it no longer
+  reloads a page that is already fine.
+- A Google link handed to the browser only names your account for Google's own
+  products — Docs, Drive, Calendar, Meet and the rest. Google also hosts pages
+  written by other people, and those are handed over exactly as they were
+  clicked.
 - Clicking a tab flagged as signed out no longer reloads it out of the thread,
   search or reply you had open when the evidence is ambiguous — a proxy or a
   captive portal can look exactly like an expired session — and never while you

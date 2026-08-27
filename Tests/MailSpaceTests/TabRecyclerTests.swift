@@ -400,7 +400,7 @@ final class RecycleDecisionTests: XCTestCase {
         // No interface: nothing else matters.
         XCTAssertEqual(
             RecycleDecision.reachability(
-                pathIsSatisfied: false, lastReachedGoogleAt: epoch, probesAreRunning: true, now: epoch
+                pathIsSatisfied: false, lastReachedGoogleAt: epoch, probes: .polling, now: epoch
             ),
             .down
         )
@@ -409,7 +409,7 @@ final class RecycleDecisionTests: XCTestCase {
             RecycleDecision.reachability(
                 pathIsSatisfied: true,
                 lastReachedGoogleAt: epoch.addingTimeInterval(-60),
-                probesAreRunning: true,
+                probes: .polling,
                 now: epoch
             ),
             .up
@@ -420,7 +420,7 @@ final class RecycleDecisionTests: XCTestCase {
             RecycleDecision.reachability(
                 pathIsSatisfied: true,
                 lastReachedGoogleAt: epoch.addingTimeInterval(-RecycleDecision.reachProofWindow - 1),
-                probesAreRunning: true,
+                probes: .polling,
                 now: epoch
             ),
             .unproven
@@ -428,7 +428,7 @@ final class RecycleDecisionTests: XCTestCase {
         // Interface up and nothing has *ever* got through.
         XCTAssertEqual(
             RecycleDecision.reachability(
-                pathIsSatisfied: true, lastReachedGoogleAt: nil, probesAreRunning: true, now: epoch
+                pathIsSatisfied: true, lastReachedGoogleAt: nil, probes: .polling, now: epoch
             ),
             .unproven
         )
@@ -437,9 +437,94 @@ final class RecycleDecisionTests: XCTestCase {
         // runs would be worse than trusting it.
         XCTAssertEqual(
             RecycleDecision.reachability(
-                pathIsSatisfied: true, lastReachedGoogleAt: nil, probesAreRunning: false, now: epoch
+                pathIsSatisfied: true, lastReachedGoogleAt: nil, probes: .idle, now: epoch
             ),
             .up
+        )
+    }
+
+    /// The signed-out case, which the old rule could not express at all.
+    ///
+    /// `probesAreRunning` meant "Mail is switched on for some account". A
+    /// signed-out account has Mail on and issues no fetch ever, so the proof
+    /// stamp stayed nil for good, reachability pinned to `.unproven`, every
+    /// health observation became BUSY, and the monitor built to report the
+    /// sign-out was held shut by the sign-out — while `.unprovenNetwork` also
+    /// stopped recycling on every tab in the app. One expired cookie on a
+    /// single-account setup was enough.
+    func testASignedOutAccountDoesNotPinTheAppToAnUnprovenNetwork() {
+        // Every mail tab parked on Google's own sign-in page. No probe can run
+        // and none ever will until the user signs in, so this is `.idle`: the
+        // link is the whole answer, health can conclude, and recycling
+        // continues on the tabs that are still signed in.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: true, lastReachedGoogleAt: nil, probes: .idle, now: epoch
+            ),
+            .up
+        )
+        // And with a stale proof, which is the state a session that expired
+        // mid-run leaves behind.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: true,
+                lastReachedGoogleAt: epoch.addingTimeInterval(-RecycleDecision.reachProofWindow - 1),
+                probes: .idle,
+                now: epoch
+            ),
+            .up
+        )
+        // The distinction that keeps the portal defence: a mail tab that is on
+        // neither Gmail nor the sign-in chain has been walked somewhere by
+        // something, and that proves nothing at all.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: true, lastReachedGoogleAt: nil, probes: .stranded, now: epoch
+            ),
+            .unproven
+        )
+        // A fresh proof still wins outright, whatever the tabs look like.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: true,
+                lastReachedGoogleAt: epoch.addingTimeInterval(-60),
+                probes: .stranded,
+                now: epoch
+            ),
+            .up
+        )
+        // And no interface still beats everything.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: false, lastReachedGoogleAt: nil, probes: .idle, now: epoch
+            ),
+            .down
+        )
+    }
+
+    /// The reading that decides which `ProbeActivity` a mail tab contributes.
+    ///
+    /// `AppDelegate.probeActivity` classifies with this exact function, so the
+    /// poller and the recycler can never disagree about which tabs are issuing
+    /// a fetch. A signed-out tab is `.definiteZero` — Google answered, with its
+    /// sign-in page — and that is what must not read as an unproven network.
+    func testASignedOutMailTabIsADefiniteZeroRatherThanSilence() {
+        XCTAssertEqual(
+            UnreadPoller.reading(for: URL(string: "https://accounts.google.com/v3/signin/identifier")),
+            .definiteZero
+        )
+        XCTAssertEqual(
+            UnreadPoller.reading(for: URL(string: "https://consent.google.com/m")),
+            .definiteZero
+        )
+        XCTAssertEqual(
+            UnreadPoller.reading(for: URL(string: "https://mail.google.com/mail/u/0/#inbox")),
+            .poll
+        )
+        // The portal shape: neither Gmail nor the sign-in chain.
+        XCTAssertEqual(
+            UnreadPoller.reading(for: URL(string: "https://portal.hotel.example/login")),
+            .noAnswer
         )
     }
 
@@ -497,6 +582,49 @@ final class RecycleDecisionTests: XCTestCase {
     /// tab alone forever".
     func testAPageThatCannotAnswerIsNotSparedForever() {
         XCTAssertFalse(RecycleDecision.hasLiveEditor(nil))
+    }
+
+    /// The two halves of the probe ask one question between them, so they must
+    /// agree on what "typable" means.
+    ///
+    /// They did not, and it was silent. `focused` handled `<input>` with a
+    /// text-like type; the `dirty` selector was
+    /// `[contenteditable="true"], [g_editable="true"], [role="textbox"], textarea`
+    /// and never visited an `<input>` at all. Google Calendar's quick-create
+    /// bubble has no contenteditable anywhere — its title is a plain
+    /// `<input type="text">` whose textbox role is *implicit*, which an
+    /// attribute selector cannot match — and G3 is URL-only while the bubble
+    /// changes no URL. So the moment focus moved to a time chip in the same
+    /// bubble the whole guard stack answered "nothing here" and the typed event
+    /// was destroyed with no log line. Gmail's filter-criteria sheet is the same
+    /// shape.
+    ///
+    /// Structural rather than behavioural because the script runs in WebKit:
+    /// `make assume` is where it is actually executed against an input-only
+    /// page. This is the cheap check that keeps the asymmetry from coming back.
+    func testTheEditorProbeAsksBothHalvesTheSameQuestion() {
+        let script = AppDelegate.editorProbeScript
+
+        XCTAssertTrue(
+            script.contains("textarea, input"),
+            "the dirty selector has to visit <input>, or Calendar quick-create is unguarded"
+        )
+        // One shared definition of a typable input type, used by both halves —
+        // two copies is how they drifted apart the first time.
+        XCTAssertEqual(
+            script.components(separatedBy: "/^(text|search|email|url|tel)$/i").count - 1, 1,
+            "one regex, referenced twice, not two regexes"
+        )
+        XCTAssertEqual(
+            script.components(separatedBy: "typableInput.test").count - 1, 2,
+            "and both halves have to consult it"
+        )
+        // A checkbox, a radio or a password field is not somebody's unsaved
+        // work, and counting one would retire that tab from recycling for good.
+        XCTAssertTrue(script.contains("if (box.tagName === 'INPUT' && !typableInput.test"))
+        // Still no text, ever: a length and two booleans are all that cross.
+        XCTAssertFalse(script.contains("textContent)"), "no text may leave the page")
+        XCTAssertTrue(script.contains("return { focused: focused, dirty: dirty };"))
     }
 
     // MARK: - Failure policy
@@ -603,11 +731,16 @@ final class FakeRecyclerHost: TabRecyclerHost {
     var reachability: RecycleDecision.Reachability = .up
     var lastWakeAt: Date?
     var mainWindowIsVisible = true
+    /// The answer every page gives unless it has one of its own.
     var editorAnswer: RecycleDecision.EditorState?
+    /// Per-webview answers, for the tests where one tab vetoes and the others
+    /// do not — the starvation case lives entirely in that difference.
+    var editorAnswers: [ObjectIdentifier: RecycleDecision.EditorState] = [:]
 
     /// What the recycler asked for, in order.
     private(set) var recycled: [String] = []
     private(set) var markedStalled: [URL] = []
+    private(set) var clearedStalls = 0
     private(set) var stallChanges = 0
     /// Every fresh webview handed back, kept alive for the test's duration.
     private(set) var replacements: [WKWebView] = []
@@ -638,13 +771,29 @@ final class FakeRecyclerHost: TabRecyclerHost {
         return fresh
     }
 
+    /// Pages that have been asked and have not answered yet, in ask order. Set
+    /// `answersLater` and the test decides when each page speaks — which is
+    /// what the real one does, and the gap the whole walk has to survive.
+    var answersLater = false
+    private(set) var pending: [(RecycleDecision.EditorState?) -> Void] = []
+
     func editorState(in webView: WKWebView, completion: @escaping (RecycleDecision.EditorState?) -> Void) {
-        completion(editorAnswer)
+        let answer = editorAnswers[ObjectIdentifier(webView)] ?? editorAnswer
+        guard answersLater else { return completion(answer) }
+        pending.append { _ in completion(answer) }
+    }
+
+    /// Lets the oldest outstanding page answer.
+    func answerOldest() {
+        guard !pending.isEmpty else { return }
+        pending.removeFirst()(nil)
     }
 
     func markRecycleStalled(_ webView: WKWebView, target url: URL) {
         markedStalled.append(url)
     }
+
+    func clearRecycleStall(_ webView: WKWebView) { clearedStalls += 1 }
 
     func recycleStallsChanged() { stallChanges += 1 }
 }
@@ -653,6 +802,7 @@ final class FakeRecyclerHost: TabRecyclerHost {
 final class TabRecyclerDriverTests: XCTestCase {
     private let epoch = Date(timeIntervalSince1970: 1_800_000_000)
     private let page = URL(string: "https://mail.google.com/mail/u/0/#inbox")!
+    private let calendarPage = URL(string: "https://calendar.google.com/calendar/u/0/r/week")!
 
     private var host: FakeRecyclerHost!
     private var recycler: TabRecycler!
@@ -699,20 +849,22 @@ final class TabRecyclerDriverTests: XCTestCase {
     private func addTab(
         _ name: String,
         slot: Int,
+        view: AccountView = .mail,
+        accountId: UUID = UUID(),
         age: TimeInterval = 13 * 3600
     ) -> WKWebView {
         let webView = WKWebView()
         let target = TabRecycler.Target(
-            accountId: UUID(),
+            accountId: accountId,
             accountName: name,
-            view: .mail,
+            view: view,
             slot: slot,
             webView: webView
         )
         host.targets.append(target)
         host.candidates[ObjectIdentifier(webView)] = RecycleDecision.Candidate(
-            url: page,
-            view: .mail,
+            url: view == .mail ? page : calendarPage,
+            view: view,
             slot: slot,
             committedAt: nil
         )
@@ -792,6 +944,124 @@ final class TabRecyclerDriverTests: XCTestCase {
         host.editorAnswer = RecycleDecision.EditorState(focused: false, dirty: 0)
         recycler.tick()
         XCTAssertEqual(host.recycled, ["work"])
+    }
+
+    /// The starvation case. One vetoed tab must not consume the tick.
+    ///
+    /// `tick()` used to hand the first eligible target to the asynchronous G18
+    /// probe and return there and then. A page that vetoed — a focused Gmail
+    /// search box, a half-typed inline reply — therefore spent the whole tick
+    /// without a recycle happening, and since a veto records no state the next
+    /// tick chose the same target again. Every tab behind it in slot order was
+    /// never evaluated at all: no rebuild, no `noteBlocked` line naming them,
+    /// and the memory growth this feature exists to prevent, for as long as the
+    /// draft sat in slot 0.
+    func testAVetoedTabDoesNotStarveTheTabsBehindIt() {
+        let blocked = addTab("work", slot: 0)
+        _ = addTab("personal", slot: 1)
+        _ = addTab("side", slot: 2)
+        clock = epoch.addingTimeInterval(40 * 3600)
+
+        // Slot 0 has an inline reply in it and answers so on every tick.
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: false, dirty: 1)
+
+        recycler.tick()
+        XCTAssertEqual(host.recycled, ["personal"], "the walk must reach past the veto")
+        XCTAssertFalse(
+            host.recycled.contains("work"),
+            "and must still not rebuild the tab with work in it"
+        )
+    }
+
+    /// The other half of the same rule: reaching past a veto must not turn one
+    /// tick into two recycles, and must not outrun G13's global spacing.
+    func testResumingPastAVetoStillRecyclesOnlyOnePerTick() {
+        let blocked = addTab("work", slot: 0)
+        _ = addTab("personal", slot: 1)
+        _ = addTab("side", slot: 2)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: true, dirty: 0)
+
+        recycler.tick()
+        XCTAssertEqual(host.recycled, ["personal"], "one, not both of the tabs behind it")
+
+        // Inside the spacing window nothing more goes, however many ticks.
+        for _ in 0..<5 { recycler.tick() }
+        XCTAssertEqual(host.recycled, ["personal"], "G13 still drips")
+
+        // Past it, the next one behind the veto goes — and still only one.
+        clock = clock.addingTimeInterval(RecycleDecision.globalSpacing + 1)
+        recycler.tick()
+        XCTAssertEqual(host.recycled, ["personal", "side"])
+    }
+
+    /// A pass can outlive the tick that started it, since a page gets five
+    /// seconds to answer. The next tick must supersede it rather than run
+    /// alongside it — two passes sharing one `lastRecycleAt` snapshot would
+    /// each rebuild a tab, which is what G13 exists to stop.
+    func testASlowPassIsSupersededRatherThanRunAlongside() {
+        let blocked = addTab("work", slot: 0)
+        _ = addTab("personal", slot: 1)
+        _ = addTab("side", slot: 2)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: true, dirty: 0)
+        host.answersLater = true
+
+        // Tick one asks slot 0 and is still waiting on it.
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 1)
+
+        // Tick two arrives first. It asks slot 0 again — nothing has changed —
+        // and the older pass is now stale.
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 2)
+
+        // Both pages answer, oldest first. The stale pass must abandon itself
+        // instead of walking on to slot 1 in parallel with the live one.
+        host.answerOldest()
+        XCTAssertEqual(host.recycled, [], "the superseded pass rebuilt nothing")
+        host.answerOldest()
+        host.answersLater = false
+        XCTAssertEqual(host.recycled, ["personal"], "and the live one still reaches past the veto")
+    }
+
+    /// A tab that vetoes forever is logged as a persistent block once per
+    /// twelve hours — not once per tick.
+    ///
+    /// The tick's `.recycle` branch used to wipe the throttle stamp *before*
+    /// the asynchronous probe ran, so the veto that came back a moment later
+    /// always found no stamp and logged. `.liveEditor` is the one reason
+    /// reachable only through that path, so the throttle never applied to it
+    /// and a single blocked tab wrote about 1440 identical lines a day.
+    func testAPermanentlyVetoedTabIsNotLoggedOnEveryTick() {
+        let blocked = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: true, dirty: 0)
+
+        var lines: [String] = []
+        let previous = Log.sink
+        Log.sink = { lines.append($0) }
+        defer { Log.sink = previous }
+
+        for _ in 0..<20 {
+            recycler.tick()
+            clock = clock.addingTimeInterval(60)
+        }
+        XCTAssertEqual(
+            lines.filter { $0.contains("reason=liveEditor") }.count,
+            1,
+            "one line for the episode, not one per tick"
+        )
+
+        // Twelve hours later the block is still standing, and says so once more.
+        clock = clock.addingTimeInterval(12 * 3600 + 1)
+        recycler.tick()
+        XCTAssertEqual(lines.filter { $0.contains("reason=liveEditor") }.count, 2)
     }
 
     // MARK: - The retry ladder
@@ -876,6 +1146,46 @@ final class TabRecyclerDriverTests: XCTestCase {
         XCTAssertEqual(loads, [page], "re-navigated to the page it was on, not to a generic inbox")
         XCTAssertFalse(recycler.hasFailedLoad(fresh))
         XCTAssertTrue(recycler.stalledAccounts.isEmpty, "the pill and the ! go away")
+        XCTAssertGreaterThan(
+            host.clearedStalls, 0,
+            "and the stall token goes with them, or the healed tab is skipped by the "
+            + "recycler and reloaded from under the user the next time he looks at it"
+        )
+    }
+
+    /// The state leak behind that: `giveUp` marks the webview stalled through
+    /// the host, the *user-driven* rescue clears the token on its way through
+    /// `recoverIfStalled`, and the automatic one only re-issued the load. So a
+    /// self-healed tab kept a token describing a failure that was over —
+    /// `.skip(.stalled)` on every tick from then on, and one unexplained full
+    /// reload the next time it was selected.
+    func testASelfHealedTabDoesNotKeepItsStallToken() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        XCTAssertEqual(host.markedStalled, [page], "the tab is stalled to begin with")
+        XCTAssertEqual(host.clearedStalls, 0)
+
+        recycler.networkBecameReachable()
+        XCTAssertEqual(host.clearedStalls, 1, "the rescue takes the token back off")
+
+        // And a commit on a dead tab clears it whatever route brought the page
+        // back — belt and braces for a rescue that did not come through
+        // `networkBecameReachable`.
+        recycler.webViewDidFail(fresh)
+        for _ in 0..<RecycleDecision.maximumFailures {
+            fireScheduled()
+            recycler.webViewDidFail(fresh)
+        }
+        XCTAssertTrue(recycler.hasFailedLoad(fresh))
+        recycler.webViewDidSettle(fresh)
+        XCTAssertEqual(host.clearedStalls, 2)
     }
 
     /// A retry that comes due while the network is still down re-arms instead
@@ -940,6 +1250,42 @@ final class TabRecyclerDriverTests: XCTestCase {
         scheduled = []
         recycler.webViewDidFail(fresh)
         XCTAssertEqual(scheduled.map(\.delay), [30], "back on the ladder at the first rung")
+    }
+
+    /// A dead Calendar tab is a Calendar problem, and everything drawn from it
+    /// has to say so.
+    ///
+    /// The pill was already tab-resolved; the notification, its click target,
+    /// its log line and the Dock `!` were still account-level, so a Calendar
+    /// tab that would not load announced "Mail is not loading", sent the click
+    /// to the Mail tab — which was working, so the rescue there did nothing —
+    /// and stamped a `!` on an unread count that was perfectly accurate.
+    func testADeadCalendarTabIsNotReportedAgainstItsWorkingMailSibling() {
+        let account = UUID()
+        _ = addTab("work", slot: 0, view: .mail, accountId: account)
+        _ = addTab("work", slot: 1, view: .calendar, accountId: account)
+        clock = epoch.addingTimeInterval(40 * 3600)
+
+        // Only the Calendar tab is recycled and only it fails.
+        host.candidates[ObjectIdentifier(host.targets[0].webView)] = nil
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+
+        XCTAssertEqual(
+            recycler.stalledTabs,
+            [TabRef(accountId: account, view: .calendar)],
+            "the dead tab names itself"
+        )
+        XCTAssertEqual(
+            recycler.stalledMailAccounts, [],
+            "and the Dock ! stays off a mail count that is not in doubt"
+        )
+        XCTAssertEqual(recycler.stalledAccounts, [account], "the account-level fact is still there")
     }
 
     /// A tab the ladder still owns is not recycled again underneath it — the
