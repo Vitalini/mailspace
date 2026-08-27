@@ -631,6 +631,16 @@ final class TabRecycler {
         recycleTarget[fresh] = url
         webViewWasDiscarded(target.webView)
 
+        // The busy flag has to be able to end on its own. WebKit delivers a
+        // commit or a failure for every load, but a flag that only two
+        // callbacks can clear would, if either is ever missed, freeze the
+        // health monitor on this account and take the webview out of the
+        // recycler's reach for the rest of the session.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self, weak fresh] in
+            guard let self, let fresh, self.recycling.contains(fresh) else { return }
+            self.recycling.remove(fresh)
+        }
+
         Log.info(
             "recycled account=\(target.accountName) view=\(target.view.rawValue) "
             + "age=\(Self.describe(age)) reason=\(trigger.rawValue)"

@@ -289,11 +289,13 @@ final class UnreadPoller {
     private func noteUnanswered(_ accountId: UUID) {
         let cycles = (unansweredCycles[accountId] ?? 0) + 1
         unansweredCycles[accountId] = cycles
-        if let forced = Self.contribution(previous: counts[accountId], unansweredCycles: cycles), forced == 0 {
-            counts[accountId] = 0
-            if reportedStale.insert(accountId).inserted {
-                Log.info("unread feed unanswered for \(cycles) cycles on one account; its badge contribution is now 0")
-            }
+        guard cycles >= Self.unansweredLimit else { return }
+        counts[accountId] = Self.contribution(previous: counts[accountId], unansweredCycles: cycles)
+        if reportedStale.insert(accountId).inserted {
+            Log.info(
+                "unread feed unanswered for \(cycles) cycles on account "
+                + "\(accountId.uuidString.prefix(8)); its badge contribution is now 0"
+            )
         }
     }
 
