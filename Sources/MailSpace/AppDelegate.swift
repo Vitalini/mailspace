@@ -90,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         loginAutofill.locator = self
         navigationPolicy.mailtoHandler = { [weak self] url in self?.openMailto(url) }
         navigationPolicy.onSignInCompleted = { [weak self] accountId in self?.signInCompleted(accountId) }
+        // So a Google link handed to the browser can ask for the account it was
+        // clicked in, rather than whichever one the browser happens to hold.
+        navigationPolicy.accountEmail = { [weak self] accountId in self?.accountStore.account(id: accountId)?.email }
         notificationBridge.locator = self
         notificationBridge.router = self
         notificationBridge.onMailNotification = { [weak self] accountId in
