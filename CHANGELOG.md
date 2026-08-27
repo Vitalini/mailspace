@@ -11,6 +11,20 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 ## [Unreleased]
 
 ### Added
+- Every Mail tab now carries its own account's unread count, so the number on
+  the Dock is attributable at a glance instead of being one total you have to
+  open tabs to explain. The Dock badge is still the sum, and it is the same
+  number — read once, drawn in both places.
+- Every Calendar tab says how long until that account's next event later today,
+  in parentheses: `(5m)`, `(45m)`, `(1h)`, or `(now)` when it is about to
+  start. It reads the account's own calendar through the tab you are already
+  signed in to: no new sign-in, no Google account access to grant, and no event
+  title, guest or link ever leaves the page.
+- Settings ▸ General ▸ Calendar switches the countdown on and off for every
+  Calendar tab at once, with no relaunch. It is on to begin with.
+- The same row carries a **Check Now** button and a line saying what the last
+  check did — working, waiting for a signed-in Calendar tab, refused, or not
+  understood. It never shows anything from your calendar, only what happened.
 - Tabs left open for a long time are now rebuilt on their own, so MailSpace no
   longer grows to gigabytes over a day of uptime and a Gmail tab no longer
   quietly stops syncing until you quit the app. It happens in the background,
@@ -24,23 +38,24 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 - An account whose Google session has expired now says so: an orange warning on
   its Mail tab, an exclamation mark on the Dock badge, and one notification.
   Clicking the tab takes you straight to the sign-in page.
-- `View ▸ Reload All Tabs` (⌥⌘R) reloads every tab by hand. It is a diagnostic;
-  the automatic rebuild above is what actually keeps things healthy.
 - A tab that will not load now says so, the same way a signed-out account does:
   an orange warning on the tab, an exclamation mark on the Dock badge, and one
   notification. It comes back on its own as soon as the network does, and
   clicking the tab loads it immediately.
-- A Calendar tab can say how long until that account's next event later today —
-  `5m`, `1h`, `5h`. It reads the account's own calendar through the tab you are
-  already signed in to: no new sign-in, no Google account access to grant, and
-  no event title, guest or link ever leaves the page.
-- Settings ▸ General ▸ Calendar switches the countdown on and off for every
-  Calendar tab at once, with no relaunch. It is on to begin with.
-- The same row carries a **Check Now** button and a line saying what the last
-  check did — working, waiting for a signed-in Calendar tab, refused, or not
-  understood. It never shows anything from your calendar, only what happened.
+- `View ▸ Reload All Tabs` (⌥⌘R) reloads every tab by hand. It is a diagnostic;
+  the automatic rebuild above is what actually keeps things healthy.
 
 ### Changed
+- A tab with a warning on it shows the warning and nothing else. An account
+  that is signed out hides its unread count, and a Calendar tab that will not
+  load hides its countdown, because a number sitting beside a broken session
+  stopped being true the moment the session broke.
+- A count of zero shows nothing at all rather than a `0`, and an inbox past a
+  thousand shows `999+` with the exact figure in the tab's tooltip.
+- The tab bar does not resize while a countdown ticks. Every tab is as wide as
+  the widest, so the indicator gets one fixed slot: `(5m)` becoming `(45m)`
+  moves nothing, and only a count or a countdown appearing or disappearing
+  changes the tabs' width.
 - The countdown shows nothing rather than guessing. Only events that have not
   started yet count, only today's, and only when the answer is clear: a check
   that fails keeps the last number briefly and then drops it, rather than

@@ -125,6 +125,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             guard let self else { return [] }
             return Set(self.accountStore.accounts.filter { $0.mailEnabled && $0.countInBadge }.map(\.id))
         }
+        // The counts settled, so the tabs redraw — the same number the Dock
+        // badge was just given, on the same pass (KTD-S7, KTD-S8).
+        unreadPoller.onCountsChanged = { [weak self] in
+            self?.windowController?.refreshIndicators()
+        }
         unreadPoller.onObservation = { [weak self] accountId, observation in
             self?.health.record(observation, for: accountId)
         }
@@ -320,11 +325,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     /// A Calendar tab's countdown changed.
     ///
-    /// The value is ready in `nextEventPoller`; drawing it is a separate pass,
-    /// which hooks the tab bar in here alongside the unread pill. Keeping this
-    /// method now means the poller has one settled place to report to rather
-    /// than two callbacks bolted on later.
-    private func countdownsChanged() {}
+    /// Straight to the tab bar's in-place pass and nowhere near `refresh()`
+    /// (KTD-S8): this fires every 30 seconds while a countdown is live, and
+    /// `refresh()` would re-pin the webview and move first responder each time.
+    private func countdownsChanged() {
+        windowController?.refreshIndicators()
+    }
 
     func badgeInputsChanged(repoll: Bool) {
         if repoll {
@@ -397,6 +403,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func stalledAccounts() -> Set<UUID> {
         tabRecycler.stalledAccounts
+    }
+
+    func stalledTabs() -> Set<TabRef> {
+        tabRecycler.stalledTabs
+    }
+
+    func unreadCount(for accountId: UUID) -> Int? {
+        unreadPoller.count(for: accountId)
     }
 
     // MARK: - TabRecyclerHost

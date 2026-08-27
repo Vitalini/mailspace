@@ -203,4 +203,30 @@ final class UnreadBadgeTests: XCTestCase {
         XCTAssertEqual(UnreadPoller.dockTotal(counts, participants: [work]), 3)
         XCTAssertEqual(counts[personal], 44)
     }
+
+    // MARK: - What the tabs read (U10)
+
+    /// An account the poller has never seen has no number, which the tab draws
+    /// as nothing — the same as a definite zero, so no caller has to tell the
+    /// two apart.
+    func testAnUnknownAccountHasNoCount() {
+        XCTAssertNil(UnreadPoller().count(for: UUID()))
+    }
+
+    /// The tabs are told wherever the counts settle, which is the one place the
+    /// Dock badge is written. That is what keeps the badge and the pills from
+    /// ever disagreeing: they are the same number on the same pass (KTD-S7).
+    func testTheCountsSettlingTellsTheTabs() {
+        let poller = UnreadPoller()
+        var told = 0
+        poller.onCountsChanged = { told += 1 }
+
+        poller.updateBadge()
+        XCTAssertEqual(told, 1)
+
+        // Removing an account settles them too, so a tab cannot outlive its
+        // number by a poll cycle.
+        poller.forget(accountId: UUID())
+        XCTAssertEqual(told, 2)
+    }
 }

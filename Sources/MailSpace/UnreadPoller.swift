@@ -199,6 +199,19 @@ final class UnreadPoller {
     /// a poll cycle.
     var badgeParticipants: () -> Set<UUID> = { [] }
 
+    /// The counts settled. Fired from `updateBadge()` — the one place they ever
+    /// do — so the Dock total and the per-tab pills are drawn from the same
+    /// number on the same pass and can never disagree (KTD-S7).
+    var onCountsChanged: (() -> Void)?
+
+    /// This account's own unread count, for its own tab (U10).
+    ///
+    /// A missing key is `nil` — never polled, nothing known — which the tab
+    /// renders identically to a definite zero.
+    func count(for accountId: UUID) -> Int? {
+        counts[accountId]
+    }
+
     init(interval: TimeInterval = 60, settings: AppSettings = .shared) {
         self.interval = interval
         self.settings = settings
@@ -430,5 +443,6 @@ final class UnreadPoller {
             total: total,
             anySignedOut: !signedOutAccounts.isEmpty || !stalledAccounts.isEmpty
         )
+        onCountsChanged?()
     }
 }

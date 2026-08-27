@@ -698,6 +698,8 @@ final class TabRecycler {
     /// The account each dead webview belongs to, for the pill and the badge.
     /// Held by value because the webview it describes may already be gone.
     private var deadAccounts: Set<UUID> = []
+    /// The same set at tab resolution, for the pill.
+    private var deadTabs: Set<TabRef> = []
     /// Whether a retry is already armed for this webview, so a second failure
     /// callback for the same load cannot arm two.
     private var retryArmed = WeakObjectSet<WKWebView>()
@@ -884,19 +886,29 @@ final class TabRecycler {
         refreshDeadAccounts()
     }
 
-    /// Accounts with a Mail tab that failed to load and has not come back.
+    /// Accounts with a tab that failed to load and has not come back. What the
+    /// Dock badge's `!` is drawn from, so it stays per-account.
     var stalledAccounts: Set<UUID> { deadAccounts }
+
+    /// The same fact at the resolution the tab bar needs: *which* tab is dead,
+    /// not just which account. A Calendar tab that will not load is a Calendar
+    /// tab problem, and marking its Mail sibling instead would point the user at
+    /// a tab that is working.
+    var stalledTabs: Set<TabRef> { deadTabs }
 
     /// Recomputed from the host's live tab list rather than tracked
     /// incrementally, so a webview that has been discarded cannot leave a
     /// permanent `!` on the Dock badge.
     private func refreshDeadAccounts() {
         var accounts: Set<UUID> = []
+        var tabs: Set<TabRef> = []
         for target in host?.recycleTargets() ?? [] where deadTargets[target.webView] != nil {
             accounts.insert(target.accountId)
+            tabs.insert(TabRef(accountId: target.accountId, view: target.view))
         }
-        guard accounts != deadAccounts else { return }
+        guard accounts != deadAccounts || tabs != deadTabs else { return }
         deadAccounts = accounts
+        deadTabs = tabs
         host?.recycleStallsChanged()
     }
 

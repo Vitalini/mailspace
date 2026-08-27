@@ -33,7 +33,8 @@ BUILD_NUMBER := $(shell awk -F. '{printf "%d", $$1*10000 + $$2*100 + $$3}' VERSI
 GIT_DESCRIBE := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 .PHONY: all build compile icon bundle sign signing-cert selftest-app run smoke test clean \
-        version update-key changelog-draft release release-dry-run bench assume
+        version update-key changelog-draft release release-dry-run bench assume \
+        recovery tabshot
 
 all: build
 
@@ -141,6 +142,21 @@ assume: selftest-app
 ##            touched. Offscreen, under the throwaway bundle, as every probe is.
 recovery: selftest-app
 	@MAILSPACE_SELFTEST=recovery $(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
+
+## tabshot - render the tab bar offscreen to a PNG and print where it went
+##           No window ever reaches a display: the probe sets the activation
+##           policy to .prohibited and orders a deferred window out before the
+##           run loop turns. Every count and countdown in the shot is invented
+##           by the probe; nothing reads a real inbox or calendar.
+##
+##           SCENE=warnings (default) | indicators | precedence
+##           WIDTH=720 (default), and 860 is the main window's minimum.
+tabshot: selftest-app
+	@MAILSPACE_SELFTEST=tabshot \
+		MAILSPACE_TABSHOT_SCENE=$(or $(SCENE),warnings) \
+		MAILSPACE_TABSHOT_WIDTH=$(or $(WIDTH),720) \
+		MAILSPACE_TABSHOT_PATH=$(or $(OUT),$(BUILD_DIR)/tab-bar.png) \
+		$(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
 
 ## test - run the unit test suite
 test:

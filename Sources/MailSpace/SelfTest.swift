@@ -991,6 +991,10 @@ final class SettingsProbe: NSObject, AccountHosting {
     func tabWasDeselected(accountId: UUID, view: AccountView) {}
     func signedOutAccounts() -> Set<UUID> { [] }
     func stalledAccounts() -> Set<UUID> { [] }
+    func stalledTabs() -> Set<TabRef> { [] }
+    func unreadCount(for accountId: UUID) -> Int? { nil }
+    func calendarCountdownSeconds(for accountId: UUID) -> Int? { nil }
+    func calendarCountdownDescription(for accountId: UUID) -> String? { nil }
     func badgeInputsChanged(repoll: Bool) { badgeCalls.append(repoll) }
 
     func run() {

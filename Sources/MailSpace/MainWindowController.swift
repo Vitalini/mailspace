@@ -21,6 +21,19 @@ protocol AccountHosting: AnyObject {
     func signedOutAccounts() -> Set<UUID>
     /// Accounts whose Mail tab failed to reload and has not come back.
     func stalledAccounts() -> Set<UUID>
+    /// The same fact per tab, so a dead Calendar tab is marked on the Calendar
+    /// tab rather than on its working Mail sibling.
+    func stalledTabs() -> Set<TabRef>
+    /// This account's own unread count, or `nil` when nothing is known. One
+    /// number per account, read once and rendered twice — this and the Dock
+    /// badge are the same value (KTD-S7).
+    func unreadCount(for accountId: UUID) -> Int?
+    /// Seconds until this account's next event later today, or `nil` whenever
+    /// there is nothing honest to say — including when the setting is off.
+    func calendarCountdownSeconds(for accountId: UUID) -> Int?
+    /// The spoken form of the same number, for the tooltip. Generated from the
+    /// integer; it names no event.
+    func calendarCountdownDescription(for accountId: UUID) -> String?
     /// Something that feeds the Dock badge changed. `repoll` is for a change to
     /// what the number *means* (the badge scope); without it the existing
     /// counts are simply re-totalled.
@@ -251,10 +264,49 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             accounts: store.accounts,
             selection: selection,
             signedOut: host.signedOutAccounts(),
-            stalled: host.stalledAccounts()
+            stalledTabs: host.stalledTabs(),
+            indicators: indicatorLookup()
         )
         rebuildAccountsMenu()
         showActiveContent()
+    }
+
+    /// Redraws the tab indicators and nothing else (KTD-S8).
+    ///
+    /// This is the whole update path for a count that ticked over or a countdown
+    /// that lost a minute, and it deliberately does not go near `refresh()`:
+    /// that tears the active webview out of its container, re-pins it, moves
+    /// first responder and fires `tabBecameVisible`. Doing that from a
+    /// 30-second timer would take the caret out of a half-written reply twice a
+    /// minute and re-run crashed-content recovery on tabs that never crashed.
+    func refreshIndicators() {
+        tabBar.updateIndicators(indicatorLookup())
+    }
+
+    /// One place that assembles what every tab shows, so `rebuild` and
+    /// `refreshIndicators` can never disagree about it.
+    private func indicatorLookup() -> (TabRef) -> TabIndicator.State {
+        let signedOut = host.signedOutAccounts()
+        let stalledTabs = host.stalledTabs()
+        return { [host] tab in
+            let unread = host.unreadCount(for: tab.accountId)
+            let indicator = TabIndicator.resolve(
+                view: tab.view,
+                warning: AccountTabBar.warning(
+                    tab: tab, signedOut: signedOut, stalledTabs: stalledTabs
+                ),
+                unread: unread,
+                countdownSeconds: host.calendarCountdownSeconds(for: tab.accountId)
+            )
+            return TabIndicator.State(
+                indicator: indicator,
+                detail: TabIndicator.tooltipSuffix(
+                    indicator,
+                    unread: unread,
+                    countdownDescription: host.calendarCountdownDescription(for: tab.accountId)
+                )
+            )
+        }
     }
 
     /// Whether the content area already shows exactly this view and nothing
@@ -435,6 +487,9 @@ final class AccountTabBar: NSView {
 
     private(set) var tabCount = 0
     private var isDragging = false
+    /// Set while a whole pass of indicators is being written, so the row is
+    /// re-measured once at the end rather than once per changed tab.
+    private var isBatchingIndicators = false
 
     init() {
         super.init(frame: .zero)
@@ -513,26 +568,45 @@ final class AccountTabBar: NSView {
 
     /// Which warning this tab carries, if any.
     ///
-    /// The evidence for both is the account's *mail* webview — the feed probe,
-    /// the classified URL and the recycle target all live there — so the
-    /// warning is shown on the Mail tab, which is also the tab whose selection
-    /// is the recovery for either one.
+    /// The evidence for *signed out* is the account's mail webview — the feed
+    /// probe and the classified URL both live there — so it is shown on the
+    /// Mail tab, which is also the tab whose selection is the recovery for it.
+    /// *Not loading* is known per webview, so it goes on whichever tab is
+    /// actually dead.
     ///
     /// Signed-out wins when both are true. They are nearly disjoint in practice
     /// (a signed-out tab is not recycled at all, by G1), and if the session is
     /// gone *and* the tab will not load, the sign-in is the thing to fix.
-    static func warning(tab: TabRef, signedOut: Set<UUID>, stalled: Set<UUID> = []) -> TabWarning? {
-        guard tab.view == .mail else { return nil }
-        if signedOut.contains(tab.accountId) { return .signedOut }
-        if stalled.contains(tab.accountId) { return .notLoading }
-        return nil
+    ///
+    /// Whichever it is, it outranks the count or countdown that would otherwise
+    /// have the slot — see `TabIndicator.resolve`.
+    /// - Parameter stalled: dead tabs known only per account. Lands on the Mail
+    ///   tab, as it always has.
+    /// - Parameter stalledTabs: the same fact at tab resolution, which is what
+    ///   the live path supplies. A Calendar tab that will not load says so on
+    ///   *itself*; marking its Mail sibling would point the user at a tab that
+    ///   is working. Signed-out stays Mail-only either way, because its evidence
+    ///   really is the mail feed probe.
+    static func warning(
+        tab: TabRef,
+        signedOut: Set<UUID>,
+        stalled: Set<UUID> = [],
+        stalledTabs: Set<TabRef> = []
+    ) -> TabWarning? {
+        if tab.view == .mail {
+            if signedOut.contains(tab.accountId) { return .signedOut }
+            if stalled.contains(tab.accountId) { return .notLoading }
+        }
+        return stalledTabs.contains(tab) ? .notLoading : nil
     }
 
     func rebuild(
         accounts: [Account],
         selection: MainWindowController.Selection?,
         signedOut: Set<UUID> = [],
-        stalled: Set<UUID> = []
+        stalled: Set<UUID> = [],
+        stalledTabs: Set<TabRef> = [],
+        indicators: (TabRef) -> TabIndicator.State = { _ in .none }
     ) {
         for view in tabStack.arrangedSubviews {
             tabStack.removeArrangedSubview(view)
@@ -545,12 +619,23 @@ final class AccountTabBar: NSView {
         for tab in tabs {
             guard let account = accounts.first(where: { $0.id == tab.accountId }) else { continue }
             let isSelected = selection.map { $0.accountId == tab.accountId && $0.view == tab.view } ?? false
+            // A genuine rebuild — an account added, renamed, removed, a tab
+            // dragged, a service toggled — starts with the number it should
+            // already be showing, rather than flashing blank until the next
+            // tick of a poller.
+            var state = indicators(tab)
+            if state == .none {
+                state.indicator = Self.warning(
+                    tab: tab, signedOut: signedOut, stalled: stalled, stalledTabs: stalledTabs
+                ).map(TabIndicator.warning) ?? .none
+            }
             let tabView = AccountTabView(
                 account: account,
                 view: tab.view,
                 isSelected: isSelected,
-                warning: Self.warning(tab: tab, signedOut: signedOut, stalled: stalled)
+                state: state
             )
+            tabView.onNaturalWidthChanged = { [weak self] in self?.applyUniformTabWidth() }
             tabView.onClick = { [weak self] tab in self?.onSelectTab?(tab) }
             tabView.onEdit = { [weak self] id in self?.onEditAccount?(id) }
             tabView.onRemove = { [weak self] id in self?.onRemoveAccount?(id) }
@@ -565,6 +650,41 @@ final class AccountTabBar: NSView {
         tabStack.layoutSubtreeIfNeeded()
     }
 
+    /// Updates every tab's indicator in place — no teardown, no new views, no
+    /// webview touched, first responder where it was (KTD-S8).
+    ///
+    /// The row is re-laid-out only when an indicator appeared or disappeared.
+    /// A countdown ticking or a count climbing keeps the same fixed-width slot,
+    /// so under the equal-width rule the whole bar stays exactly as wide as it
+    /// was — which is the difference between a tab bar and a tab bar that
+    /// breathes once a minute.
+    func updateIndicators(_ indicators: (TabRef) -> TabIndicator.State) {
+        // Each tab that gains or loses its indicator would otherwise ask for a
+        // re-measure of the whole row on the spot, so a pass that changed three
+        // tabs would size the bar three times over. Held until the pass is done
+        // and then sized once.
+        isBatchingIndicators = true
+        var geometryChanged = false
+        for tabView in tabStack.arrangedSubviews.compactMap({ $0 as? AccountTabView }) {
+            let new = indicators(tabView.tab)
+            if TabIndicator.needsRelayout(from: tabView.state.indicator, to: new.indicator) {
+                geometryChanged = true
+            }
+            tabView.state = new
+        }
+        isBatchingIndicators = false
+
+        guard geometryChanged else { return }
+        applyUniformTabWidth()
+        tabStack.layoutSubtreeIfNeeded()
+    }
+
+    /// The tabs currently in the bar, so a test can assert on the row's
+    /// geometry without reaching through `arrangedSubviews` itself.
+    var tabViewsForTesting: [AccountTabView] {
+        tabStack.arrangedSubviews.compactMap { $0 as? AccountTabView }
+    }
+
     /// The bar's own width decides whether the tabs get what they asked for, so
     /// the rule is re-applied on every resize as well as on every rebuild.
     override func layout() {
@@ -577,6 +697,7 @@ final class AccountTabBar: NSView {
     /// Only changed widths are written back, so the layout pass this triggers
     /// settles on the second pass instead of looping.
     private func applyUniformTabWidth() {
+        guard !isBatchingIndicators else { return }
         let tabViews = tabStack.arrangedSubviews.compactMap { $0 as? AccountTabView }
         guard !tabViews.isEmpty else { return }
 
@@ -639,7 +760,7 @@ final class AccountTabBar: NSView {
 final class AccountTabView: NSView, NSDraggingSource {
     static let pasteboardType = NSPasteboard.PasteboardType("com.vitalii.MailSpace.tab")
 
-    private let tab: AccountTabBar.Tab
+    let tab: AccountTabBar.Tab
     private let tint: NSColor
     private let selected: Bool
 
@@ -647,15 +768,52 @@ final class AccountTabView: NSView, NSDraggingSource {
     var onEdit: ((UUID) -> Void)?
     var onRemove: ((UUID) -> Void)?
     var onDragBegan: (() -> Void)?
+    /// The tab has gained or lost its accessory, so the bar has to re-decide
+    /// the one width every tab shares.
+    var onNaturalWidthChanged: (() -> Void)?
 
     /// Set on mouse-down and cleared once a drag starts, so a press that never
     /// moves is a click and a press that moves is a reorder.
     private var pressOrigin: NSPoint?
 
+    /// The label's measured width, taken once at init in the selected weight.
+    private let labelWidth: CGFloat
+    private let baseDescription: String
+    private let label = NSTextField(labelWithString: "")
+    private let pill = TabAccessoryPill()
+    /// The two ways the content group can end: at the pill, or at the label
+    /// when there is no pill. Exactly one is active, which is what makes a
+    /// hidden accessory cost no width at all.
+    private var contentEndsAtPill: NSLayoutConstraint!
+    private var contentEndsAtLabel: NSLayoutConstraint!
+
+    /// What this tab's trailing slot is showing. Assigning it redraws the pill
+    /// and rewrites the words; it does not rebuild anything.
+    var state: TabIndicator.State {
+        didSet {
+            guard state != oldValue else { return }
+            let changedGeometry = TabIndicator.needsRelayout(
+                from: oldValue.indicator, to: state.indicator
+            )
+            applyState()
+            guard changedGeometry else { return }
+            invalidateIntrinsicContentSize()
+            onNaturalWidthChanged?()
+        }
+    }
+
     /// What this tab would like to be, measured from its own content. The bar
     /// collects these, takes the widest, and hands every tab the same
     /// `assignedWidth`.
-    let naturalWidth: CGFloat
+    ///
+    /// Computed rather than stored, because an indicator that appears has to
+    /// widen this tab — and, under the equal-width rule, every tab beside it.
+    var naturalWidth: CGFloat {
+        TabMetrics.naturalWidth(
+            labelWidth: labelWidth,
+            accessoryWidth: state.indicator.accessoryWidth
+        )
+    }
 
     /// The width the bar has decided every tab gets. Same for every tab in the
     /// bar, always.
@@ -670,32 +828,25 @@ final class AccountTabView: NSView, NSDraggingSource {
         NSSize(width: assignedWidth, height: TabMetrics.height)
     }
 
-    /// - Parameter accessoryWidth: room reserved at the trailing end for an
-    ///   optional accessory — the per-account unread pill of plan unit U10.
-    ///   Reserving it in the measurement is what makes a tab that gains a pill
-    ///   grow instead of squeezing its label.
+    /// - Parameter state: what the trailing accessory slot shows — the health
+    ///   warning, the account's unread count, or the Calendar countdown. One
+    ///   slot, one width, and `TabIndicator` decides which of the three gets it.
     init(
         account: Account,
         view: AccountView,
         isSelected: Bool,
-        warning: TabWarning? = nil,
-        accessoryWidth: CGFloat? = nil
+        state: TabIndicator.State = .none
     ) {
         self.tab = AccountTabBar.Tab(accountId: account.id, view: view)
         self.tint = account.color.nsColor
         self.selected = isSelected
+        self.state = state
 
         let labelText = "\(account.name) · \(view.displayName)"
-        // A warning pill lives in the same trailing accessory slot, so a tab
-        // that carries one is measured with the slot reserved. Without this the
-        // pill would eat the label's room instead of widening the tab — and
-        // because the bar sizes every tab by the widest, all its siblings too.
-        self.naturalWidth = TabMetrics.naturalWidth(
-            // Measured in the selected weight whatever this tab's state is, so
-            // selecting a tab never resizes the row.
-            labelWidth: TabMetrics.textWidth(labelText, font: TabMetrics.measurementFont),
-            accessoryWidth: accessoryWidth ?? (warning != nil ? SignedOutPill.size.width : nil)
-        )
+        // Measured in the selected weight whatever this tab's state is, so
+        // selecting a tab never resizes the row.
+        self.labelWidth = TabMetrics.textWidth(labelText, font: TabMetrics.measurementFont)
+        self.baseDescription = account.email.isEmpty ? labelText : "\(labelText) — \(account.email)"
         super.init(frame: .zero)
 
         wantsLayer = true
@@ -708,38 +859,35 @@ final class AccountTabView: NSView, NSDraggingSource {
         icon.contentTintColor = isSelected ? tint : tint.withAlphaComponent(0.75)
         icon.translatesAutoresizingMaskIntoConstraints = false
 
-        let label = NSTextField(labelWithString: labelText)
+        label.stringValue = labelText
         label.font = TabMetrics.labelFont(selected: isSelected)
         label.textColor = isSelected ? .labelColor : .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         // The tab's width is the bar's decision. When it is not enough for the
         // full name, the label is the part that gives way — with a tail
-        // ellipsis, and the whole name still in the tooltip.
+        // ellipsis, and the whole name still in the tooltip. The pill opposite
+        // it resists to `.required`, so a narrow tab truncates the account name
+        // and never the number.
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
-
-        let base = account.email.isEmpty ? labelText : "\(labelText) — \(account.email)"
-        toolTip = warning?.tooltip ?? base
-        setAccessibilityLabel(warning.map { "\(base). \($0.accessibilitySuffix)" } ?? base)
 
         addSubview(icon)
         addSubview(label)
 
-        // The trailing accessory slot. Signed-out and an unread count are
-        // mutually exclusive by construction — an account whose feed cannot be
-        // read has no count — so this one slot carries whichever is true, and
-        // the warning costs no tab width that the unread pill was not already
-        // going to take.
+        // The trailing accessory slot, built once and kept. Three things want
+        // it — the health warning, the unread count, the Calendar countdown —
+        // and `TabIndicator` decides which one gets it, with the warning always
+        // winning. Rendering it in place rather than rebuilding the tab is what
+        // lets a count tick over without touching the webview under it.
         //
-        // Filled orange rather than the account tint on purpose: every other
-        // element in this bar is tinted with the account colour, so the single
-        // non-tint thing in the tab bar is the one thing that cannot be read as
-        // "this is the purple account".
-        let pill: SignedOutPill? = warning != nil ? SignedOutPill() : nil
-        if let pill {
-            pill.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(pill)
-        }
+        // The warning is filled orange rather than the account tint on purpose:
+        // every other element in this bar is tinted with the account colour, so
+        // the single non-tint thing in the tab bar is the one thing that cannot
+        // be read as "this is the purple account".
+        pill.configure(tint: tint, selected: isSelected)
+        pill.setContentCompressionResistancePriority(.required, for: .horizontal)
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(pill)
 
         // Icon, label and any accessory travel as one group, centred in
         // whatever width the bar hands out. Left-aligning them would leave a
@@ -752,9 +900,11 @@ final class AccountTabView: NSView, NSDraggingSource {
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        contentEndsAtPill = content.trailingAnchor.constraint(equalTo: pill.trailingAnchor)
+        contentEndsAtLabel = content.trailingAnchor.constraint(equalTo: label.trailingAnchor)
+
         NSLayoutConstraint.activate([
             content.leadingAnchor.constraint(equalTo: icon.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: pill?.trailingAnchor ?? label.trailingAnchor),
             content.centerXAnchor.constraint(equalTo: centerXAnchor),
             content.leadingAnchor.constraint(
                 greaterThanOrEqualTo: leadingAnchor, constant: TabMetrics.horizontalPadding
@@ -775,16 +925,18 @@ final class AccountTabView: NSView, NSDraggingSource {
             heightAnchor.constraint(equalToConstant: TabMetrics.height)
         ])
 
-        if let pill {
-            NSLayoutConstraint.activate([
-                pill.leadingAnchor.constraint(
-                    equalTo: label.trailingAnchor, constant: TabMetrics.accessorySpacing
-                ),
-                pill.centerYAnchor.constraint(equalTo: centerYAnchor),
-                pill.widthAnchor.constraint(equalToConstant: SignedOutPill.size.width),
-                pill.heightAnchor.constraint(equalToConstant: SignedOutPill.size.height)
-            ])
-        }
+        NSLayoutConstraint.activate([
+            pill.leadingAnchor.constraint(
+                equalTo: label.trailingAnchor, constant: TabMetrics.accessorySpacing
+            ),
+            pill.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // One width for every indicator, fixed for the life of the tab.
+            // This is the constraint that stops a ticking countdown from
+            // resizing the whole row.
+            pill.widthAnchor.constraint(equalToConstant: TabIndicator.slotWidth),
+            pill.heightAnchor.constraint(equalToConstant: SignedOutPill.size.height)
+        ])
+        applyState()
 
         let contextMenu = NSMenu()
         let settings = contextMenu.addItem(withTitle: "Account Settings…", action: #selector(edit(_:)), keyEquivalent: "")
@@ -796,6 +948,35 @@ final class AccountTabView: NSView, NSDraggingSource {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used — the UI is built programmatically") }
+
+    /// Draws the slot and writes the words for it. Everything here is a
+    /// property assignment — nothing is added, removed or re-created, which is
+    /// the whole point of doing this outside `refresh()` (KTD-S8).
+    private func applyState() {
+        let indicator = state.indicator
+        pill.indicator = indicator
+        pill.isHidden = !indicator.isPresent
+        // A hidden accessory has to cost no width, not just no ink: the content
+        // group ends at the label instead, so the tab is exactly as wide as it
+        // was before the indicator existed.
+        contentEndsAtPill.isActive = indicator.isPresent
+        contentEndsAtLabel.isActive = !indicator.isPresent
+
+        if case .warning(let warning) = indicator {
+            // A warning replaces the description rather than extending it:
+            // what the tab is showing is no longer about this account's mail.
+            toolTip = warning.tooltip
+            setAccessibilityLabel("\(baseDescription). \(warning.accessibilitySuffix)")
+            return
+        }
+        guard let detail = state.detail else {
+            toolTip = baseDescription
+            setAccessibilityLabel(baseDescription)
+            return
+        }
+        toolTip = "\(baseDescription) — \(detail)"
+        setAccessibilityLabel("\(baseDescription). \(detail)")
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let body = bounds.insetBy(dx: 0.5, dy: 0.5)
@@ -915,6 +1096,12 @@ final class SignedOutPill: NSView {
     override var intrinsicContentSize: NSSize { Self.size }
 
     override func draw(_ dirtyRect: NSRect) {
+        Self.drawWarning(in: bounds)
+    }
+
+    /// The orange capsule and its glyph, so the shared accessory slot and this
+    /// view draw the identical thing rather than two lookalikes.
+    static func drawWarning(in bounds: NSRect) {
         let body = bounds.insetBy(dx: 0.5, dy: 0.5)
         NSColor.systemOrange.withAlphaComponent(0.9).setFill()
         NSBezierPath(roundedRect: body, xRadius: body.height / 2, yRadius: body.height / 2).fill()
@@ -947,6 +1134,69 @@ final class SignedOutPill: NSView {
             return true
         }
         glyph.draw(in: rect)
+    }
+}
+
+/// The one accessory in a tab's trailing slot, whichever of the three it is
+/// currently showing (U10, U11).
+///
+/// A single view rather than one per kind, because the slot has to change what
+/// it says without the tab being rebuilt around it: assigning `indicator` is a
+/// redraw, and a redraw does not move first responder or disturb the webview.
+/// Its width is fixed by the tab, so what it draws never changes its size.
+final class TabAccessoryPill: NSView {
+    var indicator: TabIndicator = .none {
+        didSet {
+            guard indicator != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var tint: NSColor = .secondaryLabelColor
+    private var selected = false
+
+    func configure(tint: NSColor, selected: Bool) {
+        self.tint = tint
+        self.selected = selected
+        needsDisplay = true
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: TabIndicator.slotWidth, height: SignedOutPill.size.height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let text: String
+        switch indicator {
+        case .none:
+            return
+        case .warning:
+            SignedOutPill.drawWarning(in: bounds)
+            return
+        case .count(let value), .countdown(let value):
+            text = value
+        }
+
+        // The same "the account tint is always present, selection deepens it"
+        // rule the tab body and the icon already follow, at the same two
+        // strengths. A low-alpha tint fill against the light chrome stays
+        // legible for all eight palette entries — the number is never
+        // white-on-saturated.
+        let body = bounds.insetBy(dx: 0.5, dy: 0.5)
+        tint.withAlphaComponent(selected ? 0.28 : 0.14).setFill()
+        NSBezierPath(roundedRect: body, xRadius: body.height / 2, yRadius: body.height / 2).fill()
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: TabIndicator.font,
+            .foregroundColor: selected ? NSColor.labelColor : NSColor.secondaryLabelColor
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        // Centred in the fixed slot, so `(5m)` and `(45m)` sit in the same
+        // place rather than growing out of one edge.
+        (text as NSString).draw(
+            at: NSPoint(x: body.midX - size.width / 2, y: body.midY - size.height / 2),
+            withAttributes: attributes
+        )
     }
 }
 

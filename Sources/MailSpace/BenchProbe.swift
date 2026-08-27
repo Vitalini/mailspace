@@ -474,25 +474,119 @@ final class AssumptionProbe: NSObject, WKNavigationDelegate {
 /// Renders the tab bar offscreen and writes it to a PNG, so the signed-out
 /// signal can be reviewed without a window ever reaching a display.
 final class TabShotProbe {
+    /// What one account contributes to a scene. Every number here is invented
+    /// for the shot — nothing reads a real inbox or a real calendar.
+    private struct Row {
+        let account: Account
+        var unread: Int?
+        var countdownSeconds: Int?
+        var signedOut = false
+        var stalledViews: Set<AccountView> = []
+    }
+
     func run() {
         NSApp.setActivationPolicy(.prohibited)
-        let path = ProcessInfo.processInfo.environment["MAILSPACE_TABSHOT_PATH"]
+        let environment = ProcessInfo.processInfo.environment
+        let path = environment["MAILSPACE_TABSHOT_PATH"]
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("tab-bar.png").path
+        let scene = environment["MAILSPACE_TABSHOT_SCENE"] ?? "warnings"
+        let width = environment["MAILSPACE_TABSHOT_WIDTH"]
+            .flatMap { Double($0) }
+            .map { CGFloat($0) } ?? 720
 
-        let personal = Account(name: "Personal", email: "personal@example.com", color: .purple)
-        let work = Account(name: "Talkable", email: "work@example.com", color: .teal)
-        let side = Account(name: "Side Project", email: "side@example.com", color: .orange)
-        let accounts = [personal, work, side]
+        let rows: [Row]
+        switch scene {
+        case "indicators":
+            // Two accounts, both services each. Mail tabs carry their own
+            // number, one Calendar tab counts down and the other has nothing
+            // left today — which has to render as nothing, not as a zero.
+            rows = [
+                Row(
+                    account: Account(name: "Personal", email: "personal@example.com", color: .purple),
+                    unread: 12,
+                    countdownSeconds: 2700
+                ),
+                Row(
+                    account: Account(name: "Work", email: "work@example.com", color: .teal),
+                    unread: 4231
+                )
+            ]
+        case "precedence":
+            // The rule, drawn: an account that is signed out while it still
+            // holds a count shows the warning and not the number, and a
+            // Calendar tab that will not load shows the warning and not its
+            // countdown.
+            rows = [
+                Row(
+                    account: Account(name: "Personal", email: "personal@example.com", color: .purple),
+                    unread: 12,
+                    countdownSeconds: 2700,
+                    signedOut: true
+                ),
+                Row(
+                    account: Account(name: "Work", email: "work@example.com", color: .teal),
+                    unread: 7,
+                    countdownSeconds: 300,
+                    stalledViews: [.calendar]
+                )
+            ]
+        default:
+            // One of each warning beside a healthy tab, so the shot shows that
+            // both fit the uniform width rather than squeezing their labels.
+            rows = [
+                Row(account: Account(name: "Personal", email: "personal@example.com", color: .purple)),
+                Row(
+                    account: Account(name: "Talkable", email: "work@example.com", color: .teal),
+                    signedOut: true
+                ),
+                Row(
+                    account: Account(name: "Side Project", email: "side@example.com", color: .orange),
+                    stalledViews: [.mail]
+                )
+            ]
+        }
+
+        let accounts = rows.map(\.account)
+        let byId = Dictionary(uniqueKeysWithValues: rows.map { ($0.account.id, $0) })
+        let signedOut = Set(rows.filter(\.signedOut).map(\.account.id))
+        let stalledTabs = Set(
+            rows.flatMap { row in
+                row.stalledViews.map { TabRef(accountId: row.account.id, view: $0) }
+            }
+        )
 
         let bar = AccountTabBar()
-        bar.frame = NSRect(x: 0, y: 0, width: 720, height: AccountTabBar.height)
-        // One of each warning beside a healthy tab, so the shot shows that both
-        // fit the uniform width rather than squeezing their labels.
+        bar.frame = NSRect(x: 0, y: 0, width: width, height: AccountTabBar.height)
         bar.rebuild(
             accounts: accounts,
-            selection: MainWindowController.Selection(accountId: personal.id, view: .mail),
-            signedOut: [work.id],
-            stalled: [side.id]
+            selection: accounts.first.map {
+                MainWindowController.Selection(accountId: $0.id, view: .mail)
+            },
+            signedOut: signedOut,
+            stalledTabs: stalledTabs,
+            // Through the shipped rule, not a hand-painted mock: what the shot
+            // shows is what `TabIndicator.resolve` decides.
+            indicators: { tab in
+                let row = byId[tab.accountId]
+                let indicator = TabIndicator.resolve(
+                    view: tab.view,
+                    warning: AccountTabBar.warning(
+                        tab: tab, signedOut: signedOut, stalledTabs: stalledTabs
+                    ),
+                    unread: row?.unread,
+                    countdownSeconds: row?.countdownSeconds
+                )
+                return TabIndicator.State(
+                    indicator: indicator,
+                    detail: TabIndicator.tooltipSuffix(
+                        indicator,
+                        unread: row?.unread,
+                        countdownDescription: row?.countdownSeconds.flatMap {
+                            CalendarCountdown.longForm(secondsUntilStart: $0)
+                        }
+                    )
+                )
+            }
         )
         bar.layoutSubtreeIfNeeded()
 
@@ -522,6 +616,9 @@ final class TabShotProbe {
         } catch {
             SelfTest.finish("tabshot result=write-failed error=\(error.localizedDescription)")
         }
-        SelfTest.finish("tabshot result=ok path=\(path) bytes=\(data.count)")
+        SelfTest.finish(
+            "tabshot result=ok scene=\(scene) width=\(Int(width)) tabs=\(bar.tabCount) "
+            + "path=\(path) bytes=\(data.count)"
+        )
     }
 }
