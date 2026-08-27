@@ -4,9 +4,17 @@ import WebKit
 /// Decides which URLs belong inside MailSpace and which belong to the user's
 /// browser. Pure logic, kept separate from the delegate so it can be tested.
 enum LinkRouter {
-    /// Hosts (and their subdomains) that are part of the Gmail/Calendar
-    /// experience and must keep the account's session. Deliberately excludes
-    /// youtube.com — a video link is browser work.
+    /// Hosts (and their subdomains) that serve the *material* of the two
+    /// surfaces rather than pages of their own: attachment bodies and inline
+    /// images (`googleusercontent.com`), static assets (`gstatic.com`), the
+    /// XHR endpoints Gmail and Calendar call (`googleapis.com`), and Gmail's
+    /// alternate domain (`googlemail.com`, which serves nothing but Gmail).
+    ///
+    /// None of these is a destination a person means to visit, and the browser
+    /// cannot fetch them anyway — an attachment body is readable only inside
+    /// the account's session, which lives in this app's data store and nowhere
+    /// else. Deliberately no `google.com`: that is where Docs, Drive, Meet,
+    /// Maps and the rest live, and those are browser work.
     private static let inAppHosts = [
         "googlemail.com",
         "googleusercontent.com",
@@ -37,8 +45,10 @@ enum LinkRouter {
 
     /// What should happen to a URL the webview wants to go to.
     enum Destination: Equatable {
-        /// Stays in the webview: Google pages, and every non-web URL the page
-        /// drives itself (`about:blank`, `blob:`, `data:`, `javascript:`).
+        /// Stays in the webview: this account's own Gmail and Calendar, the
+        /// sign-in chain, the assets those surfaces load, and every non-web URL
+        /// the page drives itself (`about:blank`, `blob:`, `data:`,
+        /// `javascript:`).
         case allowInApp
         /// A real web page somewhere else — the user's browser owns it.
         case openExternally(URL)
@@ -100,12 +110,113 @@ enum LinkRouter {
         return false
     }
 
+    /// Whether a page belongs inside MailSpace.
+    ///
+    /// MailSpace hosts exactly two surfaces per account — its Gmail and its
+    /// Calendar — and nothing else. It used to host *Google*, which is not the
+    /// same thing at all: a calendar event's links are overwhelmingly Google
+    /// links (Meet, Docs, Drive, Maps, Groups, a `google.com/url` wrapper), so
+    /// clicking one satisfied "is Google, keep in-app" and got an in-app popup
+    /// window with no address bar, no history and no extensions, instead of the
+    /// browser the user asked for. Three things stay, each for a reason:
+    ///
+    /// - **The two surfaces**, via `AuthSurface.classify`, which already knows
+    ///   `mail.google.com/mail/…` and `calendar.google.com/calendar/…` from
+    ///   their marketing and help pages. This covers in-page navigation and the
+    ///   modal popups Gmail and Calendar open onto themselves — print preview,
+    ///   attachment and "show original" views, compose-in-a-new-window. Those
+    ///   are not destinations; they are the mail UI in a second window, they
+    ///   read the account's session, and the browser has no access to it.
+    /// - **The whole sign-in chain**, by host. Handing `accounts.google.com` to
+    ///   the browser would strand the sign-in: the browser cannot see this
+    ///   account's data store, so whatever it signed in would not be this tab.
+    ///   (A Workspace bounce to a customer's own identity provider leaves
+    ///   Google entirely and is covered separately, by `SSOEscort`.)
+    /// - **The asset hosts** in `inAppHosts`, which are payloads, not pages.
+    ///
+    /// Everything else — every other Google product included — is the browser's.
     static func isInApp(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
-        guard let host = url.host?.lowercased() else { return false }
+        guard let host = webHost(of: url) else { return false }
+
+        if inAppHosts.contains(where: { matches(host: host, domain: $0) }) { return true }
+        // By host rather than by `classify`, so the sign-up screen the chain
+        // offers stays with the chain instead of being posted to the browser
+        // halfway through signing in.
+        if AuthSurface.isSignInHost(host) { return true }
+        if case .app = AuthSurface.classify(url) { return true }
+        return false
+    }
+
+    /// Whether the page is Google's at all — the two surfaces, every other
+    /// Google product, and the asset hosts.
+    ///
+    /// Not a routing decision: routing asks `isInApp`, which is far narrower.
+    /// This answers the *security* question "is the tab still on Google", which
+    /// is what `AuthSurface.provenance` and `SSOEscort` turn on. They have to
+    /// keep asking the broad question: a commit on `drive.google.com` ends a
+    /// sign-in chain, and must not instead be read as "a foreign page rendered"
+    /// and pin an escort pass to it.
+    static func isGoogleProperty(_ url: URL) -> Bool {
+        guard let host = webHost(of: url) else { return false }
 
         if inAppHosts.contains(where: { matches(host: host, domain: $0) }) { return true }
         return isGoogleDomain(host)
+    }
+
+    /// The host of a real web URL, lowercased. `nil` for everything a page
+    /// drives itself — `about:`, `blob:`, `data:`, `javascript:`, `mailto:` —
+    /// none of which has a host to reason about.
+    private static func webHost(of url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        return url.host?.lowercased()
+    }
+
+    /// The URL actually handed to the browser.
+    ///
+    /// The browser resolves a Google link against whichever Google account *it*
+    /// is signed into, which need not be the MailSpace account the link came
+    /// from — a Docs link out of a work inbox opening as a personal identity is
+    /// an access-denied page at best and the wrong document at worst.
+    /// `authuser=<address>` asks Google for the right one by name.
+    ///
+    /// Narrow on purpose:
+    /// - only a Google host, because the address is the user's and has no
+    ///   business travelling to anyone else's server;
+    /// - only when the link does not already name an account, so Google's own
+    ///   `authuser=` and `/u/N/` always win;
+    /// - the address, never the `/u/N` index, because every MailSpace account
+    ///   is `/u/0/` in its own store while `/u/0` in a browser means "whichever
+    ///   account signed in there first" — copying the index across would name
+    ///   the wrong account with confidence.
+    static func forBrowser(_ url: URL, accountEmail: String?) -> URL {
+        guard
+            let email = accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines), !email.isEmpty,
+            isGoogleProperty(url),
+            !namesAnAccount(url),
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return url }
+
+        // Percent-encoded by hand: a `+` in an address is a legal query
+        // character, so `URLQueryItem` would leave it alone and Google would
+        // read it as a space.
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~@"))
+        let encoded = email.addingPercentEncoding(withAllowedCharacters: allowed) ?? email
+        components.percentEncodedQueryItems =
+            (components.percentEncodedQueryItems ?? []) + [URLQueryItem(name: "authuser", value: encoded)]
+        return components.url ?? url
+    }
+
+    /// Whether the link already says which Google account it is for: `authuser`
+    /// in the query, or Google's `/u/N/` path index (`/mail/u/0/`,
+    /// `/document/u/1/d/…`).
+    static func namesAnAccount(_ url: URL) -> Bool {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if items.contains(where: { $0.name.lowercased() == "authuser" }) { return true }
+
+        let segments = url.path.split(separator: "/")
+        return segments.indices.contains { index in
+            segments[index] == "u" && index + 1 < segments.count && segments[index + 1].allSatisfy(\.isNumber)
+        }
     }
 
     /// `host` is `domain` itself or a subdomain of it. The dot matters:
@@ -300,7 +411,10 @@ enum AuthSurface {
             return .keep
         case .other:
             guard let url else { return .keep }
-            return LinkRouter.isInApp(url) ? .clear : .keep
+            // `isGoogleProperty`, not `isInApp`: the question here is whether
+            // the tab is still on Google, and a Drive preview is a Google page
+            // that ends the chain even though routing sends it to the browser.
+            return LinkRouter.isGoogleProperty(url) ? .clear : .keep
         }
     }
 
@@ -452,7 +566,11 @@ enum SSOEscort {
             return pass
         }
 
-        guard !LinkRouter.isInApp(url) else {
+        // `isGoogleProperty`, not `isInApp`: a Google page the router sends to
+        // the browser (a Drive preview, `myaccount.google.com`) still ends the
+        // chain. Reading it as "a foreign page rendered" would pin the pass to
+        // a Google host and keep it alive instead.
+        guard !LinkRouter.isGoogleProperty(url) else {
             // An app surface is left alone — `didFinish` there is what completes
             // the sign-in, and completing it drops the pass. Any other Google
             // page ends the chain, delegated authorization endpoints included.
@@ -584,9 +702,11 @@ struct CrashThrottle {
 
 /// The single navigation/UI delegate shared by every account webview.
 ///
-/// - non-Google links leave for the default browser (R12)
-/// - Google popups (sign-in, print) open as in-app child windows on the same
-///   session, using the exact configuration WebKit hands over (KTD7)
+/// - every link that is not this account's own Gmail or Calendar leaves for the
+///   default browser, Google's other products included (R12)
+/// - the popups that are part of the mail and calendar UI — sign-in, print,
+///   attachment preview, compose in a new window — open as in-app child windows
+///   on the same session, using the exact configuration WebKit hands over (KTD7)
 /// - downloads land in `~/Downloads` (R13)
 final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate, WebViewDiscarding {
     /// Handles a `mailto:` link clicked inside a webview.
@@ -596,6 +716,12 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// than reached for: the notification centre belongs to
     /// `NotificationBridge`, which is the app's only delegate for it.
     var notifyDownloadFinished: ((URL) -> Void)?
+
+    /// The address of the account a webview belongs to, so a Google link handed
+    /// to the browser can name the account it came from (`LinkRouter.forBrowser`).
+    /// Injected like the closures above — the account list belongs to
+    /// `AccountStore`, and this object only ever sees data stores.
+    var accountEmail: ((UUID) -> String?)?
 
     /// Injected the same way the closures above are (KTD-S3) — no global
     /// lookup, and a probe can hand in its own scratch domain.
@@ -657,14 +783,25 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// `activates = false` keeps MailSpace frontmost when the browser is
     /// already running; a browser launching cold activates itself and nothing
     /// here stops it, which is what the checkbox's sublabel says.
-    private func openExternally(_ url: URL, commandHeld: Bool = false) {
+    ///
+    /// `from` is the webview the click happened in, which is how a Google link
+    /// carries its account across (`LinkRouter.forBrowser`).
+    private func openExternally(_ url: URL, from webView: WKWebView?, commandHeld: Bool = false) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = Self.activatesBrowser(
             openInBackground: settings.openLinksInBackground,
             commandHeld: commandHeld
         )
         configuration.addsToRecentItems = false
-        NSWorkspace.shared.open(url, configuration: configuration)
+        NSWorkspace.shared.open(LinkRouter.forBrowser(url, accountEmail: email(of: webView)), configuration: configuration)
+    }
+
+    /// The address behind a webview's data store, if the app knows one. Every
+    /// account webview runs on a store identified by the account's `id`, so
+    /// this is the only link between a page and the identity it belongs to.
+    private func email(of webView: WKWebView?) -> String? {
+        guard let accountId = webView?.configuration.websiteDataStore.identifier else { return nil }
+        return accountEmail?(accountId)
     }
 
     /// Whether handing the link over is allowed to take the screen (G2).
@@ -729,9 +866,38 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             decisionHandler(.cancel)
 
         case .openExternally(let url):
-            openExternally(url, commandHeld: navigationAction.modifierFlags.contains(.command))
+            openExternally(url, from: webView, commandHeld: navigationAction.modifierFlags.contains(.command))
             decisionHandler(.cancel)
+            closeIfNothingLeftToShow(webView, isMainFrameTarget: isMainFrameTarget)
         }
+    }
+
+    /// Closes a popup window whose only reason to exist has just gone to the
+    /// browser.
+    ///
+    /// WebKit asks for the window before the page says where it is going —
+    /// `window.open()` and then `location = …` — so a link that belongs in the
+    /// browser can only be recognised once the navigation arrives, by which
+    /// time an empty window is already on screen. Nothing has rendered in it,
+    /// so there is nothing to lose by closing it, and leaving it would put back
+    /// exactly the blank popup this routing exists to get rid of.
+    private func closeIfNothingLeftToShow(_ webView: WKWebView, isMainFrameTarget: Bool) {
+        guard Self.shouldCloseEmptyPopup(
+            isPopup: popupWindows[ObjectIdentifier(webView)] != nil,
+            hasRenderedAPage: webView.url != nil,
+            isMainFrameTarget: isMainFrameTarget
+        ) else { return }
+
+        // Never tear a webview down from inside its own navigation callback.
+        DispatchQueue.main.async { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            self.closePopup(hosting: webView)
+        }
+    }
+
+    /// Pure, so the rule is covered by a test rather than by a real popup.
+    static func shouldCloseEmptyPopup(isPopup: Bool, hasRenderedAPage: Bool, isMainFrameTarget: Bool) -> Bool {
+        isPopup && !hasRenderedAPage && isMainFrameTarget
     }
 
     /// Asks this webview's `SSOEscort` pass to cover one navigation, and spends
@@ -962,8 +1128,9 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             switch LinkRouter.destination(for: requested) {
             case .openExternally(let url):
                 // A `window.open` has no navigation action of its own to read a
-                // modifier from, so it follows the setting alone.
-                openExternally(url)
+                // modifier from, so it follows the setting alone. The opener is
+                // the webview whose account the link belongs to.
+                openExternally(url, from: webView)
                 return nil
             case .compose(let mailto):
                 mailtoHandler?(mailto)

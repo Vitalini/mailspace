@@ -167,6 +167,39 @@ final class SSOEscortTests: XCTestCase {
         XCTAssertEqual(tab.navigate(to: url("https://mfa.company.example/push")), .allowInApp)
     }
 
+    /// Routing now sends Google's other products to the browser, so a page like
+    /// a Drive preview is something an escort has a say over. A live pass covers
+    /// it: the pass exists to let a sign-in finish, and stranding a chain that
+    /// hops through a Google page is the worse failure. It is self-limiting —
+    /// committing that page ends the chain, so exactly one such hop is possible
+    /// and ordinary routing resumes immediately after.
+    func testAGooglePageDuringASignInIsCoveredByThePassAndThenEndsIt() {
+        var tab = Tab(pass: nil, now: start)
+        tab.commit(url("https://accounts.google.com/v3/signin/identifier"))
+
+        let drive = url("https://drive.google.com/file/d/abc/preview")
+        XCTAssertEqual(tab.navigate(to: drive), .allowInApp)
+        tab.commit(drive)
+        XCTAssertNil(tab.pass, "an ordinary Google page ends the chain")
+
+        XCTAssertEqual(tab.navigate(to: drive), .openExternally(drive), "and the browser owns it from then on")
+    }
+
+    /// With no sign-in in flight — the normal state of a signed-in tab — a
+    /// Google product link leaves for the browser.
+    func testWithoutAPassGoogleProductsGoToTheBrowser() {
+        var tab = Tab(pass: nil, now: start)
+        tab.commit(url("https://mail.google.com/mail/u/0/"))
+
+        for candidate in [
+            "https://meet.google.com/abc-defg-hij",
+            "https://docs.google.com/document/d/1a2b/edit",
+            "https://www.google.com/maps/place/Kyiv"
+        ] {
+            XCTAssertEqual(tab.navigate(to: url(candidate)), .openExternally(url(candidate)), "should leave: \(candidate)")
+        }
+    }
+
     // MARK: - Arming
 
     func testOnlyARealSignInStepArmsAPass() {

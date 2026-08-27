@@ -10,6 +10,17 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Changed
+- Links open in your browser, Google's own products included — Meet, Docs,
+  Drive, Maps, a search result. Only this account's Gmail and Calendar, the
+  sign-in pages, and the mail window's own popups (print, attachment preview,
+  compose in a new window) stay inside MailSpace, so a link in a calendar event
+  no longer opens in a bare in-app window with no address bar.
+- A Google link handed to the browser names the account it was clicked in, so a
+  document from a work inbox does not open as whichever account the browser is
+  signed into. The browser has to be signed into that account already;
+  otherwise Google asks which one to use.
+
 ## [1.0.3] - 2026-08-26
 
 ### Added

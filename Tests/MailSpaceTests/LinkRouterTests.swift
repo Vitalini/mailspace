@@ -12,19 +12,82 @@ final class LinkRouterTests: XCTestCase {
 
     // MARK: - In-app classification
 
-    func testGoogleHostsStayInApp() {
+    /// The three things MailSpace hosts: the account's own two surfaces, the
+    /// sign-in chain that keeps them signed in, and the assets they load.
+    func testOwnSurfacesSignInAndAssetsStayInApp() {
         for candidate in [
+            // The surfaces themselves, and navigation inside them.
             "https://mail.google.com/mail/u/0/",
+            "https://mail.google.com/mail/u/0/#inbox/FMfcgz",
+            "https://mail.google.com/mail/u/0/#search/from%3Aboss",
+            "https://mail.googlemail.com/mail/u/0/",
             "https://calendar.google.com/calendar/u/0/r",
+            "https://calendar.google.com/calendar/u/0/r/day/2026/8/27",
+            "https://calendar.google.com/calendar/u/0/r/eventedit/abc123",
+            // The modal popups that are the mail UI in a second window, not a
+            // destination: print preview, "show original", attachment view,
+            // compose in a new window. All of them read the account's session,
+            // which exists only in this app's data store.
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc&view=pt&search=inbox",
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc&view=om",
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc&view=att&disp=safe",
+            "https://mail.google.com/mail/u/0/?view=cm&fs=1&tf=1",
+            // The sign-in chain. The browser cannot see this account's data
+            // store, so sending any of this away strands the sign-in.
             "https://accounts.google.com/ServiceLogin",
-            "https://google.com",
-            "https://www.google.co.uk/search",
-            "https://drive.google.de/",
+            "https://accounts.google.com/v3/signin/identifier?continue=https://mail.google.com/mail/u/0/",
+            "https://accounts.google.com/signin/challenge/totp",
+            "https://accounts.google.co.uk/ServiceLogin",
+            "https://gds.google.com/web/challenge",
+            "https://consent.google.com/m?continue=https://mail.google.com/",
+            "https://accounts.youtube.com/accounts/SetSID",
+            // Payloads rather than pages: an attachment body, an inline image,
+            // a stylesheet, an XHR endpoint.
+            "https://mail-attachment.googleusercontent.com/attachment/u/0/?view=att",
             "https://lh3.googleusercontent.com/avatar.png",
             "https://ssl.gstatic.com/ui/v1/icons/mail.png",
+            "https://www.googleapis.com/gmail/v1/users/me/messages",
             "https://mail.googlemail.com/"
         ] {
             XCTAssertTrue(LinkRouter.isInApp(url(candidate)), "expected in-app: \(candidate)")
+        }
+    }
+
+    /// The complaint this rule exists for: a calendar event's links are mostly
+    /// *Google* links, and "is Google, keep in-app" put every one of them in an
+    /// in-app popup window with no address bar instead of the browser.
+    func testOtherGoogleProductsGoToTheBrowser() {
+        for candidate in [
+            "https://meet.google.com/abc-defg-hij",
+            "https://docs.google.com/document/d/1a2b3c/edit",
+            "https://docs.google.com/spreadsheets/d/1a2b3c/edit#gid=0",
+            "https://docs.google.com/presentation/d/1a2b3c/edit",
+            "https://drive.google.com/file/d/1a2b3c/view",
+            "https://drive.google.com/drive/folders/1a2b3c",
+            "https://maps.google.com/?q=1600+Amphitheatre",
+            "https://www.google.com/maps/place/Kyiv",
+            "https://groups.google.com/g/team/c/thread",
+            "https://mail.google.com/chat/u/0/#chat/home",
+            "https://photos.google.com/share/abc",
+            "https://keep.google.com/#NOTE/1a2b",
+            "https://tasks.google.com/embed/list/~default",
+            "https://www.youtube.com/watch?v=abc",
+            "https://myaccount.google.com/security",
+            "https://www.google.com/search?q=weather",
+            "https://www.google.co.uk/search?q=weather",
+            "https://drive.google.de/",
+            "https://google.com",
+            // Marketing and help pages on the surfaces' own hosts.
+            "https://mail.google.com/mail/about/",
+            "https://calendar.google.com/calendar/about/",
+            "https://mail.google.com/mail/help/intro.html"
+        ] {
+            XCTAssertFalse(LinkRouter.isInApp(url(candidate)), "expected the browser: \(candidate)")
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(candidate)),
+                .openExternally(url(candidate)),
+                "expected the browser: \(candidate)"
+            )
         }
     }
 
@@ -38,6 +101,54 @@ final class LinkRouterTests: XCTestCase {
             "https://github.com/Vitalini/mailspace"
         ] {
             XCTAssertFalse(LinkRouter.isInApp(url(candidate)), "expected external: \(candidate)")
+        }
+    }
+
+    /// A look-alike must not become in-app by wearing an app surface's path, its
+    /// host as user-info, or a suffix that is somebody else's domain.
+    func testLookalikeSurfacesAreNeverInApp() {
+        for candidate in [
+            "https://mail.google.com.evil.example/mail/u/0/",
+            "https://calendar.google.com.evil.example/calendar/u/0/r",
+            "https://accounts.google.com.evil.example/signin",
+            "https://notgoogle.com/mail/u/0/",
+            "https://mail.notgoogle.com/mail/u/0/",
+            // User-info: the host is evil.example, whatever precedes the @.
+            "https://mail.google.com@evil.example/mail/u/0/",
+            "https://accounts.google.com@evil.example/signin",
+            "https://mail.google.ev.io/mail/u/0/",
+            "https://accounts.google.ev.io/signin",
+            "https://mail.googleusercontent.com.evil.example/attachment"
+        ] {
+            XCTAssertFalse(LinkRouter.isInApp(url(candidate)), "must not be in-app: \(candidate)")
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(candidate)),
+                .openExternally(url(candidate)),
+                "must go to the browser: \(candidate)"
+            )
+        }
+    }
+
+    /// The broad "is the tab still on Google" test the sign-in provenance and
+    /// the SSO escort turn on. Deliberately wider than `isInApp`.
+    func testGooglePropertyIsBroaderThanInApp() {
+        for candidate in [
+            "https://drive.google.com/file/d/abc/preview",
+            "https://myaccount.google.com/security",
+            "https://www.google.com/gmail/about/",
+            "https://mail.google.com/mail/u/0/",
+            "https://ssl.gstatic.com/ui/v1/icons/mail.png"
+        ] {
+            XCTAssertTrue(LinkRouter.isGoogleProperty(url(candidate)), "expected a Google page: \(candidate)")
+        }
+        for candidate in [
+            "https://idp.company.example/saml/sso",
+            "https://notgoogle.com/",
+            "https://google.com.evil.example/",
+            "https://www.youtube.com/watch?v=abc",
+            "about:blank"
+        ] {
+            XCTAssertFalse(LinkRouter.isGoogleProperty(url(candidate)), "must not be a Google page: \(candidate)")
         }
     }
 
@@ -83,6 +194,71 @@ final class LinkRouterTests: XCTestCase {
         XCTAssertEqual(
             LinkRouter.destination(for: url("https://www.google.com/url?q=https://example.com/x")),
             .openExternally(url("https://example.com/x"))
+        )
+    }
+
+    /// The wrapper is what a calendar event's links actually look like, and the
+    /// destination behind it is usually Google's. It leaves too — unwrapped, so
+    /// the browser gets the real page rather than a redirect through Google.
+    func testWrappedGoogleProductLinkGoesToTheBrowserUnwrapped() {
+        for (wrapped, destination) in [
+            ("https://www.google.com/url?q=https://meet.google.com/abc-defg-hij&source=calendar",
+             "https://meet.google.com/abc-defg-hij"),
+            ("https://www.google.com/url?q=https://docs.google.com/document/d/1a2b/edit",
+             "https://docs.google.com/document/d/1a2b/edit"),
+            ("https://www.google.com/url?q=https://www.google.com/maps/place/Kyiv",
+             "https://www.google.com/maps/place/Kyiv")
+        ] {
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(wrapped)),
+                .openExternally(url(destination)),
+                "expected the browser, unwrapped: \(wrapped)"
+            )
+        }
+    }
+
+    /// …while a wrapper around the app's own surface still stays: that is the
+    /// account's own mail or calendar, wherever the link came from.
+    func testWrappedOwnSurfaceStaysInApp() {
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://www.google.com/url?q=https://calendar.google.com/calendar/u/0/r")),
+            .allowInApp
+        )
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://www.google.com/url?q=https://accounts.google.com/ServiceLogin")),
+            .allowInApp
+        )
+    }
+
+    /// In-page navigation on either surface never leaves, whatever drove it.
+    func testInPageNavigationOnTheSurfacesStaysInApp() {
+        for candidate in [
+            "https://mail.google.com/mail/u/0/#inbox",
+            "https://mail.google.com/mail/u/0/#sent",
+            "https://calendar.google.com/calendar/u/0/r/month",
+            "https://calendar.google.com/calendar/u/0/r/eventedit"
+        ] {
+            for isMainFrame in [true, false] {
+                XCTAssertEqual(
+                    LinkRouter.destination(for: url(candidate), isMainFrameTarget: isMainFrame, isSSOEscorted: false),
+                    .allowInApp,
+                    "must stay in-app: \(candidate)"
+                )
+            }
+        }
+    }
+
+    /// A Google product opened in the main frame or as a new window leaves; the
+    /// same URL as a subframe stays, or every embed would open a window.
+    func testGoogleProductLeavesTheMainFrameButNotASubframe() {
+        let meet = url("https://meet.google.com/abc-defg-hij")
+        XCTAssertEqual(
+            LinkRouter.destination(for: meet, isMainFrameTarget: true, isSSOEscorted: false),
+            .openExternally(meet)
+        )
+        XCTAssertEqual(
+            LinkRouter.destination(for: meet, isMainFrameTarget: false, isSSOEscorted: false),
+            .allowInApp
         )
     }
 
@@ -324,6 +500,114 @@ final class LinkRouterTests: XCTestCase {
                 .allowInApp
             )
         }
+    }
+
+    // MARK: - Which Google account the browser should use
+
+    /// The browser resolves a Google link against whichever account it is
+    /// signed into, which need not be the one the mail arrived in. The link
+    /// says which account it wants.
+    func testGoogleLinksCarryTheAccountToTheBrowser() {
+        XCTAssertEqual(
+            LinkRouter.forBrowser(url("https://docs.google.com/document/d/1a2b/edit"), accountEmail: "me@example.com"),
+            url("https://docs.google.com/document/d/1a2b/edit?authuser=me@example.com")
+        )
+        // An existing query and a fragment both survive.
+        XCTAssertEqual(
+            LinkRouter.forBrowser(url("https://meet.google.com/abc-defg-hij?hs=1"), accountEmail: "me@example.com"),
+            url("https://meet.google.com/abc-defg-hij?hs=1&authuser=me@example.com")
+        )
+        XCTAssertEqual(
+            LinkRouter.forBrowser(
+                url("https://docs.google.com/spreadsheets/d/1a2b/edit#gid=0"),
+                accountEmail: "me@example.com"
+            ),
+            url("https://docs.google.com/spreadsheets/d/1a2b/edit?authuser=me@example.com#gid=0")
+        )
+    }
+
+    /// `+` is a legal query character, so an untouched address would reach
+    /// Google as a space.
+    func testTheAddressIsPercentEncoded() {
+        XCTAssertEqual(
+            LinkRouter.forBrowser(url("https://drive.google.com/drive/my-drive"), accountEmail: "a+tag@example.com"),
+            url("https://drive.google.com/drive/my-drive?authuser=a%2Btag@example.com")
+        )
+    }
+
+    /// A link that already names an account keeps what it says — Google's own
+    /// `authuser=` and `/u/N/` are better information than ours.
+    func testLinksThatAlreadyNameAnAccountAreLeftAlone() {
+        for candidate in [
+            "https://docs.google.com/document/d/1a2b/edit?authuser=1",
+            "https://docs.google.com/document/d/1a2b/edit?AuthUser=me@example.com",
+            "https://drive.google.com/drive/u/1/my-drive",
+            "https://docs.google.com/document/u/2/d/1a2b/edit",
+            "https://mail.google.com/mail/u/0/"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.forBrowser(url(candidate), accountEmail: "me@example.com"),
+                url(candidate),
+                "must be left alone: \(candidate)"
+            )
+        }
+    }
+
+    /// The address is the user's. It goes to Google or nowhere — a look-alike
+    /// host must never be handed it.
+    func testTheAddressNeverTravelsToANonGoogleHost() {
+        for candidate in [
+            "https://example.com/article",
+            "https://google.com.evil.example/document",
+            "https://notgoogle.com/",
+            "https://google.ev.io/document",
+            "https://docs.google.com@evil.example/document",
+            "https://www.youtube.com/watch?v=abc"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.forBrowser(url(candidate), accountEmail: "me@example.com"),
+                url(candidate),
+                "must not carry the address: \(candidate)"
+            )
+        }
+    }
+
+    func testNoAccountMeansNoTagging() {
+        let target = url("https://docs.google.com/document/d/1a2b/edit")
+        XCTAssertEqual(LinkRouter.forBrowser(target, accountEmail: nil), target)
+        XCTAssertEqual(LinkRouter.forBrowser(target, accountEmail: ""), target)
+        XCTAssertEqual(LinkRouter.forBrowser(target, accountEmail: "   "), target)
+    }
+
+    // MARK: - The window a popup leaves behind
+
+    /// `window.open()` then `location = …`: WebKit asks for the window before
+    /// the page says where it is going, so a link that belongs in the browser
+    /// leaves an empty window behind unless it is closed.
+    func testAnEmptyPopupIsClosedWhenItsLinkGoesToTheBrowser() {
+        XCTAssertTrue(NavigationPolicy.shouldCloseEmptyPopup(
+            isPopup: true,
+            hasRenderedAPage: false,
+            isMainFrameTarget: true
+        ))
+        // A popup showing print preview or an attachment keeps its window.
+        XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
+            isPopup: true,
+            hasRenderedAPage: true,
+            isMainFrameTarget: true
+        ))
+        // A subframe inside a popup is not the popup's reason to exist.
+        XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
+            isPopup: true,
+            hasRenderedAPage: false,
+            isMainFrameTarget: false
+        ))
+        // And a tab is never closed by a link leaving.
+        XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
+            isPopup: false,
+            hasRenderedAPage: false,
+            isMainFrameTarget: true
+        ))
     }
 
     // MARK: - Download destinations
