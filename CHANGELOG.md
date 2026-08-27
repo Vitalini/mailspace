@@ -98,6 +98,18 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 - A tab that came back on its own after a failed rebuild is treated as healthy
   again: it goes back into the rebuild rotation, and clicking it no longer
   reloads a page that is already fine.
+- A rebuild is no longer carried out on the strength of an answer that has gone
+  stale. Asking a page whether anything is being typed into it takes a moment,
+  and the network dropping — or you coming back to the window — during that
+  moment now cancels the rebuild rather than going ahead with it. The tab you
+  have just come back to no longer reloads out from under you.
+- A tab that gave up on loading now comes back when the network does even when
+  nothing is being polled — Mail switched off everywhere, or every account
+  signed out. Until now it could only be revived by clicking it, which is the
+  one thing nobody does to a tab they are not looking at.
+- A tab caught mid-rebuild, or one sitting on Google's account-creation screen,
+  no longer stops every other tab in the app from being rebuilt and no longer
+  leaves MailSpace unable to decide whether it is online.
 - A Google link handed to the browser only names your account for Google's own
   products — Docs, Drive, Calendar, Meet and the rest. Google also hosts pages
   written by other people, and those are handed over exactly as they were

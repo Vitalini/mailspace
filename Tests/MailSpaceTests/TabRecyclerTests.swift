@@ -528,6 +528,149 @@ final class RecycleDecisionTests: XCTestCase {
         )
     }
 
+    // MARK: - Which tabs are proving anything
+
+    /// The classification `AppDelegate` used to keep private, with only the
+    /// per-tab reading it delegates to pinned.
+    ///
+    /// It decides whether the recycler may touch anything at all and whether the
+    /// health monitor may conclude anything at all, which makes it the last
+    /// thing in this feature that should have been reachable only by running the
+    /// app on the owner's live mail.
+    func testTheProbeActivityClassifierReadsAWholeTabList() {
+        // One account signed out and one signed in. The signed-in tab is
+        // issuing the fetch, so its verdict is the app's.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [
+                url("https://accounts.google.com/v3/signin/identifier"),
+                url("https://mail.google.com/mail/u/0/#inbox")
+            ]),
+            .polling
+        )
+        // Signed out and alone: nothing is being asked of Google and nothing
+        // will be until the user signs in. Google answered, with its own
+        // sign-in page, so this is not silence and must not veto.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [
+                url("https://accounts.google.com/v3/signin/identifier")
+            ]),
+            .idle
+        )
+        // An account with Mail switched off is not in the list at all, so the
+        // one stranded tab that is left is the whole answer.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [url("https://portal.hotel.example/login")]),
+            .stranded
+        )
+        // …and one tab polling still outranks it: an answer out of Google
+        // settles the question however the other tabs look.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [
+                url("https://portal.hotel.example/login"),
+                url("https://mail.google.com/mail/u/0/#inbox")
+            ]),
+            .polling
+        )
+        // A Google-hosted page that is neither the app nor the sign-in chain —
+        // the "unusual traffic" interstitial, a product error page — stays
+        // stranded on purpose. Telling it from a portal serving something would
+        // mean trusting an arbitrary Google host, and being wrong that way
+        // blanks every tab, so the conservative answer stands: recycling stops.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [url("https://www.google.com/sorry/index")]),
+            .stranded
+        )
+        // No account has Mail on.
+        XCTAssertEqual(RecycleDecision.probeActivity(mailTabURLs: []), .idle)
+    }
+
+    /// The sign-up screen is Google answering.
+    ///
+    /// `AuthSurface.classify` calls it `.other` deliberately — creating a
+    /// brand-new Google account is not *this* account's sign-in finishing — and
+    /// that is the right answer to that question and the wrong one here, where
+    /// the only thing that matters is which side of the wire the page came from.
+    /// Read as the portal shape it stopped every rebuild in the app and pinned
+    /// the health monitor to BUSY for as long as the user spent signing up.
+    func testTheSignUpScreenIsGoogleAnsweringRatherThanAPortal() {
+        XCTAssertEqual(
+            UnreadPoller.reading(for: URL(string: "https://accounts.google.com/signup/v2/createaccount")),
+            .noAnswer,
+            "the per-tab feed reading is unchanged: no fetch can be issued from there"
+        )
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [
+                url("https://accounts.google.com/signup/v2/createaccount")
+            ]),
+            .idle
+        )
+    }
+
+    /// A webview with no URL has not committed anything: freshly built,
+    /// mid-recycle, or the wreckage of a failed provisional navigation.
+    ///
+    /// None of those is something walking the tab off Gmail, and reading them as
+    /// the portal shape deadlocked the app outright. One dead mail tab with a
+    /// nil URL pinned a single-account setup to `.unproven` for the rest of the
+    /// session — which skipped every tab in the app with G15 *and* made
+    /// `attemptLoad` re-arm every thirty seconds forever without once putting
+    /// the retry on the wire. The tab the ladder exists to bring back could then
+    /// never come back at all.
+    func testATabThatHasNotCommittedAnythingIsNotEvidenceOfAPortal() {
+        XCTAssertEqual(RecycleDecision.probeActivity(mailTabURLs: [nil]), .idle)
+        // Same rule, same reason: nothing was fetched from anywhere.
+        XCTAssertEqual(RecycleDecision.probeActivity(mailTabURLs: [url("about:blank")]), .idle)
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [
+                nil, url("https://mail.google.com/mail/u/0/#inbox")
+            ]),
+            .polling
+        )
+        // And it papers over nothing: a tab that really is stranded still is.
+        XCTAssertEqual(
+            RecycleDecision.probeActivity(mailTabURLs: [nil, url("https://portal.hotel.example/login")]),
+            .stranded
+        )
+        // The deadlock, spelled out end to end.
+        XCTAssertEqual(
+            RecycleDecision.reachability(
+                pathIsSatisfied: true,
+                lastReachedGoogleAt: nil,
+                probes: RecycleDecision.probeActivity(mailTabURLs: [nil]),
+                now: epoch
+            ),
+            .up,
+            "a tab mid-recycle must not make the network unprovable"
+        )
+    }
+
+    // MARK: - Noticing that the network came back
+
+    /// An edge, never a level. A level would re-issue a load into every dead tab
+    /// on every tick for as long as the network stayed up.
+    func testTheNetworkComingBackIsAnEdge() {
+        XCTAssertTrue(RecycleDecision.networkCameBack(from: .down, to: .up))
+        XCTAssertTrue(RecycleDecision.networkCameBack(from: .unproven, to: .up))
+        XCTAssertFalse(RecycleDecision.networkCameBack(from: .up, to: .up))
+        XCTAssertFalse(RecycleDecision.networkCameBack(from: .down, to: .unproven))
+        XCTAssertFalse(RecycleDecision.networkCameBack(from: .up, to: .down))
+    }
+
+    /// And the floor under the edge, because a flapping radio is nothing but
+    /// edges.
+    func testARescueSweepIsFlooredSoAFlapCannotBecomeARetryLoop() {
+        XCTAssertTrue(RecycleDecision.rescueIsDue(lastRescueAt: nil, now: epoch))
+        XCTAssertFalse(
+            RecycleDecision.rescueIsDue(lastRescueAt: epoch.addingTimeInterval(-10), now: epoch)
+        )
+        XCTAssertTrue(
+            RecycleDecision.rescueIsDue(
+                lastRescueAt: epoch.addingTimeInterval(-RecycleDecision.rescueSpacing),
+                now: epoch
+            )
+        )
+    }
+
     // MARK: - G16: waking up
 
     /// Waking is when every tab is overdue at once and the network is least
@@ -1027,6 +1170,126 @@ final class TabRecyclerDriverTests: XCTestCase {
         host.answerOldest()
         host.answersLater = false
         XCTAssertEqual(host.recycled, ["personal"], "and the live one still reaches past the veto")
+
+        // The other half of the same rule, and the half that was open: only the
+        // *walk* was generation-checked. A stale pass could not walk on to the
+        // next slot — but it could still rebuild the tab it was already holding,
+        // because the recycle path had no check at all. Two overlapping passes
+        // then each rebuilt a tab, sixty seconds apart, straight through G13's
+        // hundred-and-twenty-second spacing. It took roughly thirteen
+        // simultaneously-vetoing tabs to reach, so at three or four tabs it was
+        // arithmetic rather than a guard — which is not the same thing as safe.
+        clock = clock.addingTimeInterval(RecycleDecision.globalSpacing + 1)
+        host.editorAnswers.removeValue(forKey: ObjectIdentifier(blocked))
+        host.answersLater = true
+
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 1, "pass A is holding slot 0, which would now rebuild")
+
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 2, "pass B steps over the reserved slot 0 and holds slot 2")
+
+        host.answerOldest()
+        XCTAssertEqual(
+            host.recycled, ["personal"],
+            "the superseded pass must not rebuild the tab it was holding either"
+        )
+
+        host.answerOldest()
+        XCTAssertEqual(host.recycled, ["personal", "side"], "and the live pass still finishes its own")
+    }
+
+    /// The stale-environment defect in its simplest form: nothing has to be
+    /// vetoed first.
+    ///
+    /// The G18 question alone takes up to five seconds, and every fact that
+    /// authorised the rebuild was measured before it was asked. A recycle works
+    /// by destroying the page and *then* loading the replacement, so a network
+    /// that went away in between does not degrade the tab — it blanks it.
+    func testANetworkThatDropsWhileThePageAnswersStopsTheRebuild() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        host.answersLater = true
+
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 1, "the page has been asked and has not answered")
+
+        host.reachability = .down
+        host.answerOldest()
+
+        XCTAssertEqual(
+            host.recycled, [],
+            "the answer that said this was safe is five seconds old; G15 has to be asked again"
+        )
+    }
+
+    /// The same defect across a resumed pass, which is where it is permanent.
+    ///
+    /// A Gmail search box holding a query marks slot 0 dirty on every single
+    /// tick — the accepted trade-off — so every tick resumes, and every
+    /// resumption used to judge the next tab against the environment captured
+    /// before the veto.
+    func testAResumedPassJudgesTheNextTabAgainstTheNetworkAsItIsNow() {
+        let blocked = addTab("work", slot: 0)
+        _ = addTab("personal", slot: 1)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: false, dirty: 1)
+        host.answersLater = true
+
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 1)
+
+        // The Wi-Fi drops while slot 0 is thinking. Slot 1 is next in the pass.
+        host.answersLater = false
+        host.reachability = .down
+        host.answerOldest()
+
+        XCTAssertEqual(
+            host.recycled, [],
+            "the tab that is actually about to be rebuilt is the one G15 has to be asked about"
+        )
+    }
+
+    /// The other consequence of defect 1, and the one that is pure annoyance
+    /// rather than something the ladder can recover: he comes back to the window
+    /// while the probe is out, and the tab he came back to reloads under him.
+    func testComingBackToTheWindowDuringTheProbeSparesTheTabHeIsLookingAt() {
+        let blocked = addTab("work", slot: 0)
+        let selected = addTab("personal", slot: 1)
+        // Both documents committed at the same instant, comfortably past slot
+        // 1's twelve-hour-five threshold and comfortably short of the
+        // twenty-four-hour hard deadline: the band where the opportunity gate is
+        // the only thing deciding.
+        clock = epoch
+        recycler.webViewDidCommit(blocked)
+        recycler.webViewDidCommit(selected)
+        clock = epoch.addingTimeInterval(13 * 3600)
+
+        // Stated rather than inherited from whatever the test runner's own
+        // process happens to be doing.
+        recycler.appIsActive = { true }
+        recycler.systemIdle = { 0 }
+
+        host.candidates[ObjectIdentifier(selected)]?.isSelected = true
+        host.mainWindowIsVisible = false
+        host.editorAnswers[ObjectIdentifier(blocked)] =
+            RecycleDecision.EditorState(focused: false, dirty: 1)
+        host.answersLater = true
+
+        recycler.tick()
+        XCTAssertEqual(host.pending.count, 1)
+
+        // He un-hides the window while slot 0 is still thinking.
+        host.answersLater = false
+        host.mainWindowIsVisible = true
+        host.answerOldest()
+
+        XCTAssertEqual(
+            host.recycled, [],
+            "the whole opportunity gate is re-asked, not just the network"
+        )
     }
 
     /// A tab that vetoes forever is logged as a persistent block once per
@@ -1186,6 +1449,137 @@ final class TabRecyclerDriverTests: XCTestCase {
         XCTAssertTrue(recycler.hasFailedLoad(fresh))
         recycler.webViewDidSettle(fresh)
         XCTAssertEqual(host.clearedStalls, 2)
+    }
+
+    /// The tab has to be able to heal with nothing polling.
+    ///
+    /// The rescue used to hang entirely off the mail poller — `onReachability`
+    /// fires only when a feed fetch got an answer out of Google, and no fetch is
+    /// issued at all while `ProbeActivity` is `.idle`: Mail switched off
+    /// everywhere, or every mail tab parked on Google's sign-in page. In that
+    /// state `networkBecameReachable()` was simply unreachable and a tab the
+    /// ladder had given up on could only come back on a click, which is the half
+    /// of the self-heal that matters: nobody is looking at the tab that stopped
+    /// working.
+    ///
+    /// The recycler samples reachability on its own tick now. With no probe
+    /// running that reading *is* `NWPathMonitor`, so the interface coming back
+    /// is seen without anything telling Google a thing.
+    func testADeadTabHealsWhenTheInterfaceComesBackWithNothingPolling() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        XCTAssertTrue(recycler.hasFailedLoad(fresh), "the tab is dead to begin with")
+
+        // The outage. Nothing polls, so nothing can report a recovery.
+        host.reachability = .down
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+
+        loads = []
+        // The interface is back. No feed probe runs, and none has to.
+        host.reachability = .up
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+
+        XCTAssertEqual(loads, [page], "the tab comes back on its own, with no click and no poll")
+        XCTAssertFalse(recycler.hasFailedLoad(fresh))
+        XCTAssertTrue(recycler.stalledAccounts.isEmpty, "and the pill and the ! go with it")
+    }
+
+    /// The other side of that: an edge, not a level. Once the tab is back on the
+    /// ladder, a network that simply stays up must not keep sweeping it.
+    func testTheSelfHealDoesNotKeepFiringWhileTheNetworkStaysUp() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        host.reachability = .down
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+        host.reachability = .up
+        clock = clock.addingTimeInterval(60)
+        recycler.tick()
+        XCTAssertFalse(recycler.hasFailedLoad(fresh), "rescued once")
+
+        loads = []
+        for _ in 0..<20 {
+            clock = clock.addingTimeInterval(60)
+            recycler.tick()
+        }
+        XCTAssertEqual(loads, [], "the ladder owns the tab again; the tick must not re-issue")
+    }
+
+    /// A recovery signal that arrives while nothing can actually reach Google
+    /// must not take the warning down.
+    ///
+    /// It used to: the sweep cleared the dead flag, cleared the stall token,
+    /// took the pill and the Dock `!` off and handed the tab to a load that
+    /// could not succeed — so the tab looked healthy and was not, and the only
+    /// thing left watching it was a thirty-second re-arm.
+    func testARescueIsRefusedWhileNothingCanReachGoogle() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        XCTAssertTrue(recycler.hasFailedLoad(fresh))
+
+        host.reachability = .down
+        loads = []
+        recycler.networkBecameReachable()
+
+        XCTAssertEqual(loads, [], "nothing on the wire")
+        XCTAssertTrue(recycler.hasFailedLoad(fresh), "and the tab still says it is dead")
+        XCTAssertFalse(recycler.stalledAccounts.isEmpty, "so the pill and the ! stay up")
+    }
+
+    /// The floor, driven end to end. Two recovery signals in quick succession —
+    /// a flapping radio, a proof that expired and was renewed — are one sweep.
+    func testTwoRecoverySignalsInQuickSuccessionAreOneSweep() {
+        _ = addTab("work", slot: 0)
+        clock = epoch.addingTimeInterval(40 * 3600)
+        recycler.tick()
+        guard let fresh = host.replacements.first else { return XCTFail("no recycle happened") }
+
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        loads = []
+        recycler.networkBecameReachable()
+        XCTAssertEqual(loads, [page], "the first one goes through immediately")
+
+        // The rescue fails too, so the tab is dead again, and the link flaps.
+        for _ in 0...RecycleDecision.maximumFailures {
+            recycler.webViewDidFail(fresh)
+            fireScheduled()
+        }
+        XCTAssertTrue(recycler.hasFailedLoad(fresh))
+        loads = []
+        clock = clock.addingTimeInterval(10)
+        recycler.networkBecameReachable()
+        XCTAssertEqual(loads, [], "inside the floor a flap is not a recovery")
+
+        // Past the floor a genuine recovery still gets through.
+        clock = clock.addingTimeInterval(RecycleDecision.rescueSpacing)
+        recycler.networkBecameReachable()
+        XCTAssertEqual(loads, [page])
     }
 
     /// A retry that comes due while the network is still down re-arms instead

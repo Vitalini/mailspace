@@ -436,25 +436,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// Asked of the same provider the poller itself polls, and classified with
     /// the same function, so the two can never disagree about which tabs are
     /// issuing a fetch.
-    private var probeActivity: RecycleDecision.ProbeActivity {
-        var sawStranded = false
-        for target in unreadPoller.mailWebViews() {
-            switch UnreadPoller.reading(for: target.webView.url) {
-            case .poll:
-                // One tab issuing the fetch is enough: its verdict is the
-                // app-wide answer, and its silence is app-wide evidence.
-                return .polling
-            case .definiteZero:
-                // Google's own sign-in page. Nothing is being asked of Google
-                // from this tab and nothing ever will be until the user signs
-                // in, so this tab contributes no evidence either way — but it
-                // is not the portal shape either, so it must not veto.
-                continue
-            case .noAnswer:
-                sawStranded = true
-            }
-        }
-        return sawStranded ? .stranded : .idle
+    ///
+    /// The classification itself lives in `RecycleDecision.probeActivity`, and
+    /// is a unit test. It used to live here, private, with only the per-tab
+    /// reading it delegates to pinned — which is how the signed-out case, and
+    /// then the nil-URL case behind it, reached the owner's Mac. All this is
+    /// now is the list of tabs to ask about, which is the one part that cannot
+    /// be a pure function.
+    var probeActivity: RecycleDecision.ProbeActivity {
+        RecycleDecision.probeActivity(mailTabURLs: unreadPoller.mailWebViews().map { $0.webView.url })
     }
 
     /// The feed probe got an answer out of Google — or did not.
@@ -758,10 +748,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 guard up != self.networkIsUp else { return }
                 self.networkIsUp = up
                 guard up else { return }
-                // The interface is back. Nothing has yet proved Google is
-                // reachable, so this does not release the recycler's G15 — but
-                // it does make the next feed probe worth waiting for, and that
-                // probe is what triggers the rescue.
+                // The interface is back. A feed probe is the strongest evidence
+                // available, so ask for one — but it is no longer the *only*
+                // route back. It is not issued at all when `probeActivity` is
+                // `.idle`, and that is precisely the state a tab is most likely
+                // to be stranded in. The recycler samples reachability on its
+                // own tick and sees this same edge for itself.
                 Log.info("network path is back")
                 self.unreadPoller.refresh()
             }

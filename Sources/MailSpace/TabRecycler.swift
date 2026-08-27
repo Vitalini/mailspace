@@ -45,6 +45,19 @@ enum RecycleDecision {
     /// four-tab thundering herd after a long system sleep.
     static let globalSpacing: TimeInterval = 120
 
+    /// At most one automatic rescue sweep of the tabs the ladder gave up on per
+    /// this many seconds.
+    ///
+    /// The same rhythm G13 already holds every rebuild to, for the same reason.
+    /// "The network came back" is an *edge*, and edges are exactly what a
+    /// flapping interface produces: a Wi-Fi radio at the edge of range, a VPN
+    /// reconnecting, a proof that expires and is renewed. Each one of those
+    /// looks like a recovery, and each one would otherwise re-issue a load into
+    /// every dead tab and reset its ladder to the first rung — the thrash the
+    /// ladder's rungs exist to prevent. The first rescue after any quiet period
+    /// is still immediate; only a second one inside two minutes is refused.
+    static let rescueSpacing: TimeInterval = globalSpacing
+
     /// Gmail issues actions optimistically; archiving a thread and immediately
     /// switching accounts can leave a request in flight in a tab that is now
     /// "background".
@@ -238,6 +251,85 @@ enum RecycleDecision {
         case .idle: return .up
         case .polling, .stranded: return .unproven
         }
+    }
+
+    /// What a set of mail tabs adds up to.
+    ///
+    /// Extracted out of `AppDelegate` so the classification is a unit test
+    /// rather than a property nothing could reach. It decides whether the
+    /// recycler may touch anything at all and whether the health monitor may
+    /// conclude anything at all, and the way it used to be written — private,
+    /// and pinned only through the per-tab reading it delegates to — is how the
+    /// signed-out case reached the owner's Mac.
+    ///
+    /// One tab issuing the fetch is enough: its verdict is the app-wide answer,
+    /// and its silence is app-wide evidence. Otherwise a tab only counts if it
+    /// is genuinely sitting on a page that is neither Gmail nor Google's own
+    /// sign-in chain — that is the captive-portal shape, and nothing else is.
+    static func probeActivity(mailTabURLs urls: [URL?]) -> ProbeActivity {
+        var sawStranded = false
+        for url in urls {
+            // Nothing has been fetched here at all: a webview that is freshly
+            // built, one mid-recycle, the wreckage of a failed provisional
+            // navigation, and the `about:blank` / `blob:` / `data:` pages
+            // Google's sign-in SPA leaves lying about. None of those is
+            // something walking the tab off Gmail onto a splash page, which is
+            // the only thing `.stranded` is supposed to mean.
+            //
+            // Reading them as the portal shape deadlocked the app. One dead
+            // mail tab with a nil URL pinned a single-account setup to
+            // `.unproven` for the rest of the session, which skipped every tab
+            // in the app with G15 *and* made `attemptLoad` re-arm every thirty
+            // seconds forever without once putting the retry on the wire. The
+            // tab the ladder exists to bring back could then never come back.
+            guard
+                let url,
+                let scheme = url.scheme?.lowercased(),
+                scheme == "http" || scheme == "https"
+            else { continue }
+            // Google's own sign-in chain, the sign-up screen included. Asked by
+            // host rather than through `classify`, which calls the sign-up
+            // screen `.other` — the right answer to a different question
+            // ("is *this account's* sign-in finishing?") and the wrong one here,
+            // where all that matters is that Google answered.
+            if let host = url.host, AuthSurface.isSignInHost(host) { continue }
+            switch UnreadPoller.reading(for: url) {
+            case .poll:
+                return .polling
+            case .definiteZero:
+                // Google's own sign-in page. Nothing is being asked of Google
+                // from this tab and nothing ever will be until the user signs
+                // in, so it contributes no evidence either way — but it is not
+                // the portal shape either, so it must not veto.
+                continue
+            case .noAnswer:
+                sawStranded = true
+            }
+        }
+        return sawStranded ? .stranded : .idle
+    }
+
+    /// Whether these two consecutive readings are the network coming back.
+    ///
+    /// The recycler samples `reachability` on its own 60 s tick, so this edge is
+    /// seen whether or not the mail poller is running. That matters because the
+    /// poller is the *only* thing that used to report a recovery, and it does
+    /// not run at all while `ProbeActivity` is `.idle` — Mail off everywhere, or
+    /// every mail tab parked on Google's sign-in page. A tab the ladder had
+    /// given up on could then only come back on a click, which defeats half of
+    /// the self-heal.
+    ///
+    /// `NWPathMonitor` is what actually moves this needle in that state: with no
+    /// probe running, `reachability` is `.down` exactly when the path is
+    /// unsatisfied and `.up` exactly when it is satisfied.
+    static func networkCameBack(from previous: Reachability, to current: Reachability) -> Bool {
+        current == .up && previous != .up
+    }
+
+    /// Whether a rescue sweep may run now, given when the last one ran.
+    static func rescueIsDue(lastRescueAt: Date?, now: Date) -> Bool {
+        guard let last = lastRescueAt else { return true }
+        return now.timeIntervalSince(last) >= rescueSpacing
     }
 
     /// The facts that are the same for every candidate on one tick.
@@ -714,6 +806,17 @@ final class TabRecycler {
     var load: (WKWebView, URL) -> Void = { webView, url in
         webView.load(URLRequest(url: url))
     }
+    /// The three app-wide facts `makeEnvironment` reads straight out of AppKit.
+    ///
+    /// Injected for the same reason as the clock. The environment is re-derived
+    /// at every step of a pass now, so "would this tab be rebuilt at *this*
+    /// instant" is asked far more often than once a minute — and a test of it
+    /// has to be able to state what the app looked like at that instant instead
+    /// of inheriting whatever the test runner's own process happened to be
+    /// doing when it ran.
+    var appIsActive: () -> Bool = { NSApp.isActive }
+    var systemIdle: () -> TimeInterval = { TabRecycler.systemIdleSeconds() }
+    var modalIsUp: () -> Bool = { NSApp.modalWindow != nil || NSApp.keyWindow?.attachedSheet != nil }
 
     weak var host: TabRecyclerHost?
 
@@ -754,8 +857,15 @@ final class TabRecycler {
     /// When a guard holding this webview back was last written to the log.
     private var lastBlockLogAt = WeakObjectMap<WKWebView, Date>()
     private var lastRecycleAt: Date?
+    /// When the tabs that gave up were last swept back onto the ladder. The
+    /// floor under every recovery signal — see `networkBecameReachable`.
+    private var lastRescueAt: Date?
+    /// The reachability the previous tick saw, so the recycler can notice the
+    /// network coming back without anything else in the app telling it.
+    private var lastSeenReachability: RecycleDecision.Reachability?
     /// Which pass over the tab list is the current one. Bumped by every tick;
-    /// a pass whose generation is stale abandons itself. See `tick()`.
+    /// a pass whose generation is stale abandons itself, at the walk *and* at
+    /// the rebuild. See `tick()`.
     private var walkGeneration = 0
     /// When MailSpace itself last saw an event. A *local* monitor: events
     /// already being delivered to this app, so no permission is involved.
@@ -801,8 +911,15 @@ final class TabRecycler {
 
     /// Stamped from `NavigationPolicy.webView(_:didCommit:)`, which is
     /// main-frame-only and is not fired by a fragment change.
+    ///
+    /// On the injected clock, like every other time this class writes. It used
+    /// to be `Date()`, which is the same thing in the app and is not the same
+    /// thing in a test: the age it produced was measured against a wall clock
+    /// the test could not move, so a harness could set a tab's age to anything
+    /// it liked and get a hundred and fifty days. Every guard that turns on an
+    /// age band — the hard deadline above all — was untestable by construction.
     func webViewDidCommit(_ webView: WKWebView) {
-        lastCommittedAt[webView] = Date()
+        lastCommittedAt[webView] = now()
     }
 
     /// Set at issue time by `recycle`, and cleared when the load settles.
@@ -910,9 +1027,25 @@ final class TabRecycler {
     /// This is what makes the terminal state impossible without the user doing
     /// anything: he closes the laptop on a train, opens it at the office, and
     /// the tabs come back on their own.
+    ///
+    /// The one door every recovery signal comes through — the feed probe
+    /// getting an answer out of Google, the recycler's own tick seeing the
+    /// interface come back, and the recovery harness. Two things are asked of
+    /// all of them, because a rescue is not free: it destroys the ladder's
+    /// progress and puts a request on the wire for every dead tab.
+    ///
+    /// * The network has to actually be up. A signal that arrives while nothing
+    ///   can reach Google used to take the warning pill and the Dock `!` down
+    ///   and hand the tab to a load that could not succeed — the tab looked
+    ///   healthy and was not.
+    /// * At most one sweep per `rescueSpacing`. "The network came back" is an
+    ///   edge, and a flapping interface is nothing but edges.
     func networkBecameReachable() {
         let pending = deadTargets.pairs()
         guard !pending.isEmpty else { return }
+        guard (host?.reachability ?? .down) == .up else { return }
+        guard RecycleDecision.rescueIsDue(lastRescueAt: lastRescueAt, now: now()) else { return }
+        lastRescueAt = now()
         Log.info("network is back; retrying \(pending.count) tab(s) whose recycle had given up")
         for (webView, url) in pending {
             deadTargets.removeValue(forKey: webView)
@@ -1038,6 +1171,11 @@ final class TabRecycler {
     /// into the owner's uptime on his live mail.
     func tick() {
         guard let host else { return }
+        // First, before anything is judged: did the network come back while
+        // nothing was polling? This is the recycler's own eye on it, and the
+        // only one a tab has when no feed probe is being issued.
+        noticeNetworkCameBack()
+
         // One live pass at a time. A pass can now outlive the tick that started
         // it — `editorState` allows a page five seconds to answer — so with
         // enough tabs one could still be walking when the next tick arrives,
@@ -1049,8 +1187,43 @@ final class TabRecycler {
         // a stuck one here would retire the whole feature silently — the exact
         // shape of failure the rest of this file is written against. This way
         // the newest tick always wins and nothing has to be released.
+        //
+        // The generation is checked twice: where the walk resumes, and again in
+        // `askAndRecycle` on the way into the rebuild. Only the first check
+        // existed, so a stale pass could not walk on — but it could still
+        // rebuild the tab it was already holding.
         walkGeneration &+= 1
-        walk(host.recycleTargets(), from: 0, environment: makeEnvironment(), generation: walkGeneration)
+        walk(host.recycleTargets(), from: 0, generation: walkGeneration)
+    }
+
+    /// The recycler's own eye on the network, sampled once a tick.
+    ///
+    /// The rescue used to hang entirely off the mail poller: `onReachability`
+    /// fires only when a feed fetch got an answer out of Google, and no fetch is
+    /// issued at all while `ProbeActivity` is `.idle` — Mail switched off
+    /// everywhere, or every mail tab parked on Google's sign-in page. In that
+    /// state `networkBecameReachable()` was simply unreachable, so a tab the
+    /// ladder had given up on could only come back on a click. That defeats
+    /// half of the self-heal, and it is the half that matters: nobody is looking
+    /// at the tab that stopped working.
+    ///
+    /// This needs no new signal source. `NWPathMonitor` is already the
+    /// `pathIsSatisfied` half of `reachability`, and with no probe running it is
+    /// the *whole* of it — so sampling `host.reachability` on the tick the
+    /// recycler already runs sees the interface come back whether or not
+    /// anything is polling. Edge-triggered by construction, and floored by
+    /// `rescueSpacing` on top, so a flapping link cannot turn into a retry loop.
+    private func noticeNetworkCameBack() {
+        let current = host?.reachability ?? .down
+        let previous = lastSeenReachability
+        lastSeenReachability = current
+        // The first sample is not an edge. A tab can only be dead after a
+        // recycle has already failed its way down the ladder, so there is
+        // always an earlier sample by the time this can matter.
+        guard let previous, RecycleDecision.networkCameBack(from: previous, to: current) else { return }
+        // The floor and the "is it actually up" test both live in
+        // `networkBecameReachable`, so every route in gets the same answer.
+        networkBecameReachable()
     }
 
     /// One pass over the tab list, in slot order, resumable across G18.
@@ -1070,40 +1243,40 @@ final class TabRecycler {
     /// there is no loop left to continue by the time the veto lands. So the
     /// walk carries its own cursor and the veto resumes it at the next slot.
     ///
-    /// Two properties this must not break, and does not:
+    /// Three properties this must not break, and does not:
     /// * **At most one recycle per tick.** Only a veto — or a rebuild that
     ///   could not be performed — resumes the walk. A recycle that happened
     ///   ends the pass.
-    /// * **G13's 120 s global spacing.** Every target in the pass is judged
-    ///   against the `environment` captured at the top of the tick, and
-    ///   `lastRecycleAt` inside it is what G13 reads, so nothing in a resumed
-    ///   pass can slip past the spacing that the first target was held to.
-    private func walk(
-        _ targets: [Target],
-        from index: Int,
-        environment: RecycleDecision.Environment,
-        generation: Int
-    ) {
-        guard let host, generation == walkGeneration else { return }
+    /// * **G13's 120 s global spacing.** `lastRecycleAt` is re-read for every
+    ///   judgement, so nothing in a resumed pass can slip past the spacing the
+    ///   first target was held to.
+    /// * **Nothing is ever rebuilt against a stale answer.** The pass carries a
+    ///   cursor, a generation and the tab list it is walking — no judgement of
+    ///   any kind. It used to carry the `Environment` captured when the tick
+    ///   started, and every resumption judged the next tab against it: a Wi-Fi
+    ///   drop during the probe still blanked the next tab, and coming back to
+    ///   the window during the probe still rebuilt the tab he had just come back
+    ///   to. That window is about five seconds per preceding veto, and it is
+    ///   effectively permanent — a Gmail search box holding a query marks slot 0
+    ///   dirty on every single tick. `assess` re-derives everything instead, and
+    ///   it is called again from the completion handler immediately before the
+    ///   rebuild, so there is no cached answer left to go stale.
+    private func walk(_ targets: [Target], from index: Int, generation: Int) {
+        guard generation == walkGeneration else { return }
         var index = index
 
         while index < targets.count {
             let target = targets[index]
             index += 1
 
-            var candidate = host.recycleCandidate(for: target)
-            candidate?.lastDeselectedAt = lastDeselectedAt[target.webView]
-            candidate?.committedAt = lastCommittedAt[target.webView]
-            candidate?.hasOutstandingRecycle = recycleTarget[target.webView] != nil
-            candidate?.loadFailed = deadTargets[target.webView] != nil
-            guard let candidate else { continue }
             // A recycle already in flight in this webview is one recycle too
             // many (G13, per-webview half).
             guard !recycling.contains(target.webView) else { continue }
+            guard let judgement = assess(target) else { continue }
 
-            switch RecycleDecision.evaluate(candidate, in: environment) {
+            switch judgement.outcome {
             case .skip(let reason):
-                noteBlocked(target, reason: reason, now: environment.now)
+                noteBlocked(target, reason: reason, now: judgement.environment.now)
                 continue
             case .recycle:
                 break
@@ -1112,12 +1285,39 @@ final class TabRecycler {
             // G18 — the last question, and the only one that has to be asked of
             // the page rather than of its URL.
             let resumeFrom = index
-            askAndRecycle(target, candidate: candidate, environment: environment) { [weak self] recycled in
+            askAndRecycle(target, generation: generation) { [weak self] recycled in
                 guard let self, !recycled else { return }
-                self.walk(targets, from: resumeFrom, environment: environment, generation: generation)
+                self.walk(targets, from: resumeFrom, generation: generation)
             }
             return
         }
+    }
+
+    /// Everything the rule needs about one target, derived from scratch: the
+    /// candidate, the app-wide environment, and the verdict over the two.
+    ///
+    /// The single place any of that is read, so there is no way to hold on to a
+    /// judgement across the asynchronous G18 probe by accident. Both callers —
+    /// the walk, and the probe's completion handler on its way into `recycle` —
+    /// go through here.
+    private struct Judgement {
+        let candidate: RecycleDecision.Candidate
+        let environment: RecycleDecision.Environment
+        let outcome: RecycleDecision.Outcome
+    }
+
+    private func assess(_ target: Target) -> Judgement? {
+        guard let host, var candidate = host.recycleCandidate(for: target) else { return nil }
+        candidate.lastDeselectedAt = lastDeselectedAt[target.webView]
+        candidate.committedAt = lastCommittedAt[target.webView]
+        candidate.hasOutstandingRecycle = recycleTarget[target.webView] != nil
+        candidate.loadFailed = deadTargets[target.webView] != nil
+        let environment = makeEnvironment()
+        return Judgement(
+            candidate: candidate,
+            environment: environment,
+            outcome: RecycleDecision.evaluate(candidate, in: environment)
+        )
     }
 
     /// Asks the page whether it has a live editor, then recycles if it does not.
@@ -1126,10 +1326,15 @@ final class TabRecycler {
     /// lets `walk` tell "this tab is done" from "this tab said no, try the next
     /// one". It is called exactly once, on the main thread, for every outcome
     /// including the ones where the recycler has already been torn down.
+    ///
+    /// The answer takes up to five seconds to arrive, and everything that
+    /// authorised the rebuild was true five seconds ago. So nothing that was
+    /// decided before the question is trusted after it: the pass has to still be
+    /// the live one, and the whole rule is put again to a freshly derived
+    /// environment on the way into `recycle`.
     private func askAndRecycle(
         _ target: Target,
-        candidate: RecycleDecision.Candidate,
-        environment: RecycleDecision.Environment,
+        generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
         guard let host else { return completion(false) }
@@ -1143,12 +1348,36 @@ final class TabRecycler {
             self.recycling.remove(target.webView)
             guard host != nil else { return completion(false) }
 
+            // A newer tick has started a pass of its own. This one is stale and
+            // must not rebuild anything: two passes sharing one view of
+            // `lastRecycleAt` each rebuilt a tab, 60 s apart, straight through
+            // G13's 120 s spacing. The walk had this check; the recycle path
+            // did not, which left the spacing as arithmetic — "you would need
+            // thirteen simultaneously-vetoing tabs for a pass to outlive its
+            // tick" — rather than as a guard.
+            guard generation == self.walkGeneration else { return completion(false) }
+
             if RecycleDecision.hasLiveEditor(state) {
                 self.noteBlocked(target, reason: .liveEditor, now: self.now())
                 completion(false)
                 return
             }
-            completion(self.recycle(target, candidate: candidate, environment: environment))
+
+            // Re-derived, never remembered. See `walk`.
+            guard let judgement = self.assess(target) else { return completion(false) }
+            switch judgement.outcome {
+            case .skip(let reason):
+                self.noteBlocked(target, reason: reason, now: judgement.environment.now)
+                completion(false)
+            case .recycle:
+                completion(
+                    self.recycle(
+                        target,
+                        candidate: judgement.candidate,
+                        environment: judgement.environment
+                    )
+                )
+            }
         }
     }
 
@@ -1179,15 +1408,17 @@ final class TabRecycler {
         )
     }
 
+    /// Everything app-wide, read *now*. Never cached across an `await`-shaped
+    /// gap — see `assess`.
     private func makeEnvironment() -> RecycleDecision.Environment {
         RecycleDecision.Environment(
             now: now(),
             isEnabled: settings.automaticTabRecycling,
-            appIsActive: NSApp.isActive,
+            appIsActive: appIsActive(),
             mainWindowIsVisible: host?.mainWindowIsVisible ?? false,
-            systemIdle: Self.systemIdleSeconds(),
+            systemIdle: systemIdle(),
             lastLocalInputAt: lastLocalInputAt,
-            modalIsUp: NSApp.modalWindow != nil || NSApp.keyWindow?.attachedSheet != nil,
+            modalIsUp: modalIsUp(),
             lastRecycleAt: lastRecycleAt,
             reachability: host?.reachability ?? .down,
             lastWakeAt: host?.lastWakeAt
