@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-27
+
 ### Added
 - Every Mail tab now carries its own account's unread count, so the number on
   the Dock is attributable at a glance instead of being one total you have to
