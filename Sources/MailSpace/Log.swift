@@ -9,4 +9,12 @@ enum Log {
     static func error(_ message: String) {
         FileHandle.standardError.write(Data("MailSpace: \(message)\n".utf8))
     }
+
+    /// Something that happened on its own and that the user may need to
+    /// reconstruct afterwards — an automatic tab recycle, an account reported
+    /// signed out. Same stream as `error`: one `log stream`/Console filter finds
+    /// everything MailSpace says about itself.
+    static func info(_ message: String) {
+        FileHandle.standardError.write(Data("MailSpace: \(message)\n".utf8))
+    }
 }

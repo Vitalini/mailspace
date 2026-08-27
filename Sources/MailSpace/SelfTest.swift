@@ -61,6 +61,14 @@ enum SelfTest {
         case autofill
         case store
         case update
+        /// Measures what a recycle actually reclaims, against a synthetic page
+        /// that touches no Google account and loads no mail.
+        case bench
+        /// Settles the two platform behaviours the recycling guards rest on.
+        case assume
+        /// Renders the tab bar offscreen to a PNG, so the signed-out signal can
+        /// be looked at without opening a window on anyone's screen.
+        case tabshot
     }
 
     /// The throwaway identity self-tests run under. Assembled by
@@ -142,6 +150,98 @@ enum SelfTest {
         let configuration = WebViewFactory.makeConfiguration(dataStoreIdentifier: UUID())
         configuration.websiteDataStore = .nonPersistent()
         return configuration
+    }
+
+    /// A window WebKit will run a page in that never reaches the display.
+    ///
+    /// Stronger than `presentOffscreen`: the process takes no activation policy
+    /// at all, the window is created deferred so no backing store is realised
+    /// before it is ordered out, and it is ordered out before the run loop turns.
+    /// The benchmark runs for half an hour on a Mac somebody is using.
+    @discardableResult
+    static func headlessWindow(hosting view: NSView) -> NSWindow {
+        NSApp.setActivationPolicy(.prohibited)
+        let window = NSWindow(
+            contentRect: NSRect(x: -8000, y: -8000, width: 1200, height: 900),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: true
+        )
+        window.contentView?.addSubview(view)
+        view.frame = window.contentView?.bounds ?? .zero
+        view.translatesAutoresizingMaskIntoConstraints = true
+        window.orderOut(nil)
+        return window
+    }
+
+    /// The pids of every `com.apple.WebKit.WebContent` process this user owns
+    /// right now.
+    ///
+    /// Attribution without SPI and without privileges: snapshot this set before
+    /// the harness creates its webview and again afterwards, and the difference
+    /// is the harness's own process. It cannot misattribute to an already
+    /// running MailSpace, whose processes are in the first snapshot.
+    static func webContentPids() -> Set<Int32> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-xo", "pid=,comm="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        guard (try? process.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        var pids: Set<Int32> = []
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            guard line.contains("com.apple.WebKit.WebContent") else { continue }
+            let fields = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            if let first = fields.first, let pid = Int32(first) { pids.insert(pid) }
+        }
+        return pids
+    }
+
+    /// One process's physical footprint in MB, from `footprint(1)` — the same
+    /// number the memory report was measured with. Falls back to RSS.
+    static func footprintMB(pid: Int32) -> Double? {
+        if let value = shell("/usr/bin/footprint", ["-p", "\(pid)"]) {
+            for line in value.split(separator: "\n") where line.contains("phys_footprint:") {
+                let parts = line.split(separator: ":", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let text = parts[1].trimmingCharacters(in: .whitespaces)
+                let pieces = text.split(separator: " ")
+                guard let number = Double(pieces.first ?? "") else { continue }
+                switch pieces.last.map(String.init) {
+                case "KB": return number / 1024
+                case "MB": return number
+                case "GB": return number * 1024
+                case "B": return number / (1024 * 1024)
+                default: return number / 1024
+                }
+            }
+        }
+        guard
+            let rss = shell("/bin/ps", ["-o", "rss=", "-p", "\(pid)"]),
+            let kb = Double(rss.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return kb / 1024
+    }
+
+    private static func shell(_ path: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func environmentDouble(_ name: String, default fallback: Double) -> Double {
+        ProcessInfo.processInfo.environment[name].flatMap(Double.init) ?? fallback
     }
 }
 

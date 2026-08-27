@@ -124,6 +124,41 @@ final class AccountSession {
         }
     }
 
+    /// Replaces one view's webview with a fresh one on the same configuration,
+    /// and hands the new object back.
+    ///
+    /// Replacement rather than `reload()` on purpose. 68% of the measured 2.3 GB
+    /// is WebKit malloc inside the WebContent processes, and an in-process
+    /// reload hands that back on JSC's and libpas's own schedule, into a process
+    /// that has already grown its high-water mark. Dropping the webview releases
+    /// the process outright and the new page starts from baseline, so the saving
+    /// is guaranteed by construction rather than hoped for. It is also the
+    /// stronger fix for the second symptom: a dead long-poll or a wedged service
+    /// worker in a twenty-hour page is exactly the kind of state that survives an
+    /// in-process reload.
+    ///
+    /// The caller navigates the returned webview to the URL the old one was on,
+    /// so the label and the open thread survive just as they would under
+    /// `reload()`.
+    ///
+    /// Re-using `teardown` is not an implementation detail: that call is what
+    /// fires `webViewWasDiscarded(old)`, and the crash budget, the stall token,
+    /// the sign-in provenance flag and the `SSOEscort` pass are all keyed by
+    /// object identity — an address the allocator is free to hand to the fresh
+    /// webview next.
+    func recycle(_ view: AccountView) -> WKWebView? {
+        guard let old = views[view] else { return nil }
+
+        let fresh = WebViewFactory.makeWebView(configuration: configuration)
+        if let delegate {
+            fresh.navigationDelegate = delegate
+            fresh.uiDelegate = delegate
+        }
+        views[view] = fresh
+        teardown(old)
+        return fresh
+    }
+
     /// Tears the session down before its data store can be deleted.
     ///
     /// WebKit refuses to remove a store anything still references, and this

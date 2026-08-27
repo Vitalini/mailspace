@@ -159,7 +159,10 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         )
     }
 
-    private func post(title: String, body: String, tag: String, account: Account, view: AccountView) {
+    /// Internal rather than private: the session-health indicator posts through
+    /// the same path, so its click routes back to the right account and view
+    /// with nothing new to build.
+    func post(title: String, body: String, tag: String, account: Account, view: AccountView) {
         guard let center else { return }
 
         let content = UNMutableNotificationContent()

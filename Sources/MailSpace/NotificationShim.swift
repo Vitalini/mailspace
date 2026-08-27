@@ -13,8 +13,13 @@ import WebKit
 enum NotificationShim {
     static let handlerName = "mailspaceNotify"
 
+    /// Main frame only, like `LoginAutofill`. `NotificationOrigin.isTrusted`
+    /// opens by rejecting every subframe, so a shim running in an iframe could
+    /// never produce a notification that was accepted — it only cost a script
+    /// evaluation in every third-party frame Gmail embeds, and left
+    /// `window.webkit.messageHandlers.mailspaceNotify` reachable from them.
     static var userScript: WKUserScript {
-        WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true)
     }
 
     private static let source = """

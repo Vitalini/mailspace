@@ -14,6 +14,7 @@ final class AppSettings {
     enum Key {
         static let automaticallyChecksForUpdates = "AutomaticallyCheckForUpdates"
         static let lastUpdateCheck = "LastUpdateCheck"
+        static let automaticTabRecycling = "AutomaticTabRecycling"
     }
 
     static let shared = AppSettings()
@@ -26,7 +27,8 @@ final class AppSettings {
 
     static func registerDefaults(in defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
-            Key.automaticallyChecksForUpdates: true
+            Key.automaticallyChecksForUpdates: true,
+            Key.automaticTabRecycling: true
         ])
     }
 
@@ -36,6 +38,16 @@ final class AppSettings {
     var automaticallyChecksForUpdates: Bool {
         get { defaults.bool(forKey: Key.automaticallyChecksForUpdates) }
         set { defaults.set(newValue, forKey: Key.automaticallyChecksForUpdates) }
+    }
+
+    /// Whether MailSpace rebuilds a tab that has been open a long time.
+    ///
+    /// On by default, and the reason the app does not grow to gigabytes over a
+    /// day of uptime. Off means a tab is only ever reloaded when the user asks
+    /// — ⌘R, or selecting a tab the crash throttle gave up on.
+    var automaticTabRecycling: Bool {
+        get { defaults.bool(forKey: Key.automaticTabRecycling) }
+        set { defaults.set(newValue, forKey: Key.automaticTabRecycling) }
     }
 
     /// When the last check completed — successfully or not. Also the throttle: a

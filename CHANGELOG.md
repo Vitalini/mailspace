@@ -10,7 +10,30 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Added
+- Tabs left open for a long time are now rebuilt on their own, so MailSpace no
+  longer grows to gigabytes over a day of uptime and a Gmail tab no longer
+  quietly stops syncing until you quit the app. It happens in the background,
+  keeps the label and the thread you were on, and waits while you are typing,
+  while a message is being written, while an event is being edited, and while a
+  download or a sign-in is running. Switch it off in Settings ▸ General.
+- Once a day or so, the tab you are actually looking at is rebuilt too — but
+  only after you have left it alone for a minute and a half. You will see it
+  blink once and come back where you were.
+- An account whose Google session has expired now says so: an orange warning on
+  its Mail tab, an exclamation mark on the Dock badge, and one notification.
+  Clicking the tab takes you straight to the sign-in page.
+- `View ▸ Reload All Tabs` (⌥⌘R) reloads every tab by hand. It is a diagnostic;
+  the automatic rebuild above is what actually keeps things healthy.
+
 ### Fixed
+- The Dock badge fills in as soon as your mail loads, instead of staying blank
+  for up to a minute after launch.
+- The unread badge no longer drops to zero while an account's tab is reloading.
+  A count is only cleared when Google actually says the account is signed out.
+- Clicking the tab you are already on no longer makes the page throw away and
+  rebuild its drawing, and no longer steals the cursor out of what you were
+  typing.
 - A release note too long for one line stays part of its bullet in the update
   window, instead of breaking off into a stray line at the left margin.
 

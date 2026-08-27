@@ -8,8 +8,14 @@ protocol AccountHosting: AnyObject {
     func requestAddAccount()
     func requestEditAccount(id: UUID)
     func requestRemoveAccount(id: UUID)
-    /// This tab is now the visible one.
-    func tabBecameVisible(accountId: UUID, view: AccountView)
+    /// This tab is now the visible one. `isSelectionChange` separates a real
+    /// tab change from a `refresh()` that happened to re-render the same tab —
+    /// the second must not re-navigate anything.
+    func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool)
+    /// This tab has just stopped being the visible one.
+    func tabWasDeselected(accountId: UUID, view: AccountView)
+    /// Accounts the health monitor currently reports as signed out.
+    func signedOutAccounts() -> Set<UUID>
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -36,6 +42,15 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private let emptyState = EmptyStateView()
 
     private(set) var selection: Selection?
+    /// What the content area is actually showing. A `refresh()` that resolves to
+    /// this same selection is a redundant re-pin.
+    private var pinned: Selection?
+
+    /// Whether the window is genuinely on screen — the recycler's opportunity
+    /// gate for the selected tab.
+    var isOnScreen: Bool {
+        window.isVisible && !window.isMiniaturized
+    }
 
     init(host: AccountHosting) {
         self.host = host
@@ -137,7 +152,14 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         // does offer.
         guard let resolved = account.isEnabled(view) ? view : account.effectiveView else { return }
 
-        selection = Selection(accountId: accountId, view: resolved)
+        let next = Selection(accountId: accountId, view: resolved)
+        // G11: Gmail issues actions optimistically, so a tab that has just
+        // become "background" may still have a request in flight. The recycler
+        // holds off on it for five minutes.
+        if let previous = selection, previous != next {
+            host.tabWasDeselected(accountId: previous.accountId, view: previous.view)
+        }
+        selection = next
         store.setLastView(resolved, for: accountId)
         UserDefaults.standard.set(accountId.uuidString, forKey: Self.lastAccountDefaultsKey)
         refresh()
@@ -205,14 +227,22 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     func refresh() {
         selection = Self.reconciledSelection(selection, accounts: store.accounts)
 
-        tabBar.rebuild(accounts: store.accounts, selection: selection)
+        tabBar.rebuild(
+            accounts: store.accounts,
+            selection: selection,
+            signedOut: host.signedOutAccounts()
+        )
         rebuildAccountsMenu()
         showActiveContent()
     }
 
-    private func showActiveContent() {
-        contentContainer.subviews.forEach { $0.removeFromSuperview() }
+    /// Whether the content area already shows exactly this view and nothing
+    /// else. Pure so the "do not re-pin what is already pinned" rule is a test.
+    static func needsRepin(currentSubviews: [NSView], desired: NSView) -> Bool {
+        currentSubviews.count != 1 || currentSubviews[0] !== desired
+    }
 
+    private func showActiveContent() {
         guard
             let selection,
             let account = store.account(id: selection.accountId),
@@ -220,19 +250,51 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             let webView = session.webView(for: selection.view)
         else {
             window.title = "MailSpace"
-            pin(emptyState, in: contentContainer)
+            if Self.needsRepin(currentSubviews: contentContainer.subviews, desired: emptyState) {
+                contentContainer.subviews.forEach { $0.removeFromSuperview() }
+                pin(emptyState, in: contentContainer)
+            }
+            pinned = nil
             return
         }
 
-        pin(webView, in: contentContainer)
+        // Every `refresh()` used to remove all subviews and re-pin, including a
+        // re-click of the tab already showing and every drag drop. Each round
+        // trip makes WebKit drop and rebuild the compositing backing store for
+        // that page, which is real repaint work on a webview that has not
+        // changed.
+        if Self.needsRepin(currentSubviews: contentContainer.subviews, desired: webView) {
+            contentContainer.subviews.forEach { $0.removeFromSuperview() }
+            pin(webView, in: contentContainer)
+        }
         window.title = "\(account.name) — \(selection.view.displayName)"
-        // Hand focus straight to the page so Gmail's own shortcuts work
-        // without an extra click (R15).
-        window.makeFirstResponder(webView)
+
+        // A real tab change still hands focus straight to the page, so Gmail's
+        // own shortcuts work without an extra click (R15). A redundant refresh
+        // does not, because yanking first responder back mid-typing is exactly
+        // the cost the skip above exists to avoid.
+        let isSelectionChange = pinned != selection
+        if isSelectionChange {
+            window.makeFirstResponder(webView)
+        }
+        pinned = selection
         // Bringing a tab up is also the cue to revive one whose content process
-        // kept crashing; the user asking to see it is the bound on how often
-        // that is retried.
-        host.tabBecameVisible(accountId: selection.accountId, view: selection.view)
+        // kept crashing, and to put the sign-in page in front of the user when
+        // the account is signed out; the user asking to see it is the bound on
+        // how often either is retried.
+        host.tabBecameVisible(
+            accountId: selection.accountId,
+            view: selection.view,
+            isSelectionChange: isSelectionChange
+        )
+    }
+
+    /// The selected tab's webview object has been replaced underneath us — an
+    /// automatic recycle. Force the re-pin the skip above would otherwise
+    /// suppress, and hand focus to the new page.
+    func replacedSelectedWebView() {
+        pinned = nil
+        refresh()
     }
 
     private func pin(_ view: NSView, in container: NSView) {
@@ -403,7 +465,17 @@ final class AccountTabBar: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used — the UI is built programmatically") }
 
-    func rebuild(accounts: [Account], selection: MainWindowController.Selection?) {
+    /// Whether this tab carries the signed-out warning.
+    ///
+    /// The evidence is the account's *mail* webview — the feed probe and the
+    /// classified URL both live there — so the warning is shown on the Mail
+    /// tab, which is also the tab whose selection puts the sign-in form in
+    /// front of the user.
+    static func showsSignedOut(tab: TabRef, signedOut: Set<UUID>) -> Bool {
+        tab.view == .mail && signedOut.contains(tab.accountId)
+    }
+
+    func rebuild(accounts: [Account], selection: MainWindowController.Selection?, signedOut: Set<UUID> = []) {
         for view in tabStack.arrangedSubviews {
             tabStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -415,7 +487,12 @@ final class AccountTabBar: NSView {
         for tab in tabs {
             guard let account = accounts.first(where: { $0.id == tab.accountId }) else { continue }
             let isSelected = selection.map { $0.accountId == tab.accountId && $0.view == tab.view } ?? false
-            let tabView = AccountTabView(account: account, view: tab.view, isSelected: isSelected)
+            let tabView = AccountTabView(
+                account: account,
+                view: tab.view,
+                isSelected: isSelected,
+                isSignedOut: Self.showsSignedOut(tab: tab, signedOut: signedOut)
+            )
             tabView.onClick = { [weak self] tab in self?.onSelectTab?(tab) }
             tabView.onEdit = { [weak self] id in self?.onEditAccount?(id) }
             tabView.onRemove = { [weak self] id in self?.onRemoveAccount?(id) }
@@ -488,7 +565,7 @@ final class AccountTabView: NSView, NSDraggingSource {
     /// moves is a click and a press that moves is a reorder.
     private var pressOrigin: NSPoint?
 
-    init(account: Account, view: AccountView, isSelected: Bool) {
+    init(account: Account, view: AccountView, isSelected: Bool, isSignedOut: Bool = false) {
         self.tab = AccountTabBar.Tab(accountId: account.id, view: view)
         self.tint = account.color.nsColor
         self.selected = isSelected
@@ -510,9 +587,11 @@ final class AccountTabView: NSView, NSDraggingSource {
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        toolTip = account.email.isEmpty
+        let base = account.email.isEmpty
             ? "\(account.name) · \(view.displayName)"
             : "\(account.name) · \(view.displayName) — \(account.email)"
+        toolTip = isSignedOut ? "Signed out of Google — click this tab to sign in again." : base
+        setAccessibilityLabel(isSignedOut ? "\(base). Signed out of Google." : base)
 
         addSubview(icon)
         addSubview(label)
@@ -523,12 +602,36 @@ final class AccountTabView: NSView, NSDraggingSource {
             icon.heightAnchor.constraint(equalToConstant: 14),
 
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             heightAnchor.constraint(equalToConstant: 28),
             widthAnchor.constraint(lessThanOrEqualToConstant: 260)
         ])
+
+        // The trailing accessory slot. Signed-out and an unread count are
+        // mutually exclusive by construction — an account whose feed cannot be
+        // read has no count — so this one slot carries whichever is true, and
+        // the warning costs no tab width that the unread pill was not already
+        // going to take.
+        //
+        // Filled orange rather than the account tint on purpose: every other
+        // element in this bar is tinted with the account colour, so the single
+        // non-tint thing in the tab bar is the one thing that cannot be read as
+        // "this is the purple account".
+        if isSignedOut {
+            let pill = SignedOutPill()
+            pill.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(pill)
+            NSLayoutConstraint.activate([
+                label.trailingAnchor.constraint(equalTo: pill.leadingAnchor, constant: -6),
+                pill.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+                pill.centerYAnchor.constraint(equalTo: centerYAnchor),
+                pill.widthAnchor.constraint(equalToConstant: SignedOutPill.size.width),
+                pill.heightAnchor.constraint(equalToConstant: SignedOutPill.size.height)
+            ])
+        } else {
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12).isActive = true
+        }
 
         let contextMenu = NSMenu()
         let settings = contextMenu.addItem(withTitle: "Account Settings…", action: #selector(edit(_:)), keyEquivalent: "")
@@ -621,6 +724,49 @@ final class AccountTabView: NSView, NSDraggingSource {
 
     @objc private func removeAccount(_ sender: Any?) {
         onRemove?(tab.accountId)
+    }
+}
+
+/// The warning capsule in a tab's trailing accessory slot: this account's
+/// Google session is gone and MailSpace has stopped receiving its mail.
+final class SignedOutPill: NSView {
+    static let size = NSSize(width: 24, height: 16)
+
+    override var intrinsicContentSize: NSSize { Self.size }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let body = bounds.insetBy(dx: 0.5, dy: 0.5)
+        NSColor.systemOrange.withAlphaComponent(0.9).setFill()
+        NSBezierPath(roundedRect: body, xRadius: body.height / 2, yRadius: body.height / 2).fill()
+
+        guard
+            let symbol = NSImage(
+                systemSymbolName: "exclamationmark.triangle.fill",
+                accessibilityDescription: "Signed out"
+            )
+        else { return }
+        let configured = symbol.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+        ) ?? symbol
+        let side: CGFloat = 11
+        let rect = NSRect(
+            x: body.midX - side / 2,
+            y: body.midY - side / 2,
+            width: side,
+            height: side
+        )
+        // The white has to be composited in a context of its own. Done directly
+        // into this view's context, `sourceAtop` sees the orange capsule
+        // underneath as opaque and paints a white block over the whole glyph
+        // box instead of only the glyph.
+        let glyph = NSImage(size: rect.size, flipped: false) { bounds in
+            configured.isTemplate = true
+            configured.draw(in: bounds)
+            NSColor.white.set()
+            bounds.fill(using: .sourceAtop)
+            return true
+        }
+        glyph.draw(in: rect)
     }
 }
 

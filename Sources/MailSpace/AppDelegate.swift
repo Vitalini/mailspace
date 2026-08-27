@@ -1,13 +1,16 @@
 import AppKit
+import Network
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating, NotificationRouting {
+final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating, NotificationRouting, TabRecyclerHost {
     let accountStore = AccountStore()
 
     private let navigationPolicy = NavigationPolicy()
     private let loginAutofill = LoginAutofill()
     private let notificationBridge = NotificationBridge()
     private let unreadPoller = UnreadPoller()
+    private let tabRecycler = TabRecycler()
+    private let health = SessionHealthTracker()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private let updateController = UpdateController()
@@ -17,8 +20,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var autofillProbe: AutofillProbe?
     private var storeProbe: StoreRemovalProbe?
     private var updateProbe: UpdateProbe?
+    private var benchProbe: BenchProbe?
+    private var assumptionProbe: AssumptionProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
+
+    /// Accounts whose Dock contribution has already been seeded from a real
+    /// page. The first poll runs at t=0, when every mail webview is still
+    /// blank, so without this the badge stayed empty for up to a minute after
+    /// every launch.
+    private var badgeSeeded: Set<UUID> = []
+    private let launchedAt = Date()
+    private var lastWakeAt: Date?
+    /// Whether the Mac currently has a usable network path. A cycle without one
+    /// tells the health monitor nothing.
+    private var networkIsUp = true
+    private let pathMonitor = NWPathMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A self-test never runs as the app the user relies on. Its probes talk
@@ -55,6 +72,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
                 return (accountId: account.id, webView: webView)
             }
         }
+        unreadPoller.onObservation = { [weak self] accountId, observation in
+            self?.health.record(observation, for: accountId)
+        }
+        unreadPoller.isBusy = { [weak self] accountId in self?.isBusy(accountId) ?? true }
+        unreadPoller.isBackingOff = { [weak self] accountId in self?.health.isBackingOff(accountId) ?? false }
+        health.onChange = { [weak self] accountId, change in self?.healthChanged(accountId, change) }
+
+        tabRecycler.host = self
+        navigationPolicy.onDidCommit = { [weak self] webView in self?.webViewDidCommit(webView) }
+        navigationPolicy.onDidFinish = { [weak self] webView in self?.webViewDidFinish(webView) }
+        navigationPolicy.onNavigationFailed = { [weak self] webView, _ in
+            self?.tabRecycler.webViewDidFail(webView)
+        }
+        navigationPolicy.onWebViewDiscarded = { [weak self] webView in
+            self?.tabRecycler.webViewWasDiscarded(webView)
+        }
+        observeSleepAndNetwork()
 
         if SelfTest.mode == .login {
             loginProbe = LoginProbe()
@@ -81,6 +115,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
             updateProbe?.run()
             return
         }
+        if SelfTest.mode == .bench {
+            benchProbe = BenchProbe()
+            benchProbe?.run()
+            return
+        }
+        if SelfTest.mode == .assume {
+            assumptionProbe = AssumptionProbe()
+            assumptionProbe?.run()
+            return
+        }
+        if SelfTest.mode == .tabshot {
+            TabShotProbe().run()
+            return
+        }
 
         for account in accountStore.accounts {
             makeSession(for: account)
@@ -93,6 +141,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         notificationBridge.start()
         unreadPoller.start()
+        // Started only once every account has a session, so the very first tick
+        // sees the real tab list.
+        tabRecycler.start()
         updateController.start()
         sweepOrphanedDataStores()
         if let pending = pendingMailto {
@@ -164,11 +215,167 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     /// stopped reloading gets another go now that someone is looking at it —
     /// the throttle exists to stop a reload loop, not to retire the tab for the
     /// rest of the session.
-    func tabBecameVisible(accountId: UUID, view: AccountView) {
+    ///
+    /// It is also where a signed-out account is put back in front of him. The
+    /// stale-inbox variant is still sitting on a rendered `mail.google.com`
+    /// page, so clicking the warning would otherwise show him the same dead
+    /// inbox; re-navigating to the view's own entry point makes Gmail redirect
+    /// straight to the sign-in form, and `shouldLoadInOpener` then keeps the
+    /// whole chain in the tab.
+    func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool) {
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
         // The view's own entry point comes along because a webview that crashed
         // before committing anything has no URL to reload.
         navigationPolicy.recoverIfStalled(webView, baseURL: view.url)
+
+        // Gated on a *real* selection change: `refresh()` calls this
+        // unconditionally, and a rebuild of the tab bar is not the user asking
+        // for anything.
+        guard isSelectionChange, view == .mail else { return }
+        guard health.shouldRenavigate(accountId: accountId, url: webView.url) else { return }
+        Log.info("signed-out account selected; re-navigating its mail tab to the sign-in page")
+        webView.load(URLRequest(url: view.url))
+    }
+
+    /// G11: this tab has just stopped being the visible one.
+    func tabWasDeselected(accountId: UUID, view: AccountView) {
+        guard let webView = sessions[accountId]?.webView(for: view) else { return }
+        tabRecycler.webViewWasDeselected(webView)
+    }
+
+    func signedOutAccounts() -> Set<UUID> {
+        health.signedOutAccounts
+    }
+
+    // MARK: - TabRecyclerHost
+
+    var mainWindowIsVisible: Bool {
+        windowController?.isOnScreen ?? false
+    }
+
+    func recycleTargets() -> [TabRecycler.Target] {
+        TabOrder.tabs(for: accountStore.accounts).enumerated().compactMap { index, tab in
+            guard
+                let account = accountStore.account(id: tab.accountId),
+                let webView = sessions[tab.accountId]?.webView(for: tab.view)
+            else { return nil }
+            return TabRecycler.Target(
+                accountId: tab.accountId,
+                accountName: account.name,
+                view: tab.view,
+                slot: index,
+                webView: webView
+            )
+        }
+    }
+
+    func recycleCandidate(for target: TabRecycler.Target) -> RecycleDecision.Candidate? {
+        guard let session = sessions[target.accountId] else { return nil }
+        // G4(c): a sign-in in flight on *any* of the account's webviews blocks
+        // all of them, because `signInCompleted` is about to call
+        // `reloadSignedOutViews` across the whole session and the two must not
+        // race.
+        let authenticating = session.webViews.contains { navigationPolicy.isAuthenticating($0) }
+        return RecycleDecision.Candidate(
+            url: target.webView.url,
+            view: target.view,
+            slot: target.slot,
+            committedAt: nil,
+            isSelected: windowController?.selection
+                == MainWindowController.Selection(accountId: target.accountId, view: target.view),
+            isLoading: target.webView.isLoading,
+            isStalled: navigationPolicy.isStalled(target.webView),
+            isAuthenticating: authenticating,
+            accountHasPopup: navigationPolicy.hasPopup(for: target.accountId),
+            accountHasDownload: navigationPolicy.hasActiveDownload(for: target.accountId),
+            accountIsSignedOut: health.isSignedOut(target.accountId),
+            lastOpenPanelAt: navigationPolicy.lastOpenPanel(for: target.webView),
+            lastDeselectedAt: nil
+        )
+    }
+
+    func performRecycle(_ target: TabRecycler.Target, to url: URL) -> WKWebView? {
+        guard let fresh = sessions[target.accountId]?.recycle(target.view) else { return nil }
+        fresh.load(URLRequest(url: url))
+        // Nothing else needs re-wiring: `UnreadPoller.mailWebViews` re-reads the
+        // session on every call, and `NotificationBridge` resolves through
+        // `session(hosting:)`.
+        if windowController?.selection
+            == MainWindowController.Selection(accountId: target.accountId, view: target.view) {
+            windowController?.replacedSelectedWebView()
+        }
+        return fresh
+    }
+
+    // MARK: - Session health
+
+    private func webViewDidCommit(_ webView: WKWebView) {
+        tabRecycler.webViewDidCommit(webView)
+        tabRecycler.webViewDidSettle(webView)
+        guard let session = session(hosting: webView), session.view(for: webView) == .mail else { return }
+        health.didCommit(for: session.accountId)
+    }
+
+    private func webViewDidFinish(_ webView: WKWebView) {
+        guard let session = session(hosting: webView), session.view(for: webView) == .mail else { return }
+        guard badgeSeeded.insert(session.accountId).inserted else { return }
+        unreadPoller.refresh(accountId: session.accountId)
+    }
+
+    /// Whether nothing can be concluded about this account's session right now.
+    private func isBusy(_ accountId: UUID) -> Bool {
+        guard let webView = sessions[accountId]?.webView(for: .mail) else { return true }
+        if webView.isLoading { return true }
+        if tabRecycler.isRecycling(webView) { return true }
+        if let age = tabRecycler.age(of: webView), age < 90 { return true }
+        if !networkIsUp { return true }
+        let now = Date()
+        if now.timeIntervalSince(launchedAt) < 120 { return true }
+        if let wake = lastWakeAt, now.timeIntervalSince(wake) < 120 { return true }
+        return false
+    }
+
+    private func healthChanged(_ accountId: UUID, _ change: SessionHealth.Change) {
+        unreadPoller.setSignedOut(health.signedOutAccounts)
+        windowController?.refresh()
+
+        guard case .signedOut(let shouldNotify) = change else {
+            Log.info("account \(accountId.uuidString.prefix(8)) is signed in again")
+            return
+        }
+        Log.info("account \(accountId.uuidString.prefix(8)) reported signed out (notify=\(shouldNotify))")
+        guard shouldNotify, let account = accountStore.account(id: accountId) else { return }
+
+        // He is already looking at the page; a banner about it is noise.
+        let selection = windowController?.selection
+        if NSApp.isActive,
+           mainWindowIsVisible,
+           selection?.accountId == accountId,
+           selection?.view == .mail {
+            return
+        }
+
+        notificationBridge.post(
+            title: "\(account.name) — Mail is signed out",
+            body: "MailSpace stopped receiving mail for this account. Click to sign in.",
+            tag: "mailspace-session-health",
+            account: account,
+            view: .mail
+        )
+    }
+
+    private func observeSleepAndNetwork() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.lastWakeAt = Date()
+        }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async { self?.networkIsUp = path.status == .satisfied }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "com.vitalii.MailSpace.path"))
     }
 
     func requestRemoveAccount(id: UUID) {
@@ -188,6 +395,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         // every webview on it — the account's popup windows included — and
         // every download running on it has to be gone before `destroyDataStore`.
         unreadPoller.forget(accountId: id)
+        health.forget(id)
+        badgeSeeded.remove(id)
         navigationPolicy.closePopups(for: id)
         navigationPolicy.cancelDownloads(for: id)
         // Scoped on purpose: detaching is not enough, the session object itself
@@ -328,6 +537,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         ) else { return }
 
         navigationPolicy.reload(target.webView, baseURL: target.baseURL)
+    }
+
+    /// ⌥⌘R — a diagnostic, not the feature. Automatic recycling is what keeps
+    /// memory and sync healthy; this exists so a recycle can be provoked on
+    /// demand while verifying that it does. Deliberately not on plain ⌘R, which
+    /// is load-bearing for crash-throttle recovery. One line in the View menu
+    /// and this method are the whole of it.
+    @objc func reloadAllTabs(_ sender: Any?) {
+        for session in sessions.values {
+            for webView in session.webViews {
+                navigationPolicy.reload(webView, baseURL: nil)
+            }
+        }
     }
 
     /// The selected tab's web view together with the entry point to fall back
@@ -537,6 +759,10 @@ enum MainMenu {
         // The visible way back from a tab the crash throttle gave up on, and
         // the only one when that tab is the only tab there is to select.
         menu.addItem(withTitle: "Reload Tab", action: #selector(AppDelegate.reloadCurrentTab(_:)), keyEquivalent: "r")
+        // Diagnostic only. Tabs are rebuilt automatically once they have been
+        // open half a day; this is the lever for provoking one on demand.
+        let reloadAll = menu.addItem(withTitle: "Reload All Tabs", action: #selector(AppDelegate.reloadAllTabs(_:)), keyEquivalent: "r")
+        reloadAll.keyEquivalentModifierMask = [.command, .option]
         return submenuItem(menu)
     }
 

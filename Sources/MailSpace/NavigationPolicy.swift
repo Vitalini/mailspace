@@ -597,6 +597,24 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// pages behind.
     var onSignInCompleted: ((UUID) -> Void)?
 
+    /// Fires on every main-frame commit. The tab recycler's clock, and the
+    /// health monitor's streak reset — `didCommit` is not raised for a
+    /// same-document fragment change, which is exactly what both want.
+    var onDidCommit: ((WKWebView) -> Void)?
+
+    /// Fires when a main-frame navigation finishes. The unread poller uses the
+    /// first one per mail webview so the Dock badge does not sit blank for a
+    /// minute after launch.
+    var onDidFinish: ((WKWebView) -> Void)?
+
+    /// Fires when a main-frame navigation fails, provisionally or otherwise.
+    /// The recycler's retry ladder hangs off this.
+    var onNavigationFailed: ((WKWebView, Error) -> Void)?
+
+    /// Fires alongside this class's own per-webview cleanup, so state kept
+    /// elsewhere — the recycler's commit clock — dies with the object too.
+    var onWebViewDiscarded: ((WKWebView) -> Void)?
+
     /// One in-app popup: the window, and the account whose data store it runs
     /// on so removing that account can take its popups with it.
     private struct Popup {
@@ -631,6 +649,10 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// way back: without one, three terminations left it blank until the app
     /// was restarted.
     private var stalled = WeakObjectSet<WKWebView>()
+    /// When an open panel last handed files to a webview. The only proxy there
+    /// is for "an upload may be running here" — WebKit exposes no signal for a
+    /// request body still going out (see G7 in `RecycleDecision`).
+    private var lastOpenPanelAt = WeakObjectMap<WKWebView, Date>()
 
     private static var downloadsDirectory: URL {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -736,6 +758,18 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         // The off-Google pass is kept separately and on much stricter terms;
         // see `SSOEscort`.
         escorts[webView] = SSOEscort.afterCommit(escorts[webView], of: webView.url, now: Date())
+        onDidCommit?(webView)
+    }
+
+    /// A main-frame navigation that never arrived. Neither of these existed
+    /// before; the recycler needs them so a failed rebuild retries twice and
+    /// then stops, rather than leaving the tab blank or looping.
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        onNavigationFailed?(webView, error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        onNavigationFailed?(webView, error)
     }
 
     /// A `302` inside a navigation the pass already authorised is that same
@@ -750,8 +784,40 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// appears as a redirect hop back to `accounts.google.com`, so a *finished*
     /// navigation there is itself the proof the session took.
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        onDidFinish?(webView)
         guard case .app = AuthSurface.classify(webView.url) else { return }
         completeSignIn(for: webView)
+    }
+
+    // MARK: - What the recycler is allowed to ask
+
+    /// Whether a sign-in is in flight in this webview — a live `SSOEscort` pass
+    /// or an unresolved provenance flag. Either means the chain is mid-flight
+    /// even though the page may currently classify as an app surface.
+    func isAuthenticating(_ webView: WKWebView) -> Bool {
+        sawSignIn.contains(webView) || escorts[webView] != nil
+    }
+
+    /// Whether the crash throttle has given up on this webview.
+    func isStalled(_ webView: WKWebView) -> Bool {
+        stalled.contains(webView)
+    }
+
+    /// Whether any popup window is open on this account's data store — a
+    /// popped-out compose, a print sheet, an OAuth window whose
+    /// `window.opener` channel dies if the opener is replaced.
+    func hasPopup(for accountId: UUID) -> Bool {
+        popupWindows.values.contains { $0.accountId == accountId }
+    }
+
+    /// Whether a download is running on this account's data store.
+    func hasActiveDownload(for accountId: UUID) -> Bool {
+        downloads.values.contains { $0.accountId == accountId }
+    }
+
+    /// When an open panel last handed files to this webview.
+    func lastOpenPanel(for webView: WKWebView) -> Date? {
+        lastOpenPanelAt[webView]
     }
 
     /// Ends the sign-in this webview was running — once, whichever way it ends.
@@ -891,6 +957,8 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         stalled.remove(webView)
         sawSignIn.remove(webView)
         escorts.removeValue(forKey: webView)
+        lastOpenPanelAt.removeValue(forKey: webView)
+        onWebViewDiscarded?(webView)
     }
 
     // MARK: - WKUIDelegate
@@ -992,7 +1060,14 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
         panel.canChooseDirectories = parameters.allowsDirectories
         panel.canChooseFiles = true
-        completionHandler(panel.runModal() == .OK ? panel.urls : nil)
+        guard panel.runModal() == .OK else {
+            completionHandler(nil)
+            return
+        }
+        // Files really went to the page, so something may now be uploading out
+        // of it. The recycler leaves this webview alone for ten minutes.
+        lastOpenPanelAt[webView] = Date()
+        completionHandler(panel.urls)
     }
 
     // MARK: - Popups

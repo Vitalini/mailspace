@@ -33,7 +33,7 @@ BUILD_NUMBER := $(shell awk -F. '{printf "%d", $$1*10000 + $$2*100 + $$3}' VERSI
 GIT_DESCRIBE := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 .PHONY: all build compile icon bundle sign signing-cert selftest-app run smoke test clean \
-        version update-key changelog-draft release release-dry-run
+        version update-key changelog-draft release release-dry-run bench assume
 
 all: build
 
@@ -114,6 +114,26 @@ run: build
 ##         real app is only inspected on disk.
 smoke: selftest-app
 	./scripts/smoke.sh $(APP) $(SELFTEST_APP)
+
+## bench - measure what a recycle actually reclaims, both arms, offline
+##         Runs the throwaway self-test bundle: no Google account, no mail, a
+##         synthetic page in a temp directory, a deferred window that is ordered
+##         out before the run loop turns. Never the app in /Applications.
+##
+##         Arm A is `reload()`, arm B is the shipping replacement. Phase
+##         durations follow the plan (10 min grow, 5 min settle) and can be
+##         shortened with MAILSPACE_BENCH_GROW / MAILSPACE_BENCH_SETTLE.
+bench: selftest-app
+	@echo "bench: arm A — webView.reload()"
+	@MAILSPACE_SELFTEST=bench MAILSPACE_BENCH_ARM=a \
+		$(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
+	@echo "bench: arm B — replace the webview (the shipping path)"
+	@MAILSPACE_SELFTEST=bench MAILSPACE_BENCH_ARM=b \
+		$(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
+
+## assume - check the two platform behaviours the recycling guards rest on
+assume: selftest-app
+	@MAILSPACE_SELFTEST=assume $(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
 
 ## test - run the unit test suite
 test:

@@ -12,6 +12,11 @@ final class SettingsGeneralPane: NSViewController {
     private let automaticBox = NSButton(checkboxWithTitle: "Automatically check for updates", target: nil, action: nil)
     private let checkNowButton = NSButton(title: "Check Now", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    private let recycleBox = NSButton(
+        checkboxWithTitle: "Automatically refresh tabs that have been open a long time",
+        target: nil,
+        action: nil
+    )
 
     init(updates: UpdateController, settings: AppSettings = .shared) {
         self.updates = updates
@@ -57,15 +62,40 @@ final class SettingsGeneralPane: NSViewController {
         versionLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
         versionLabel.textColor = .tertiaryLabelColor
 
-        let stack = NSStackView(views: [sectionTitle, automaticBox, caption, checkRow, versionLabel])
+        let tabsTitle = NSTextField(labelWithString: "Tabs")
+        tabsTitle.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+
+        recycleBox.target = self
+        recycleBox.action = #selector(toggleRecycling(_:))
+        recycleBox.state = settings.automaticTabRecycling ? .on : .off
+
+        // No interval picker on purpose: the useful setting is on or off, and a
+        // number here would be one more thing to get wrong.
+        let recycleCaption = NSTextField(labelWithString:
+            "A Gmail or Calendar tab left open for half a day quietly grows and can stop "
+            + "syncing. MailSpace rebuilds it in the background, keeping the view you were "
+            + "on. It waits while you are typing, while a message is being written, and "
+            + "while a download is running.")
+        recycleCaption.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        recycleCaption.textColor = .secondaryLabelColor
+        recycleCaption.lineBreakMode = .byWordWrapping
+        recycleCaption.maximumNumberOfLines = 5
+        recycleCaption.preferredMaxLayoutWidth = 420
+
+        let stack = NSStackView(views: [
+            sectionTitle, automaticBox, caption, checkRow, versionLabel,
+            tabsTitle, recycleBox, recycleCaption
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(4, after: automaticBox)
         stack.setCustomSpacing(14, after: caption)
+        stack.setCustomSpacing(20, after: versionLabel)
+        stack.setCustomSpacing(4, after: recycleBox)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 340))
         content.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
@@ -80,11 +110,16 @@ final class SettingsGeneralPane: NSViewController {
     override func viewWillAppear() {
         super.viewWillAppear()
         automaticBox.state = settings.automaticallyChecksForUpdates ? .on : .off
+        recycleBox.state = settings.automaticTabRecycling ? .on : .off
         refreshStatus()
     }
 
     @objc private func toggleAutomatic(_ sender: NSButton) {
         settings.automaticallyChecksForUpdates = sender.state == .on
+    }
+
+    @objc private func toggleRecycling(_ sender: NSButton) {
+        settings.automaticTabRecycling = sender.state == .on
     }
 
     @objc private func checkNow(_ sender: Any?) {
