@@ -166,7 +166,15 @@ final class BenchProbe: NSObject, WKNavigationDelegate {
         phase = .growing
         phaseStartedAt = Date()
         peak = fresh ?? 0
-        webView.callAsyncJavaScript("return window.__grow();", arguments: [:], in: nil, in: .defaultClient) { _ in }
+        // `.page`, not `.defaultClient`: `__grow` is defined by the document's
+        // own script, and a client world cannot see the page's globals. Run in
+        // the wrong world the call fails silently and the "grown" page never
+        // grows — which is exactly what the first run of this harness measured.
+        webView.callAsyncJavaScript("return window.__grow();", arguments: [:], in: nil, in: .page) { result in
+            if case .failure(let error) = result {
+                Log.error("bench: grow failed: \(error.localizedDescription)")
+            }
+        }
         startSampling()
     }
 
