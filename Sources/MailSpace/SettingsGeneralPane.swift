@@ -24,6 +24,14 @@ final class SettingsGeneralPane: NSViewController {
     private let downloadWarning = NSTextField(labelWithString: "")
     // G4
     private let downloadActionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    // G6
+    private let countdownBox = NSButton(
+        checkboxWithTitle: "Show time until the next event on Calendar tabs",
+        target: nil,
+        action: nil
+    )
+    private let countdownStatus = NSTextField(labelWithString: "")
+    private let countdownCheckButton = NSButton(title: "Check Now", target: nil, action: nil)
     // G5
     private let defaultMailStatus = NSTextField(labelWithString: "")
     private let makeDefaultButton = NSButton(title: "Make MailSpace the Default", target: nil, action: nil)
@@ -33,10 +41,20 @@ final class SettingsGeneralPane: NSViewController {
     private let checkNowButton = NSButton(title: "Check Now", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
 
-    init(updates: UpdateController, settings: AppSettings = .shared, accounts host: AccountHosting) {
+    /// How G6 reaches the countdown poller. Defaults to an inert set, so a
+    /// window built without one — the settings self-test — still works.
+    private let calendar: CalendarCountdownControls
+
+    init(
+        updates: UpdateController,
+        settings: AppSettings = .shared,
+        accounts host: AccountHosting,
+        calendar: CalendarCountdownControls = CalendarCountdownControls()
+    ) {
         self.updates = updates
         self.settings = settings
         self.host = host
+        self.calendar = calendar
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -49,6 +67,8 @@ final class SettingsGeneralPane: NSViewController {
         let composeRow = labeledRow("Compose mailto: links from:", composePopup)
         let linksCaption = Self.caption("Works when your browser is already running.")
         let downloadActionRow = labeledRow("When a download finishes:", downloadActionPopup)
+        let countdownCaption = Self.caption("Only events later today, from the account you are signed in to.")
+        let countdownStatusRow = NSStackView(views: [countdownCheckButton, countdownStatus]).horizontal()
         let stack = NSStackView(views: [
             Self.sectionTitle("Composing"),
             composeRow,
@@ -61,6 +81,11 @@ final class SettingsGeneralPane: NSViewController {
             labeledRow("Save downloads to:", downloadRow()),
             downloadWarning,
             downloadActionRow,
+
+            Self.sectionTitle("Calendar"),
+            countdownBox,
+            countdownCaption,
+            countdownStatusRow,
 
             Self.sectionTitle("Default Mail App"),
             defaultMailStatus,
@@ -83,10 +108,13 @@ final class SettingsGeneralPane: NSViewController {
         // `makeDefaultButton` carries the gap as well as the warning under it: a
         // hidden view contributes no spacing of its own, and that warning is
         // hidden whenever macOS has not just refused.
-        for view in [composeRow, linksCaption, downloadActionRow, makeDefaultButton, defaultMailWarning] {
+        for view in [
+            composeRow, linksCaption, downloadActionRow, countdownStatusRow, makeDefaultButton, defaultMailWarning
+        ] {
             stack.setCustomSpacing(18, after: view)
         }
         stack.setCustomSpacing(4, after: backgroundLinksBox)
+        stack.setCustomSpacing(4, after: countdownBox)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         configureControls()
@@ -116,6 +144,8 @@ final class SettingsGeneralPane: NSViewController {
         backgroundLinksBox.state = settings.openLinksInBackground ? .on : .off
         refreshDownloadFolder()
         downloadActionPopup.selectItem(withTag: Self.tag(for: settings.downloadFinishedAction))
+        countdownBox.state = settings.showsCalendarCountdown ? .on : .off
+        refreshCountdownStatus()
         refreshDefaultMailApp()
         automaticBox.state = settings.automaticallyChecksForUpdates ? .on : .off
         statusLabel.stringValue = updates.lastCheckDescription
@@ -143,6 +173,17 @@ final class SettingsGeneralPane: NSViewController {
         Self.style(downloadWarning, as: .warning)
         Self.style(defaultMailWarning, as: .warning)
         defaultMailStatus.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+
+        countdownBox.target = self
+        countdownBox.action = #selector(toggleCalendarCountdown(_:))
+        countdownCheckButton.target = self
+        countdownCheckButton.action = #selector(recheckCalendar(_:))
+        countdownCheckButton.bezelStyle = .rounded
+        // The pane carries two buttons titled "Check Now" — this one and the
+        // update check. They are unambiguous under their own section headings on
+        // screen, and this is what tells them apart to anything reading the view.
+        countdownCheckButton.setAccessibilityLabel("Check the calendar countdown now")
+        Self.style(countdownStatus, as: .secondary)
 
         makeDefaultButton.target = self
         makeDefaultButton.action = #selector(makeDefault(_:))
@@ -257,6 +298,40 @@ final class SettingsGeneralPane: NSViewController {
 
     private static func tag(for action: DownloadFinishedAction) -> Int {
         (DownloadFinishedAction.allCases.firstIndex(of: action) ?? 0) + 1
+    }
+
+    // MARK: - G6
+
+    @objc private func toggleCalendarCountdown(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        settings.showsCalendarCountdown = enabled
+        calendar.setEnabled(enabled)
+        refreshCountdownStatus()
+    }
+
+    /// Asks for a fresh check and reports what came back.
+    ///
+    /// This is the cheap way to find out whether the countdown can read a
+    /// calendar at all, on the owner's own signed-in session, without anyone
+    /// else going near it. The line says what happened — worked, refused, not
+    /// understood, no answer — and never what it read.
+    @objc private func recheckCalendar(_ sender: Any?) {
+        countdownCheckButton.isEnabled = false
+        countdownStatus.stringValue = "Checking…"
+        calendar.recheck { [weak self] in
+            self?.countdownCheckButton.isEnabled = true
+            self?.refreshCountdownStatus()
+        }
+    }
+
+    private func refreshCountdownStatus() {
+        let status = calendar.status()
+        countdownStatus.stringValue = status.text
+        // Red only for the two answers that mean the feature cannot work here.
+        // "Not checked yet" and "waiting for a Calendar tab" are ordinary.
+        let broken = status.kind == .refused || status.kind == .notUnderstood
+        countdownStatus.textColor = broken ? .systemRed : .secondaryLabelColor
+        countdownCheckButton.isEnabled = settings.showsCalendarCountdown
     }
 
     // MARK: - G5

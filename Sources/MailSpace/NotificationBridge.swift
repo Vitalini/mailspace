@@ -85,6 +85,12 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
     /// without waiting for the next poll.
     var onMailNotification: ((UUID) -> Void)?
 
+    /// The same, for a calendar reminder: something on that account's calendar
+    /// just moved, so the countdown asks again. A reminder fires at the user's
+    /// own reminder offset and cannot answer "in five hours", so it is a nudge
+    /// to re-check, never the source of the number.
+    var onCalendarNotification: ((UUID) -> Void)?
+
     /// The tab on screen right now, or `nil` when MailSpace has none. B1 reads
     /// it to decide whether a banner would be announcing the page the user is
     /// already looking at.
@@ -214,10 +220,11 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             }
         }
 
-        if view == .mail {
-            let accountId = account.id
-            DispatchQueue.main.async { [weak self] in
-                self?.onMailNotification?(accountId)
+        let accountId = account.id
+        DispatchQueue.main.async { [weak self] in
+            switch view {
+            case .mail: self?.onMailNotification?(accountId)
+            case .calendar: self?.onCalendarNotification?(accountId)
             }
         }
     }

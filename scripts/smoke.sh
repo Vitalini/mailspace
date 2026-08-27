@@ -319,6 +319,19 @@ case "$SETTINGS_OUT" in
   *) fail "settings defaults: $SETTINGS_OUT" ;;
 esac
 
+# 7bc. The Calendar countdown's parser. Privacy puts the shipped parser inside
+#      the page — the agenda response carries meeting titles, and only numbers
+#      cross the bridge — so `swift test` cannot reach it. This probe runs that
+#      exact script over every hand-written fixture in an offscreen webview and
+#      asserts it agrees with the Swift reference parser on all of them.
+#      No network: no htmlembed fetch, no data store, no signed-in session, and
+#      every fixture is synthetic with placeholder titles.
+AGENDA_OUT="$(MAILSPACE_SELFTEST=agenda run_with_timeout 90 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$AGENDA_OUT" in
+  *"result=ok"*) pass "agenda parser agrees with its Swift reference: $AGENDA_OUT" ;;
+  *) fail "agenda parser: $AGENDA_OUT" ;;
+esac
+
 # 7c. The updater's verify-and-swap, against the real signed app, in a temporary
 #     directory. This is the code that could corrupt an install, and every
 #     interesting part of it lives outside Swift — ditto round-tripping a

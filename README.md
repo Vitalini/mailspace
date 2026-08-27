@@ -119,6 +119,36 @@ downloads land and what happens when one finishes, who owns `mailto:` on this
 Mac — and, per account, mail alerts, calendar alerts and whether that account
 counts toward the Dock badge. Nothing there needs a relaunch.
 
+### The Calendar countdown
+
+**Settings ▸ General ▸ Calendar** turns on a countdown to the next event later
+today, on each Calendar tab, for the account that tab belongs to. It reads
+Google Calendar's own no-JavaScript agenda page from inside the tab you are
+already signed in to — no new sign-in, no Google API, no stored credential — and
+the page is parsed where it lands, so only three numbers ever reach MailSpace.
+No event title, guest, location or link is read out of it, logged, or written
+anywhere.
+
+What it deliberately does not do:
+
+- **It never guesses.** No answer, an answer it does not recognise, or a day
+  header that is not today all show *nothing*. A value that cannot be refreshed
+  is dropped after fifteen minutes, at the event's start, or at local midnight,
+  rather than ageing on the tab.
+- **It cannot see an event already in progress.** The agenda prints start times
+  only, never ranges, so a meeting that has begun is not a candidate — the
+  countdown moves to the next start or goes blank.
+- **It counts what is on the calendar**, including an event you have declined,
+  because the agenda does not mark one.
+- **Only your own primary calendar**, only events later today, and only for an
+  account that has an email address on it.
+
+The **Check Now** button next to the switch says what the last check did —
+working, waiting for a signed-in Calendar tab, refused, or not understood — and
+never what it read. *Refused* means Google will not serve that calendar this
+way and the countdown cannot work for it; *not understood* means the page came
+back in a shape MailSpace does not recognise.
+
 Three switches deliberately have no row. They are debugging valves, read at the
 point of use, and a row would suggest they are worth touching:
 

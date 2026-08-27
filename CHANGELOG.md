@@ -10,6 +10,24 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Added
+- A Calendar tab can say how long until that account's next event later today —
+  `5m`, `1h`, `5h`. It reads the account's own calendar through the tab you are
+  already signed in to: no new sign-in, no Google account access to grant, and
+  no event title, guest or link ever leaves the page.
+- Settings ▸ General ▸ Calendar switches the countdown on and off for every
+  Calendar tab at once, with no relaunch. It is on to begin with.
+- The same row carries a **Check Now** button and a line saying what the last
+  check did — working, waiting for a signed-in Calendar tab, refused, or not
+  understood. It never shows anything from your calendar, only what happened.
+
+### Changed
+- The countdown shows nothing rather than guessing. Only events that have not
+  started yet count, only today's, and only when the answer is clear: a check
+  that fails keeps the last number briefly and then drops it, rather than
+  letting it go stale on the tab. An event already in progress is not something
+  Google's agenda reports, so the countdown moves to the next start.
+
 ## [1.0.3] - 2026-08-26
 
 ### Added

@@ -82,6 +82,7 @@ final class AppSettings {
         static let downloadDirectoryPath = "DownloadDirectoryPath"
         static let downloadFinishedAction = "DownloadFinishedAction"
         static let badgeScope = "BadgeScope"
+        static let showCalendarCountdown = "ShowCalendarCountdown"
         // Valves: read at the point of use, no row in the window (KTD-S6).
         static let unreadPollSeconds = "UnreadPollSeconds"
         static let unreadUsePlainFeed = "UnreadUsePlainFeed"
@@ -104,6 +105,7 @@ final class AppSettings {
             Key.downloadDirectoryPath: "",
             Key.downloadFinishedAction: DownloadFinishedAction.notify.rawValue,
             Key.badgeScope: BadgeScope.primary.rawValue,
+            Key.showCalendarCountdown: true,
             Key.unreadPollSeconds: 60.0,
             Key.unreadUsePlainFeed: false,
             Key.disableSignInAutofill: false
@@ -181,6 +183,17 @@ final class AppSettings {
     var badgeScope: BadgeScope {
         get { BadgeScope(rawValue: defaults.string(forKey: Key.badgeScope) ?? "") ?? .primary }
         set { defaults.set(newValue.rawValue, forKey: Key.badgeScope) }
+    }
+
+    /// G6. Whether a Calendar tab says how long until that account's next event
+    /// later today.
+    ///
+    /// On by default. The failure policy is what makes that safe: when there is
+    /// no answer there is no countdown, so an on-by-default switch cannot show
+    /// anything wrong — only nothing.
+    var showsCalendarCountdown: Bool {
+        get { defaults.bool(forKey: Key.showCalendarCountdown) }
+        set { defaults.set(newValue, forKey: Key.showCalendarCountdown) }
     }
 
     // MARK: - Valves (no UI, `defaults write` only — KTD-S6)
