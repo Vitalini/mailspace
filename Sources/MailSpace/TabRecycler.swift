@@ -816,8 +816,10 @@ final class TabRecycler {
 
     private func attemptLoad(_ webView: WKWebView, to url: URL) {
         // Still nothing to load onto: re-arm rather than burn the attempt on a
-        // request that cannot succeed. This is the loop an outage sits in, for
-        // as long as it lasts, and it costs one `load()` per 30 s.
+        // request that cannot succeed. This is the loop an outage sits in for
+        // as long as it lasts, and it puts *nothing* on the wire — one timer
+        // every 30 s per waiting tab, and the first pass that finds the network
+        // up is the one that loads.
         guard host?.reachability == .up else {
             armRetry(webView, to: url, after: RecycleDecision.retryDelay(afterFailures: 1) ?? 30)
             return
