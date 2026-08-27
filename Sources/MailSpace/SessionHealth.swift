@@ -262,6 +262,13 @@ final class SessionHealthTracker {
         monitors[accountId]?.isBackingOff ?? false
     }
 
+    /// Whether the evidence behind a signed-out verdict is Google saying so,
+    /// rather than the ambiguous opaque redirect a proxy or a captive portal
+    /// can also produce.
+    func hasStrongEvidence(_ accountId: UUID) -> Bool {
+        monitors[accountId]?.streakIsStrong ?? false
+    }
+
     func record(_ observation: SessionHealth.Observation, for accountId: UUID, now: Date = Date()) {
         var monitor = monitors[accountId] ?? SessionHealth.Monitor()
         let change = monitor.record(observation, now: now)
@@ -284,15 +291,34 @@ final class SessionHealthTracker {
     }
 
     /// Whether selecting this account's tab should re-navigate it onto the
-    /// sign-in page. True at most once per episode, and never when the tab is
-    /// holding an unsent draft.
+    /// sign-in page. True at most once per episode, and never when there is
+    /// anything in the tab worth keeping.
     ///
-    /// Losing a draft to a helpful re-navigation is worse than a stale tab, so
-    /// the compose test is the same URL-only one the recycler uses and errs the
-    /// same way.
-    func shouldRenavigate(accountId: UUID, url: URL?) -> Bool {
+    /// Losing work to a helpful re-navigation is worse than a stale tab, and
+    /// this fires on the *first click* of a flagged tab — the click the pill's
+    /// own tooltip asks for. Three things have to be true, and the two new ones
+    /// are the ones that were throwing live pages away:
+    ///
+    /// * **The evidence has to be strong.** Six opaque redirects set the
+    ///   signed-out state on weak evidence, which a proxy or a captive portal
+    ///   can produce on a perfectly live account; the pill appears, he clicks
+    ///   it as instructed, and the thread, search or inline reply he was on is
+    ///   gone. The pill still appears on weak evidence — it is a question, and
+    ///   the answer is worth having — but nothing is thrown away to answer it.
+    /// * **The tab must not already be on the sign-in chain.** A sign-in that
+    ///   takes longer than three minutes — 2FA from a phone, a security key —
+    ///   is a live session in progress, and Google `pushState`s through its
+    ///   steps rather than committing a document per step, so the `didCommit`
+    ///   streak reset does not save it. Re-navigating there returns him to step
+    ///   one of the sign-in he is halfway through.
+    /// * **No live editor.** As `hasOpenCompose` already required, and for the
+    ///   same reason.
+    func shouldRenavigate(accountId: UUID, url: URL?, hasLiveEditor: Bool = false) -> Bool {
         guard isSignedOut(accountId) else { return false }
+        guard hasStrongEvidence(accountId) else { return false }
         guard !recoveredThisEpisode.contains(accountId) else { return false }
+        guard AuthSurface.classify(url) != .signIn else { return false }
+        guard !hasLiveEditor else { return false }
         if let url, RecycleDecision.hasOpenCompose(url) { return false }
         recoveredThisEpisode.insert(accountId)
         return true

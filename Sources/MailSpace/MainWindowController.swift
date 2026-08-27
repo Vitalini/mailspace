@@ -19,6 +19,8 @@ protocol AccountHosting: AnyObject {
     func tabWasDeselected(accountId: UUID, view: AccountView)
     /// Accounts the health monitor currently reports as signed out.
     func signedOutAccounts() -> Set<UUID>
+    /// Accounts whose Mail tab failed to reload and has not come back.
+    func stalledAccounts() -> Set<UUID>
     /// Something that feeds the Dock badge changed. `repoll` is for a change to
     /// what the number *means* (the badge scope); without it the existing
     /// counts are simply re-totalled.
@@ -248,7 +250,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         tabBar.rebuild(
             accounts: store.accounts,
             selection: selection,
-            signedOut: host.signedOutAccounts()
+            signedOut: host.signedOutAccounts(),
+            stalled: host.stalledAccounts()
         )
         rebuildAccountsMenu()
         showActiveContent()
@@ -508,17 +511,29 @@ final class AccountTabBar: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used — the UI is built programmatically") }
 
-    /// Whether this tab carries the signed-out warning.
+    /// Which warning this tab carries, if any.
     ///
-    /// The evidence is the account's *mail* webview — the feed probe and the
-    /// classified URL both live there — so the warning is shown on the Mail
-    /// tab, which is also the tab whose selection puts the sign-in form in
-    /// front of the user.
-    static func showsSignedOut(tab: TabRef, signedOut: Set<UUID>) -> Bool {
-        tab.view == .mail && signedOut.contains(tab.accountId)
+    /// The evidence for both is the account's *mail* webview — the feed probe,
+    /// the classified URL and the recycle target all live there — so the
+    /// warning is shown on the Mail tab, which is also the tab whose selection
+    /// is the recovery for either one.
+    ///
+    /// Signed-out wins when both are true. They are nearly disjoint in practice
+    /// (a signed-out tab is not recycled at all, by G1), and if the session is
+    /// gone *and* the tab will not load, the sign-in is the thing to fix.
+    static func warning(tab: TabRef, signedOut: Set<UUID>, stalled: Set<UUID> = []) -> TabWarning? {
+        guard tab.view == .mail else { return nil }
+        if signedOut.contains(tab.accountId) { return .signedOut }
+        if stalled.contains(tab.accountId) { return .notLoading }
+        return nil
     }
 
-    func rebuild(accounts: [Account], selection: MainWindowController.Selection?, signedOut: Set<UUID> = []) {
+    func rebuild(
+        accounts: [Account],
+        selection: MainWindowController.Selection?,
+        signedOut: Set<UUID> = [],
+        stalled: Set<UUID> = []
+    ) {
         for view in tabStack.arrangedSubviews {
             tabStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -534,7 +549,7 @@ final class AccountTabBar: NSView {
                 account: account,
                 view: tab.view,
                 isSelected: isSelected,
-                isSignedOut: Self.showsSignedOut(tab: tab, signedOut: signedOut)
+                warning: Self.warning(tab: tab, signedOut: signedOut, stalled: stalled)
             )
             tabView.onClick = { [weak self] tab in self?.onSelectTab?(tab) }
             tabView.onEdit = { [weak self] id in self?.onEditAccount?(id) }
@@ -663,7 +678,7 @@ final class AccountTabView: NSView, NSDraggingSource {
         account: Account,
         view: AccountView,
         isSelected: Bool,
-        isSignedOut: Bool = false,
+        warning: TabWarning? = nil,
         accessoryWidth: CGFloat? = nil
     ) {
         self.tab = AccountTabBar.Tab(accountId: account.id, view: view)
@@ -679,7 +694,7 @@ final class AccountTabView: NSView, NSDraggingSource {
             // Measured in the selected weight whatever this tab's state is, so
             // selecting a tab never resizes the row.
             labelWidth: TabMetrics.textWidth(labelText, font: TabMetrics.measurementFont),
-            accessoryWidth: accessoryWidth ?? (isSignedOut ? SignedOutPill.size.width : nil)
+            accessoryWidth: accessoryWidth ?? (warning != nil ? SignedOutPill.size.width : nil)
         )
         super.init(frame: .zero)
 
@@ -704,8 +719,8 @@ final class AccountTabView: NSView, NSDraggingSource {
         label.translatesAutoresizingMaskIntoConstraints = false
 
         let base = account.email.isEmpty ? labelText : "\(labelText) — \(account.email)"
-        toolTip = isSignedOut ? "Signed out of Google — click this tab to sign in again." : base
-        setAccessibilityLabel(isSignedOut ? "\(base). Signed out of Google." : base)
+        toolTip = warning?.tooltip ?? base
+        setAccessibilityLabel(warning.map { "\(base). \($0.accessibilitySuffix)" } ?? base)
 
         addSubview(icon)
         addSubview(label)
@@ -720,7 +735,7 @@ final class AccountTabView: NSView, NSDraggingSource {
         // element in this bar is tinted with the account colour, so the single
         // non-tint thing in the tab bar is the one thing that cannot be read as
         // "this is the purple account".
-        let pill: SignedOutPill? = isSignedOut ? SignedOutPill() : nil
+        let pill: SignedOutPill? = warning != nil ? SignedOutPill() : nil
         if let pill {
             pill.translatesAutoresizingMaskIntoConstraints = false
             addSubview(pill)
@@ -867,6 +882,33 @@ final class AccountTabView: NSView, NSDraggingSource {
 
 /// The warning capsule in a tab's trailing accessory slot: this account's
 /// Google session is gone and MailSpace has stopped receiving its mail.
+/// What a tab's orange pill is warning about.
+///
+/// Two states, one slot, one shape: both mean "this tab is not showing you your
+/// mail, and clicking it is the fix". Splitting them into two visual languages
+/// would teach the user two things where one will do; only the words differ.
+enum TabWarning: Equatable {
+    /// The Google session has expired. Clicking goes to the sign-in page.
+    case signedOut
+    /// A rebuild of this tab failed and the retries ran out. Clicking loads it
+    /// again — and so does the network coming back, without any click at all.
+    case notLoading
+
+    var tooltip: String {
+        switch self {
+        case .signedOut: return "Signed out of Google — click this tab to sign in again."
+        case .notLoading: return "This tab could not reload — click it to try again."
+        }
+    }
+
+    var accessibilitySuffix: String {
+        switch self {
+        case .signedOut: return "Signed out of Google."
+        case .notLoading: return "Not loading."
+        }
+    }
+}
+
 final class SignedOutPill: NSView {
     static let size = NSSize(width: 24, height: 16)
 

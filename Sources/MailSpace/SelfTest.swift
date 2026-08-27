@@ -75,6 +75,9 @@ enum SelfTest {
         case bench
         /// Settles the two platform behaviours the recycling guards rest on.
         case assume
+        /// Drives a real webview through a failed recycle and out the other
+        /// side, against a network the harness owns and switches off itself.
+        case recovery
         /// Renders the tab bar offscreen to a PNG, so the signed-out signal can
         /// be looked at without opening a window on anyone's screen.
         case tabshot
@@ -976,6 +979,7 @@ final class SettingsProbe: NSObject, AccountHosting {
     func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool) {}
     func tabWasDeselected(accountId: UUID, view: AccountView) {}
     func signedOutAccounts() -> Set<UUID> { [] }
+    func stalledAccounts() -> Set<UUID> { [] }
     func badgeInputsChanged(repoll: Bool) { badgeCalls.append(repoll) }
 
     func run() {

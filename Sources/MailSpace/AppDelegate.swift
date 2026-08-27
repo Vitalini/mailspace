@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var updateProbe: UpdateProbe?
     private var benchProbe: BenchProbe?
     private var assumptionProbe: AssumptionProbe?
+    private var recoveryProbe: RecoveryProbe?
     private var settingsProbe: SettingsProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
@@ -38,11 +39,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// every launch.
     private var badgeSeeded: Set<UUID> = []
     private let launchedAt = Date()
-    private var lastWakeAt: Date?
+    /// When the Mac last woke. Read by the health monitor, and by the recycler
+    /// as G16 — waking is when every tab comes due at once and the network is
+    /// least ready.
+    private(set) var lastWakeAt: Date?
     /// Whether the Mac currently has a usable network path. A cycle without one
     /// tells the health monitor nothing.
     private var networkIsUp = true
+    /// When the feed probe last got *any* answer out of Google. The link being
+    /// up says a request can leave this Mac; only this says one arrives.
+    private var lastReachedGoogleAt: Date?
     private let pathMonitor = NWPathMonitor()
+    /// Accounts the recycler reports as having a dead Mail tab, and the ones
+    /// already notified about, so the banner is one per episode.
+    private var notifiedStalls: Set<UUID> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A self-test never runs as the app the user relies on. Its probes talk
@@ -98,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         unreadPoller.isBusy = { [weak self] accountId in self?.isBusy(accountId) ?? true }
         unreadPoller.isBackingOff = { [weak self] accountId in self?.health.isBackingOff(accountId) ?? false }
+        unreadPoller.onReachability = { [weak self] reached in self?.googleAnswered(reached) }
         health.onChange = { [weak self] accountId, change in self?.healthChanged(accountId, change) }
 
         tabRecycler.host = self
@@ -144,6 +155,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if SelfTest.mode == .assume {
             assumptionProbe = AssumptionProbe()
             assumptionProbe?.run()
+            return
+        }
+        if SelfTest.mode == .recovery {
+            recoveryProbe = RecoveryProbe()
+            recoveryProbe?.run()
             return
         }
         if SelfTest.mode == .settings {
@@ -270,17 +286,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// whole chain in the tab.
     func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool) {
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
-        // The view's own entry point comes along because a webview that crashed
-        // before committing anything has no URL to reload.
-        navigationPolicy.recoverIfStalled(webView, baseURL: view.url)
+        // A recycle that gave up aimed at a specific page — the label and
+        // thread he was on — so that, not the view's generic entry point, is
+        // where a rescue goes. The entry point is the fallback for a webview
+        // that crashed before committing anything and has no URL to reload.
+        let recovered = navigationPolicy.recoverIfStalled(
+            webView,
+            baseURL: tabRecycler.outstandingTarget(for: webView) ?? view.url
+        )
+        if recovered, tabRecycler.hasFailedLoad(webView) {
+            Log.info("selected a tab whose recycle had given up; loading it again")
+            tabRecycler.userIsRetrying(webView)
+        }
 
         // Gated on a *real* selection change: `refresh()` calls this
         // unconditionally, and a rebuild of the tab bar is not the user asking
         // for anything.
         guard isSelectionChange, view == .mail else { return }
-        guard health.shouldRenavigate(accountId: accountId, url: webView.url) else { return }
-        Log.info("signed-out account selected; re-navigating its mail tab to the sign-in page")
-        webView.load(URLRequest(url: view.url))
+        // Asked of the page, not of the URL: an inline reply is invisible to
+        // `hasOpenCompose`, and this navigation would throw it away.
+        editorState(in: webView) { [weak self] state in
+            guard let self else { return }
+            guard self.health.shouldRenavigate(
+                accountId: accountId,
+                url: webView.url,
+                hasLiveEditor: RecycleDecision.hasLiveEditor(state)
+            ) else { return }
+            Log.info("signed-out account selected; re-navigating its mail tab to the sign-in page")
+            webView.load(URLRequest(url: view.url))
+        }
     }
 
     /// G11: this tab has just stopped being the visible one.
@@ -293,10 +327,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         health.signedOutAccounts
     }
 
+    func stalledAccounts() -> Set<UUID> {
+        tabRecycler.stalledAccounts
+    }
+
     // MARK: - TabRecyclerHost
 
     var mainWindowIsVisible: Bool {
         windowController?.isOnScreen ?? false
+    }
+
+    /// G15. Two sources, and the second one is the one that decides — see
+    /// `RecycleDecision.Reachability`.
+    var reachability: RecycleDecision.Reachability {
+        RecycleDecision.reachability(
+            pathIsSatisfied: networkIsUp,
+            lastReachedGoogleAt: lastReachedGoogleAt,
+            probesAreRunning: accountStore.accounts.contains { $0.mailEnabled },
+            now: Date()
+        )
+    }
+
+    /// The feed probe got an answer out of Google — or did not.
+    ///
+    /// A single success re-proves the path for `reachProofWindow`, and it is
+    /// also the moment every tab that gave up gets another go. That is what
+    /// makes an outage self-healing: nothing is asked of the user.
+    private func googleAnswered(_ reached: Bool) {
+        guard reached else { return }
+        let wasReachable = reachability == .up
+        lastReachedGoogleAt = Date()
+        guard !wasReachable else { return }
+        tabRecycler.networkBecameReachable()
+    }
+
+    /// G18. One structural question, asked in the page's main frame.
+    ///
+    /// No text crosses the bridge: the script returns whether the focused
+    /// element is typable and how many editable boxes are non-empty. It reads
+    /// no word of anybody's mail, and it cannot break because Gmail renamed a
+    /// CSS class — `contenteditable`, `role="textbox"` and `<textarea>` are the
+    /// platform's own vocabulary.
+    func editorState(
+        in webView: WKWebView,
+        completion: @escaping (RecycleDecision.EditorState?) -> Void
+    ) {
+        var answered = false
+        let answer: (RecycleDecision.EditorState?) -> Void = { state in
+            guard !answered else { return }
+            answered = true
+            completion(state)
+        }
+
+        // A page that cannot answer in five seconds is wedged, and a wedged
+        // page is the one most in need of rebuilding — so silence is "no
+        // editor", not "leave it alone forever".
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { answer(nil) }
+
+        webView.callAsyncJavaScript(
+            Self.editorProbeScript,
+            arguments: [:],
+            in: nil,
+            in: .defaultClient
+        ) { result in
+            guard let payload = (try? result.get()) as? [String: Any] else {
+                answer(nil)
+                return
+            }
+            answer(
+                RecycleDecision.EditorState(
+                    focused: (payload["focused"] as? Bool) ?? false,
+                    dirty: (payload["dirty"] as? Int) ?? 0
+                )
+            )
+        }
+    }
+
+    private static let editorProbeScript = """
+    const active = document.activeElement;
+    const focused = !!(active && (
+      active.isContentEditable ||
+      active.tagName === 'TEXTAREA' ||
+      (active.tagName === 'INPUT' && /^(text|search|email|url|tel)$/i.test(active.type || 'text'))
+    ));
+    let dirty = 0;
+    const boxes = document.querySelectorAll(
+      '[contenteditable="true"], [g_editable="true"], [role="textbox"], textarea'
+    );
+    for (const box of boxes) {
+      // A length, never the text. Nothing here can carry a word of anyone's
+      // mail back across the bridge.
+      const value = box.value !== undefined ? box.value : box.textContent;
+      if ((value || '').trim().length > 0) { dirty += 1; }
+    }
+    return { focused: focused, dirty: dirty };
+    """
+
+    func markRecycleStalled(_ webView: WKWebView, target url: URL) {
+        navigationPolicy.markStalled(webView)
+    }
+
+    func recycleStallsChanged() {
+        let stalled = tabRecycler.stalledAccounts
+        unreadPoller.setStalled(stalled)
+        windowController?.refresh()
+
+        notifiedStalls.formIntersection(stalled)
+        for accountId in stalled where !notifiedStalls.contains(accountId) {
+            notifiedStalls.insert(accountId)
+            guard let account = accountStore.account(id: accountId) else { continue }
+            Log.error("account \(accountId.uuidString.prefix(8)) has a mail tab that will not load")
+            notificationBridge.post(
+                title: "\(account.name) — Mail is not loading",
+                body: "MailSpace could not reload this tab. Click to try again.",
+                tag: "mailspace-tab-stalled",
+                account: account,
+                view: .mail
+            )
+        }
     }
 
     func recycleTargets() -> [TabRecycler.Target] {
@@ -375,6 +523,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if tabRecycler.isRecycling(webView) { return true }
         if let age = tabRecycler.age(of: webView), age < 90 { return true }
         if !networkIsUp { return true }
+        // Losing the network is not being signed out. The link can be up while
+        // nothing reaches Google — a portal, a router with no upstream — and
+        // every observation taken in that window is about the network, not
+        // about the session.
+        if reachability != .up { return true }
+        // A sign-in that is actually happening. Google `pushState`s through its
+        // steps rather than committing a document per step, so the `didCommit`
+        // streak reset does not cover a slow one; three minutes of 2FA on a
+        // phone used to confirm a signed-out verdict on a session being signed
+        // *in*. Quiescence is the discriminator the file already relies on, and
+        // a person mid-sign-in is not quiet.
+        if tabRecycler.sawLocalInput(within: 180), AuthSurface.classify(webView.url) == .signIn {
+            return true
+        }
         let now = Date()
         if now.timeIntervalSince(launchedAt) < 120 { return true }
         if let wake = lastWakeAt, now.timeIntervalSince(wake) < 120 { return true }
@@ -419,7 +581,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.lastWakeAt = Date()
         }
         pathMonitor.pathUpdateHandler = { [weak self] path in
-            DispatchQueue.main.async { self?.networkIsUp = path.status == .satisfied }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let up = path.status == .satisfied
+                guard up != self.networkIsUp else { return }
+                self.networkIsUp = up
+                guard up else { return }
+                // The interface is back. Nothing has yet proved Google is
+                // reachable, so this does not release the recycler's G15 — but
+                // it does make the next feed probe worth waiting for, and that
+                // probe is what triggers the rescue.
+                Log.info("network path is back")
+                self.unreadPoller.refresh()
+            }
         }
         pathMonitor.start(queue: DispatchQueue(label: "com.vitalii.MailSpace.path"))
     }

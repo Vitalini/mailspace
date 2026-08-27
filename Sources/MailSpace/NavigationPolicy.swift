@@ -547,6 +547,20 @@ struct WeakObjectMap<Key: AnyObject, Value> {
         entries[ObjectIdentifier(key)] = nil
         return existing
     }
+
+    /// Every live pairing, with the keys held strongly for the duration of the
+    /// call so the caller can act on them.
+    ///
+    /// Needed by the recycle retry ladder, which has to walk every tab it gave
+    /// up on when the network comes back. Dead keys are skipped rather than
+    /// reported as `nil`: a webview that has been released has nothing left to
+    /// retry.
+    func pairs() -> [(key: Key, value: Value)] {
+        entries.values.compactMap { entry in
+            guard let key = entry.key as? Key else { return nil }
+            return (key: key, value: entry.value)
+        }
+    }
 }
 
 /// Decides whether a crashed webview may be reloaded again.
@@ -855,6 +869,18 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Whether the crash throttle has given up on this webview.
     func isStalled(_ webView: WKWebView) -> Bool {
         stalled.contains(webView)
+    }
+
+    /// Puts a webview on the stall list without a crash having caused it.
+    ///
+    /// The list used to be reachable only from a WebContent process
+    /// *termination*, so a webview whose only navigation failed — the state a
+    /// recycle onto a dead network leaves behind — was invisible to
+    /// `recoverIfStalled` and had no way back at all. The recycler's retry
+    /// ladder hands the tab here when it runs out, and selecting the tab or
+    /// pressing ⌘R then brings it back exactly as it does for a crash.
+    func markStalled(_ webView: WKWebView) {
+        stalled.insert(webView)
     }
 
     /// Whether any popup window is open on this account's data store — a

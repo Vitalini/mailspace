@@ -235,4 +235,94 @@ final class SessionHealthTests: XCTestCase {
         tracker.record(.healthy, for: account, now: epoch.addingTimeInterval(600))
         XCTAssertFalse(tracker.shouldRenavigate(accountId: account, url: inbox))
     }
+
+    /// Weak evidence raises the pill but must never throw a page away.
+    ///
+    /// Six opaque redirects confirm a signed-out verdict, and a proxy or a
+    /// captive portal produces exactly that shape on a perfectly live account.
+    /// The pill appears — it is a question worth asking — but the click it asks
+    /// for used to reload the tab out of whatever thread, search or reply was
+    /// open on it.
+    func testAWeakVerdictShowsThePillButNeverRenavigates() {
+        let tracker = SessionHealthTracker()
+        let account = UUID()
+        for step in 0..<7 {
+            tracker.record(.authFailedWeak, for: account, now: epoch.addingTimeInterval(Double(step) * 60))
+        }
+
+        XCTAssertTrue(tracker.isSignedOut(account), "the pill still goes up")
+        XCTAssertFalse(tracker.hasStrongEvidence(account))
+        XCTAssertFalse(
+            tracker.shouldRenavigate(accountId: account, url: url("https://mail.google.com/mail/u/0/#inbox")),
+            "and nothing of his is thrown away to check it"
+        )
+    }
+
+    /// A sign-in that is actually in progress must not be reloaded back to its
+    /// first step. Google `pushState`s through identifier, password and 2FA
+    /// rather than committing a document per step, so the `didCommit` streak
+    /// reset does not cover a slow one — a security key or a phone prompt.
+    func testATabAlreadyOnTheSignInChainIsNeverRenavigated() {
+        let tracker = SessionHealthTracker()
+        let account = UUID()
+        for step in 0..<4 {
+            tracker.record(.authFailedStrong, for: account, now: epoch.addingTimeInterval(Double(step) * 60))
+        }
+
+        XCTAssertFalse(
+            tracker.shouldRenavigate(
+                accountId: account,
+                url: url("https://accounts.google.com/v3/signin/challenge/totp")
+            ),
+            "he is halfway through signing in; this would send him back to step one"
+        )
+        // The same account, on the inbox, still recovers.
+        XCTAssertTrue(
+            tracker.shouldRenavigate(accountId: account, url: url("https://mail.google.com/mail/u/0/#inbox"))
+        )
+    }
+
+    /// An inline reply is invisible to `hasOpenCompose`, so the page is asked
+    /// as well as the URL — the same question G18 asks before a recycle.
+    func testALiveEditorStopsTheRenavigationToo() {
+        let tracker = SessionHealthTracker()
+        let account = UUID()
+        for step in 0..<4 {
+            tracker.record(.authFailedStrong, for: account, now: epoch.addingTimeInterval(Double(step) * 60))
+        }
+
+        let inbox = url("https://mail.google.com/mail/u/0/#inbox")
+        XCTAssertFalse(tracker.shouldRenavigate(accountId: account, url: inbox, hasLiveEditor: true))
+        XCTAssertTrue(tracker.shouldRenavigate(accountId: account, url: inbox, hasLiveEditor: false))
+    }
+
+    /// Losing the network is not being signed out, and the probe now says which
+    /// is which. A thrown fetch never reached Google; an opaque redirect did,
+    /// and so did every status.
+    func testOnlyAThrownFetchMeansGoogleWasNotReached() {
+        XCTAssertFalse(
+            SessionHealth.Probe(ok: false, parsed: false, status: -1, type: "error", reached: false).reached
+        )
+        XCTAssertTrue(
+            SessionHealth.Probe(ok: false, parsed: false, status: 0, type: "opaqueredirect", reached: true).reached
+        )
+        XCTAssertTrue(
+            SessionHealth.Probe(ok: true, parsed: true, status: 200, type: "basic", reached: true).reached
+        )
+    }
+
+    /// A multi-login profile whose feed redirects same-origin to `/mail/u/N/`
+    /// is signed *in*. `redirect: 'manual'` turned that into an opaque redirect
+    /// — weak signed-out evidence on a live account, and an unanswered cycle on
+    /// the Dock badge. Following it once tells the two apart: this one resolves.
+    func testAFollowedSameOriginRedirectIsHealthyNotSignedOut() {
+        let followed = UnreadPoller.probe(from: [
+            "ok": true,
+            "feed": "<feed><fullcount>3</fullcount></feed>",
+            "status": 200,
+            "type": "redirect-followed",
+            "reached": true
+        ])
+        XCTAssertEqual(SessionHealth.observation(for: followed), .healthy)
+    }
 }

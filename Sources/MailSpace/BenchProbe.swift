@@ -256,27 +256,60 @@ final class BenchProbe: NSObject, WKNavigationDelegate {
         SelfTest.finish(line(result: nil))
     }
 
+    /// The pass mark.
+    ///
+    /// `sustained` alone was not enough, and the gap was the exact regression
+    /// this benchmark exists to catch. `resolvePid` re-snapshots the live
+    /// WebContent processes at recycle time and takes the set difference, so
+    /// `sustained` is the footprint of the *new* process only. A change that
+    /// retained the old webview would leave it alive at 700-odd MB beside a
+    /// fresh 11 MB one — and score PASS on the 11.
+    ///
+    /// So arm B has to prove both halves of what a replacement is: the new
+    /// process is small, *and* the old one is gone. `oldPidExited` was already
+    /// printed; it just had no vote. Now it does.
+    ///
+    /// Pure and static so the rule is a unit test rather than a benchmark run
+    /// that takes seven minutes and needs a webview.
+    static func verdict(
+        arm: String,
+        freshMB: Double,
+        sustainedMB: Double,
+        sampleCount: Int,
+        oldPidExited: Bool?
+    ) -> String {
+        guard sampleCount > 0, freshMB > 0 else { return "INCONCLUSIVE" }
+        guard sustainedMB <= freshMB * 1.25 else { return "FAIL" }
+        // Arm A never replaces anything, so it has no old process to account
+        // for. Arm B does, and a run that could not tell is not a pass.
+        guard arm == "b" else { return "PASS" }
+        guard let oldPidExited else { return "INCONCLUSIVE" }
+        return oldPidExited ? "PASS" : "FAIL"
+    }
+
     private func line(result: String?) -> String {
         let freshValue = fresh ?? 0
         let sustained = settleSamples.min() ?? 0
         let worst = settleSamples.max() ?? 0
         let limit = freshValue * 1.25
-        let verdict: String
-        if let result {
-            verdict = result
-        } else if settleSamples.isEmpty || freshValue <= 0 {
-            verdict = "INCONCLUSIVE"
-        } else {
-            verdict = sustained <= limit ? "PASS" : "FAIL"
-        }
 
         // Arm B additionally has to show that the old WebContent process really
         // went and a new one really arrived.
         var processNote = ""
+        var oldPidExited: Bool?
         if arm == "b", let oldPid {
             let live = SelfTest.webContentPids()
-            processNote = " oldPid=\(oldPid) oldPidExited=\(live.contains(oldPid) ? 0 : 1) newPid=\(pid.map(String.init) ?? "none")"
+            oldPidExited = !live.contains(oldPid)
+            processNote = " oldPid=\(oldPid) oldPidExited=\(oldPidExited == true ? 1 : 0) newPid=\(pid.map(String.init) ?? "none")"
         }
+
+        let verdict = result ?? Self.verdict(
+            arm: arm,
+            freshMB: freshValue,
+            sustainedMB: sustained,
+            sampleCount: settleSamples.count,
+            oldPidExited: oldPidExited
+        )
 
         return String(
             format: "bench arm=%@ result=%@ freshMB=%.0f peakMB=%.0f sustainedMB=%.0f worstMB=%.0f limitMB=%.0f samples=%d%@",
@@ -385,14 +418,18 @@ final class TabShotProbe {
 
         let personal = Account(name: "Personal", email: "personal@example.com", color: .purple)
         let work = Account(name: "Talkable", email: "work@example.com", color: .teal)
-        let accounts = [personal, work]
+        let side = Account(name: "Side Project", email: "side@example.com", color: .orange)
+        let accounts = [personal, work, side]
 
         let bar = AccountTabBar()
         bar.frame = NSRect(x: 0, y: 0, width: 720, height: AccountTabBar.height)
+        // One of each warning beside a healthy tab, so the shot shows that both
+        // fit the uniform width rather than squeezing their labels.
         bar.rebuild(
             accounts: accounts,
             selection: MainWindowController.Selection(accountId: personal.id, view: .mail),
-            signedOut: [work.id]
+            signedOut: [work.id],
+            stalled: [side.id]
         )
         bar.layoutSubtreeIfNeeded()
 

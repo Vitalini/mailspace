@@ -135,6 +135,13 @@ bench: selftest-app
 assume: selftest-app
 	@MAILSPACE_SELFTEST=assume $(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
 
+## recovery - drive a real webview through a failed recycle and out the other
+##            side. The "network" is a URL scheme handler this probe owns and
+##            switches off itself; nothing about this Mac's connectivity is
+##            touched. Offscreen, under the throwaway bundle, as every probe is.
+recovery: selftest-app
+	@MAILSPACE_SELFTEST=recovery $(SELFTEST_APP)/Contents/MacOS/$(APP_NAME) 2>/dev/null | grep '^SELFTEST '
+
 ## test - run the unit test suite
 test:
 	swift test

@@ -15,8 +15,9 @@ a wrapped line belongs to the bullet above it, here and in the update window.
   longer grows to gigabytes over a day of uptime and a Gmail tab no longer
   quietly stops syncing until you quit the app. It happens in the background,
   keeps the label and the thread you were on, and waits while you are typing,
-  while a message is being written, while an event is being edited, and while a
-  download or a sign-in is running. Switch it off in Settings ▸ General.
+  while a message is being written, while an event is being edited, while a
+  download or a sign-in is running, and while the network is down. Switch it
+  off in Settings ▸ General.
 - Once a day or so, the tab you are actually looking at is rebuilt too — but
   only after you have left it alone for a minute and a half. You will see it
   blink once and come back where you were.
@@ -25,8 +26,36 @@ a wrapped line belongs to the bullet above it, here and in the update window.
   Clicking the tab takes you straight to the sign-in page.
 - `View ▸ Reload All Tabs` (⌥⌘R) reloads every tab by hand. It is a diagnostic;
   the automatic rebuild above is what actually keeps things healthy.
+- A tab that will not load now says so, the same way a signed-out account does:
+  an orange warning on the tab, an exclamation mark on the Dock badge, and one
+  notification. It comes back on its own as soon as the network does, and
+  clicking the tab loads it immediately.
 
 ### Fixed
+- Tabs are no longer rebuilt while the network is down, or while it is up but
+  nothing is getting through to Google — a hotel Wi-Fi before you log in, a
+  router with no upstream, a train tunnel. A rebuild throws the old page away
+  first, so one done with no connection used to leave the tab blank, and a bad
+  ten minutes could empty every tab in the app with nothing said about it.
+- A rebuild that fails keeps trying, and time spent offline no longer counts
+  against those attempts, so an outage of any length is survivable. Only
+  repeated failures against a working network give up — and then the tab is
+  marked rather than left blank and silent.
+- Nothing is rebuilt for the first few minutes after the Mac wakes, when every
+  tab is overdue at once and the network is still coming up.
+- A reply you are part-way through writing is no longer thrown away by a
+  rebuild. Gmail's inline reply never showed in the address, so only a
+  popped-out compose was protected; MailSpace now asks the page itself whether
+  anything is being typed into it, without reading a word of it.
+- Clicking a tab flagged as signed out no longer reloads it out of the thread,
+  search or reply you had open when the evidence is ambiguous — a proxy or a
+  captive portal can look exactly like an expired session — and never while you
+  are part-way through signing in.
+- A slow sign-in — a phone prompt, a security key — is no longer mistaken for a
+  session that has expired.
+- An account signed into several Google profiles at once no longer drifts
+  towards a false "signed out" warning, and its unread count no longer goes
+  stale.
 - The Dock badge fills in as soon as your mail loads, instead of staying blank
   for up to a minute after launch.
 - The unread badge no longer drops to zero while an account's tab is reloading.

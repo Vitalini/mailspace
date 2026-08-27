@@ -28,10 +28,77 @@ final class ContentPinningTests: XCTestCase {
     func testTheSignedOutPillLandsOnTheAccountsMailTab() {
         let out = UUID()
         let fine = UUID()
-        XCTAssertTrue(AccountTabBar.showsSignedOut(tab: TabRef(accountId: out, view: .mail), signedOut: [out]))
-        XCTAssertFalse(AccountTabBar.showsSignedOut(tab: TabRef(accountId: out, view: .calendar), signedOut: [out]))
-        XCTAssertFalse(AccountTabBar.showsSignedOut(tab: TabRef(accountId: fine, view: .mail), signedOut: [out]))
-        XCTAssertFalse(AccountTabBar.showsSignedOut(tab: TabRef(accountId: out, view: .mail), signedOut: []))
+        XCTAssertEqual(
+            AccountTabBar.warning(tab: TabRef(accountId: out, view: .mail), signedOut: [out]),
+            .signedOut
+        )
+        XCTAssertNil(AccountTabBar.warning(tab: TabRef(accountId: out, view: .calendar), signedOut: [out]))
+        XCTAssertNil(AccountTabBar.warning(tab: TabRef(accountId: fine, view: .mail), signedOut: [out]))
+        XCTAssertNil(AccountTabBar.warning(tab: TabRef(accountId: out, view: .mail), signedOut: []))
+    }
+
+    /// A tab whose recycle load failed for good wears the same pill in the same
+    /// slot, with its own words. It used to wear nothing at all: the state was
+    /// invisible to the tab bar, to the Dock badge and to the health monitor at
+    /// once, which is what made ten minutes of bad Wi-Fi look like "no new mail"
+    /// rather than like four dead tabs.
+    func testADeadTabWearsTheSamePillWithItsOwnWords() {
+        let dead = UUID()
+        XCTAssertEqual(
+            AccountTabBar.warning(tab: TabRef(accountId: dead, view: .mail), signedOut: [], stalled: [dead]),
+            .notLoading
+        )
+        XCTAssertNil(
+            AccountTabBar.warning(tab: TabRef(accountId: dead, view: .calendar), signedOut: [], stalled: [dead])
+        )
+        XCTAssertNotEqual(TabWarning.notLoading.tooltip, TabWarning.signedOut.tooltip)
+    }
+
+    /// Both at once is the sign-in's problem to fix, so signed-out wins.
+    func testSignedOutOutranksNotLoading() {
+        let both = UUID()
+        XCTAssertEqual(
+            AccountTabBar.warning(tab: TabRef(accountId: both, view: .mail), signedOut: [both], stalled: [both]),
+            .signedOut
+        )
+    }
+
+    /// The benchmark's pass mark used to be decorative for the one regression
+    /// it exists to catch. `sustained` is the footprint of the *new* WebContent
+    /// process only — `resolvePid` takes the set difference at recycle time —
+    /// so a change that retained the old webview would leave it alive at 700-odd
+    /// MB beside a fresh 11 MB one and score PASS on the 11. `oldPidExited` was
+    /// printed and had no vote; now it has one.
+    func testTheBenchmarkFailsWhenTheOldProcessSurvives() {
+        // The shipped result: small new process, old one gone.
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "b", freshMB: 28, sustainedMB: 11, sampleCount: 28, oldPidExited: true),
+            "PASS"
+        )
+        // The regression the benchmark exists to catch, and used to miss.
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "b", freshMB: 28, sustainedMB: 11, sampleCount: 28, oldPidExited: false),
+            "FAIL"
+        )
+        // A run that could not tell is not a pass either.
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "b", freshMB: 28, sustainedMB: 11, sampleCount: 28, oldPidExited: nil),
+            "INCONCLUSIVE"
+        )
+        // The measured `reload()` arm: nothing is reclaimed, and no process
+        // accounting is expected of it.
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "a", freshMB: 28, sustainedMB: 426, sampleCount: 28, oldPidExited: nil),
+            "FAIL"
+        )
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "a", freshMB: 28, sustainedMB: 11, sampleCount: 28, oldPidExited: nil),
+            "PASS"
+        )
+        XCTAssertEqual(
+            BenchProbe.verdict(arm: "b", freshMB: 28, sustainedMB: 11, sampleCount: 0, oldPidExited: true),
+            "INCONCLUSIVE"
+        )
     }
 
     /// `NotificationOrigin.isTrusted` opens by rejecting every subframe, so a
