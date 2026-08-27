@@ -7,7 +7,10 @@ protocol AccountHosting: AnyObject {
     func session(for accountId: UUID) -> AccountSession?
     func requestAddAccount()
     func requestEditAccount(id: UUID)
-    func requestRemoveAccount(id: UUID)
+    /// Confirms on `presentedOn` — the window the user clicked in — and falls
+    /// back to an app-modal dialog when there is none. Swift forbids a default
+    /// value in a protocol requirement, so every caller passes its own window.
+    func requestRemoveAccount(id: UUID, presentedOn: NSWindow?)
     /// This tab is now the visible one. `isSelectionChange` separates a real
     /// tab change from a `refresh()` that happened to re-render the same tab —
     /// the second must not re-navigate anything.
@@ -16,6 +19,10 @@ protocol AccountHosting: AnyObject {
     func tabWasDeselected(accountId: UUID, view: AccountView)
     /// Accounts the health monitor currently reports as signed out.
     func signedOutAccounts() -> Set<UUID>
+    /// Something that feeds the Dock badge changed. `repoll` is for a change to
+    /// what the number *means* (the badge scope); without it the existing
+    /// counts are simply re-totalled.
+    func badgeInputsChanged(repoll: Bool)
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -82,7 +89,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         }
         tabBar.onAddAccount = { [weak self] in self?.host.requestAddAccount() }
         tabBar.onEditAccount = { [weak self] id in self?.host.requestEditAccount(id: id) }
-        tabBar.onRemoveAccount = { [weak self] id in self?.host.requestRemoveAccount(id: id) }
+        tabBar.onRemoveAccount = { [weak self] id in
+            self?.host.requestRemoveAccount(id: id, presentedOn: self?.window)
+        }
     }
 
     // MARK: - Layout
@@ -128,6 +137,15 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             window.center()
         }
         window.setFrameAutosaveName(Self.frameAutosaveName)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// B6. The only way back from a frame stranded on a display that is no
+    /// longer attached. A rescue belongs in a menu, not in Settings.
+    func resetWindowPosition() {
+        NSWindow.removeFrame(usingName: Self.frameAutosaveName)
+        window.setContentSize(NSSize(width: 1280, height: 840))
+        window.center()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -353,7 +371,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     @objc private func removeCurrentAccount(_ sender: Any?) {
         guard let id = selection?.accountId else { return }
-        host.requestRemoveAccount(id: id)
+        host.requestRemoveAccount(id: id, presentedOn: window)
     }
 
     // MARK: - Diagnostics
@@ -376,8 +394,27 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 ///
 /// Every tab of an account carries that account's colour, so the accounts stay
 /// apart at a glance; Mail and Calendar differ by icon and label.
+///
+/// All tabs share one width — see `TabMetrics` for the rule and `layout()` for
+/// where it is applied.
 final class AccountTabBar: NSView {
     static let height: CGFloat = 42
+
+    private static let addButtonWidth: CGFloat = 34
+    private static let addButtonTrailingInset: CGFloat = 10
+    private static let addButtonSpacing: CGFloat = 4
+    private static let stackInset: CGFloat = 10
+
+    /// The room the tabs themselves have in a bar this wide: everything left
+    /// once the `+` button and the stack's own insets are taken out. Excludes
+    /// the gaps *between* tabs, which `TabMetrics.uniformWidth` accounts for.
+    static func availableTabWidth(inBarWidth barWidth: CGFloat) -> CGFloat {
+        max(0, barWidth
+            - addButtonWidth
+            - addButtonTrailingInset
+            - addButtonSpacing
+            - stackInset * 2)
+    }
 
     typealias Tab = TabRef
 
@@ -406,8 +443,10 @@ final class AccountTabBar: NSView {
 
         tabStack.orientation = .horizontal
         tabStack.alignment = .centerY
-        tabStack.spacing = 6
-        tabStack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        tabStack.spacing = TabMetrics.spacing
+        tabStack.edgeInsets = NSEdgeInsets(
+            top: 0, left: Self.stackInset, bottom: 0, right: Self.stackInset
+        )
         tabStack.translatesAutoresizingMaskIntoConstraints = false
 
         tabScroll.drawsBackground = false
@@ -445,15 +484,19 @@ final class AccountTabBar: NSView {
             tabScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             tabScroll.topAnchor.constraint(equalTo: topAnchor),
             tabScroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
-            tabScroll.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -4),
+            tabScroll.trailingAnchor.constraint(
+                equalTo: addButton.leadingAnchor, constant: -Self.addButtonSpacing
+            ),
 
             tabStack.topAnchor.constraint(equalTo: tabScroll.contentView.topAnchor),
             tabStack.bottomAnchor.constraint(equalTo: tabScroll.contentView.bottomAnchor),
             tabStack.leadingAnchor.constraint(equalTo: tabScroll.contentView.leadingAnchor),
 
-            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            addButton.trailingAnchor.constraint(
+                equalTo: trailingAnchor, constant: -Self.addButtonTrailingInset
+            ),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            addButton.widthAnchor.constraint(equalToConstant: 34),
+            addButton.widthAnchor.constraint(equalToConstant: Self.addButtonWidth),
 
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -499,7 +542,36 @@ final class AccountTabBar: NSView {
             tabView.onDragBegan = { [weak self] in self?.isDragging = true }
             tabStack.addArrangedSubview(tabView)
         }
+        // A rebuild is every change that can alter the widest label: an account
+        // added, renamed or removed, a service toggled, a tab dragged. Sizing
+        // here rather than only on the next resize means the new set of tabs is
+        // already even by the time it is drawn.
+        applyUniformTabWidth()
         tabStack.layoutSubtreeIfNeeded()
+    }
+
+    /// The bar's own width decides whether the tabs get what they asked for, so
+    /// the rule is re-applied on every resize as well as on every rebuild.
+    override func layout() {
+        super.layout()
+        applyUniformTabWidth()
+    }
+
+    /// Gives every tab the one width `TabMetrics` computes for the set.
+    ///
+    /// Only changed widths are written back, so the layout pass this triggers
+    /// settles on the second pass instead of looping.
+    private func applyUniformTabWidth() {
+        let tabViews = tabStack.arrangedSubviews.compactMap { $0 as? AccountTabView }
+        guard !tabViews.isEmpty else { return }
+
+        let width = TabMetrics.uniformWidth(
+            naturalWidths: tabViews.map(\.naturalWidth),
+            available: Self.availableTabWidth(inBarWidth: bounds.width)
+        )
+        for tabView in tabViews where tabView.assignedWidth != width {
+            tabView.assignedWidth = width
+        }
     }
 
     @objc private func addAccount(_ sender: Any?) {
@@ -565,10 +637,50 @@ final class AccountTabView: NSView, NSDraggingSource {
     /// moves is a click and a press that moves is a reorder.
     private var pressOrigin: NSPoint?
 
-    init(account: Account, view: AccountView, isSelected: Bool, isSignedOut: Bool = false) {
+    /// What this tab would like to be, measured from its own content. The bar
+    /// collects these, takes the widest, and hands every tab the same
+    /// `assignedWidth`.
+    let naturalWidth: CGFloat
+
+    /// The width the bar has decided every tab gets. Same for every tab in the
+    /// bar, always.
+    var assignedWidth: CGFloat = TabMetrics.minimumWidth {
+        didSet { invalidateIntrinsicContentSize() }
+    }
+
+    /// The tab is sized by the bar, not by its own content: hugging and
+    /// compression resistance are both required horizontally, so `assignedWidth`
+    /// is what the stack view gives it — and the label inside truncates instead.
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: assignedWidth, height: TabMetrics.height)
+    }
+
+    /// - Parameter accessoryWidth: room reserved at the trailing end for an
+    ///   optional accessory — the per-account unread pill of plan unit U10.
+    ///   Reserving it in the measurement is what makes a tab that gains a pill
+    ///   grow instead of squeezing its label.
+    init(
+        account: Account,
+        view: AccountView,
+        isSelected: Bool,
+        isSignedOut: Bool = false,
+        accessoryWidth: CGFloat? = nil
+    ) {
         self.tab = AccountTabBar.Tab(accountId: account.id, view: view)
         self.tint = account.color.nsColor
         self.selected = isSelected
+
+        let labelText = "\(account.name) · \(view.displayName)"
+        // A warning pill lives in the same trailing accessory slot, so a tab
+        // that carries one is measured with the slot reserved. Without this the
+        // pill would eat the label's room instead of widening the tab — and
+        // because the bar sizes every tab by the widest, all its siblings too.
+        self.naturalWidth = TabMetrics.naturalWidth(
+            // Measured in the selected weight whatever this tab's state is, so
+            // selecting a tab never resizes the row.
+            labelWidth: TabMetrics.textWidth(labelText, font: TabMetrics.measurementFont),
+            accessoryWidth: accessoryWidth ?? (isSignedOut ? SignedOutPill.size.width : nil)
+        )
         super.init(frame: .zero)
 
         wantsLayer = true
@@ -581,32 +693,22 @@ final class AccountTabView: NSView, NSDraggingSource {
         icon.contentTintColor = isSelected ? tint : tint.withAlphaComponent(0.75)
         icon.translatesAutoresizingMaskIntoConstraints = false
 
-        let label = NSTextField(labelWithString: "\(account.name) · \(view.displayName)")
-        label.font = .systemFont(ofSize: 12.5, weight: isSelected ? .semibold : .regular)
+        let label = NSTextField(labelWithString: labelText)
+        label.font = TabMetrics.labelFont(selected: isSelected)
         label.textColor = isSelected ? .labelColor : .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
+        // The tab's width is the bar's decision. When it is not enough for the
+        // full name, the label is the part that gives way — with a tail
+        // ellipsis, and the whole name still in the tooltip.
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        let base = account.email.isEmpty
-            ? "\(account.name) · \(view.displayName)"
-            : "\(account.name) · \(view.displayName) — \(account.email)"
+        let base = account.email.isEmpty ? labelText : "\(labelText) — \(account.email)"
         toolTip = isSignedOut ? "Signed out of Google — click this tab to sign in again." : base
         setAccessibilityLabel(isSignedOut ? "\(base). Signed out of Google." : base)
 
         addSubview(icon)
         addSubview(label)
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 14),
-            icon.heightAnchor.constraint(equalToConstant: 14),
-
-            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            heightAnchor.constraint(equalToConstant: 28),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 260)
-        ])
 
         // The trailing accessory slot. Signed-out and an unread count are
         // mutually exclusive by construction — an account whose feed cannot be
@@ -618,19 +720,55 @@ final class AccountTabView: NSView, NSDraggingSource {
         // element in this bar is tinted with the account colour, so the single
         // non-tint thing in the tab bar is the one thing that cannot be read as
         // "this is the purple account".
-        if isSignedOut {
-            let pill = SignedOutPill()
+        let pill: SignedOutPill? = isSignedOut ? SignedOutPill() : nil
+        if let pill {
             pill.translatesAutoresizingMaskIntoConstraints = false
             addSubview(pill)
+        }
+
+        // Icon, label and any accessory travel as one group, centred in
+        // whatever width the bar hands out. Left-aligning them would leave a
+        // visible pocket of dead space at the trailing edge of every tab
+        // shorter than the widest. `horizontalPadding` is the floor on each
+        // side, not the actual inset.
+        let content = NSLayoutGuide()
+        addLayoutGuide(content)
+
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: icon.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: pill?.trailingAnchor ?? label.trailingAnchor),
+            content.centerXAnchor.constraint(equalTo: centerXAnchor),
+            content.leadingAnchor.constraint(
+                greaterThanOrEqualTo: leadingAnchor, constant: TabMetrics.horizontalPadding
+            ),
+            content.trailingAnchor.constraint(
+                lessThanOrEqualTo: trailingAnchor, constant: -TabMetrics.horizontalPadding
+            ),
+
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: TabMetrics.iconSize),
+            icon.heightAnchor.constraint(equalToConstant: TabMetrics.iconSize),
+
+            label.leadingAnchor.constraint(
+                equalTo: icon.trailingAnchor, constant: TabMetrics.iconLabelSpacing
+            ),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            heightAnchor.constraint(equalToConstant: TabMetrics.height)
+        ])
+
+        if let pill {
             NSLayoutConstraint.activate([
-                label.trailingAnchor.constraint(equalTo: pill.leadingAnchor, constant: -6),
-                pill.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+                pill.leadingAnchor.constraint(
+                    equalTo: label.trailingAnchor, constant: TabMetrics.accessorySpacing
+                ),
                 pill.centerYAnchor.constraint(equalTo: centerYAnchor),
                 pill.widthAnchor.constraint(equalToConstant: SignedOutPill.size.width),
                 pill.heightAnchor.constraint(equalToConstant: SignedOutPill.size.height)
             ])
-        } else {
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12).isActive = true
         }
 
         let contextMenu = NSMenu()

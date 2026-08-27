@@ -36,34 +36,89 @@ final class UnreadPoller {
     /// `type: 'opaqueredirect'` response while a genuine offline failure still
     /// throws. That one flag is the whole technical unlock; see `SessionHealth`.
     ///
+    /// The whole inbox, and Gmail's own Primary tab. The badge used to disagree
+    /// with Gmail by counting Promotions and Social; A5 is the choice between
+    /// the two, and the smart-label form is what Gmail's own `Inbox (N)` shows.
+    static let plainFeedPath = "/mail/feed/atom"
+    static let primaryFeedPath = "/mail/feed/atom/%5Esmartlabel_personal"
+
+    /// The feed the scope asks for, unless the `UnreadUsePlainFeed` valve
+    /// (KTD-S6) forces the whole inbox — the way out for the day Gmail retires
+    /// the smart label.
+    static func feedPath(scope: BadgeScope, usePlainFeed: Bool) -> String {
+        guard scope == .primary, !usePlainFeed else { return plainFeedPath }
+        return primaryFeedPath
+    }
+
+    /// The Dock total: only the accounts that opted in (A4). An account left
+    /// out is still polled and still holds its own count — it just does not add
+    /// to this number.
+    static func dockTotal(_ counts: [UUID: Int], participants: Set<UUID>) -> Int {
+        counts.reduce(0) { total, entry in
+            participants.contains(entry.key) ? total + entry.value : total
+        }
+    }
+
     /// The URL is host-relative so the fetch is same-origin whichever Gmail
     /// host the webview is on.
-    private static let feedScript = """
-    if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
-      return { ok: true, feed: '', status: -1, type: 'not-gmail' };
+    private static func feedScript(path: String) -> String {
+        """
+        if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
+          return { ok: true, feed: '', status: -1, type: 'not-gmail', reached: false };
+        }
+        const controller = new AbortController();
+        const deadline = setTimeout(function () { controller.abort(); }, 20000);
+        try {
+          const response = await fetch('\(path)', {
+            credentials: 'include',
+            cache: 'no-store',
+            redirect: 'manual',
+            signal: controller.signal
+          });
+          if (response.type === 'opaqueredirect') {
+            // A redirect came back, so Google answered — whatever it means, the
+            // network is up. Which redirect it is, is the question: a signed-out
+            // account goes cross-origin to accounts.google.com, a multi-login
+            // profile goes same-origin to /mail/u/N/. Following it separates
+            // them, because only the cross-origin one fails CORS and throws.
+            try {
+              const followed = await fetch('\(path)', {
+                credentials: 'include',
+                cache: 'no-store',
+                redirect: 'follow',
+                signal: controller.signal
+              });
+              if (!followed.ok) {
+                return {
+                  ok: followed.status < 500, feed: '',
+                  status: followed.status, type: 'redirect-followed', reached: true
+                };
+              }
+              return {
+                ok: true, feed: await followed.text(),
+                status: followed.status, type: 'redirect-followed', reached: true
+              };
+            } catch (followError) {
+              return { ok: false, feed: '', status: 0, type: 'opaqueredirect', reached: true };
+            }
+          }
+          if (!response.ok) {
+            return {
+              ok: response.status < 500, feed: '',
+              status: response.status, type: response.type, reached: true
+            };
+          }
+          return {
+            ok: true, feed: await response.text(),
+            status: response.status, type: response.type, reached: true
+          };
+        } catch (error) {
+          return { ok: false, feed: '', status: -1, type: 'error', reached: false };
+        } finally {
+          clearTimeout(deadline);
+        }
+        """
     }
-    const controller = new AbortController();
-    const deadline = setTimeout(function () { controller.abort(); }, 20000);
-    try {
-      const response = await fetch('/mail/feed/atom', {
-        credentials: 'include',
-        cache: 'no-store',
-        redirect: 'manual',
-        signal: controller.signal
-      });
-      if (response.type === 'opaqueredirect') {
-        return { ok: false, feed: '', status: 0, type: 'opaqueredirect' };
-      }
-      if (!response.ok) {
-        return { ok: response.status < 500, feed: '', status: response.status, type: response.type };
-      }
-      return { ok: true, feed: await response.text(), status: response.status, type: response.type };
-    } catch (error) {
-      return { ok: false, feed: '', status: -1, type: 'error' };
-    } finally {
-      clearTimeout(deadline);
-    }
-    """
 
     /// What this account's mail webview can be asked for right now.
     ///
@@ -90,6 +145,7 @@ final class UnreadPoller {
     static let unansweredLimit = 10
 
     private let interval: TimeInterval
+    private let settings: AppSettings
     private var timer: Timer?
     private var counts: [UUID: Int] = [:]
     /// Accounts with a poll still running. Doubles as the completion's
@@ -105,11 +161,18 @@ final class UnreadPoller {
     /// Accounts `SessionHealth` currently reports as signed out — the Dock
     /// badge's trailing `!`.
     private var signedOutAccounts: Set<UUID> = []
+    /// Accounts whose Mail tab the recycler could not get back onto its page.
+    /// Same `!`, same reason: the number below it is not the whole truth.
+    private var stalledAccounts: Set<UUID> = []
     /// Cycle counter, so an account Google is rate-limiting can be polled at
     /// half the rate.
     private var cycle = 0
 
     /// Supplies the mail webview of every account that currently has Mail on.
+    ///
+    /// Filtered on `mailEnabled` **alone**, never on `countInBadge`: an account
+    /// left out of the Dock total is still polled, because its count belongs to
+    /// its own tab as well (KTD-S7).
     var mailWebViews: MailWebViewProvider = { [] }
 
     /// One health observation per account per cycle. The detector reads the
@@ -126,8 +189,19 @@ final class UnreadPoller {
     /// is polled every other cycle.
     var isBackingOff: ((UUID) -> Bool)?
 
-    init(interval: TimeInterval = 60) {
+    /// Every answer from Google, reachable or not. This is the only
+    /// reachability evidence in the app that is about *Google* rather than
+    /// about the local link, which is why the recycler prefers it.
+    var onReachability: ((Bool) -> Void)?
+
+    /// The accounts whose counts add up to the Dock badge (A4). Applied at the
+    /// summing step, so ticking the box re-totals immediately instead of after
+    /// a poll cycle.
+    var badgeParticipants: () -> Set<UUID> = { [] }
+
+    init(interval: TimeInterval = 60, settings: AppSettings = .shared) {
         self.interval = interval
+        self.settings = settings
     }
 
     func start() {
@@ -224,6 +298,7 @@ final class UnreadPoller {
         unansweredCycles[accountId] = nil
         reportedStale.remove(accountId)
         signedOutAccounts.remove(accountId)
+        stalledAccounts.remove(accountId)
         updateBadge()
     }
 
@@ -235,10 +310,27 @@ final class UnreadPoller {
         updateBadge()
     }
 
+    /// Told by the recycler which accounts have a Mail tab that failed to load
+    /// and has not come back. Carried in the same `!` as signed-out: both mean
+    /// "this number is not the whole truth".
+    func setStalled(_ accounts: Set<UUID>) {
+        guard accounts != stalledAccounts else { return }
+        stalledAccounts = accounts
+        updateBadge()
+    }
+
+    /// Re-totals the badge without going near Gmail — what a change to A4 needs.
+    func refreshBadge() {
+        updateBadge()
+    }
+
     private func poll(accountId: UUID, webView: WKWebView, busy: Bool) {
         inFlight.insert(accountId)
+        let script = Self.feedScript(
+            path: Self.feedPath(scope: settings.badgeScope, usePlainFeed: settings.unreadUsePlainFeed)
+        )
         webView.callAsyncJavaScript(
-            Self.feedScript,
+            script,
             arguments: [:],
             in: nil,
             in: .defaultClient
@@ -250,6 +342,11 @@ final class UnreadPoller {
 
             let payload = (try? result.get()) as? [String: Any]
             let probe = Self.probe(from: payload)
+            // Reported before the busy filter, and whatever the verdict: a
+            // probe that got *any* answer out of Google proves the path to
+            // Google is open, which is the only reachability question the
+            // recycler actually cares about.
+            if probe.reached { self.onReachability?(true) }
             self.observe(accountId, busy ? .busy : SessionHealth.observation(for: probe))
 
             // A failed or aborted fetch is not "zero unread" — keep the last
@@ -271,14 +368,15 @@ final class UnreadPoller {
     /// arrived at all is a thrown fetch by another name.
     static func probe(from payload: [String: Any]?) -> SessionHealth.Probe {
         guard let payload else {
-            return SessionHealth.Probe(ok: false, parsed: false, status: -1, type: "error")
+            return SessionHealth.Probe(ok: false, parsed: false, status: -1, type: "error", reached: false)
         }
         let feed = (payload["feed"] as? String) ?? ""
         return SessionHealth.Probe(
             ok: (payload["ok"] as? Bool) ?? false,
             parsed: AtomFeedParser.unreadCount(from: feed) != nil,
             status: (payload["status"] as? Int) ?? -1,
-            type: (payload["type"] as? String) ?? "error"
+            type: (payload["type"] as? String) ?? "error",
+            reached: (payload["reached"] as? Bool) ?? false
         )
     }
 
@@ -314,18 +412,23 @@ final class UnreadPoller {
         inFlight.formIntersection(active)
         reportedStale.formIntersection(active)
         signedOutAccounts.formIntersection(active)
+        stalledAccounts.formIntersection(active)
     }
 
-    /// The Dock badge stops lying by omission: a signed-out account is dropped
-    /// from the sum, so the badge silently shrank and still read as a confident
-    /// number. One `!` however many accounts are out.
+    /// The Dock badge stops lying by omission: an account that is signed out —
+    /// or whose tab failed to load and has not come back — is dropped from the
+    /// sum, so the badge silently shrank and still read as a confident number.
+    /// One `!` however many accounts are affected, for either reason.
     static func badgeLabel(total: Int, anySignedOut: Bool) -> String? {
         if anySignedOut { return total > 0 ? "\(total)!" : "!" }
         return total > 0 ? String(total) : nil
     }
 
     func updateBadge() {
-        let total = counts.values.reduce(0, +)
-        NSApp.dockTile.badgeLabel = Self.badgeLabel(total: total, anySignedOut: !signedOutAccounts.isEmpty)
+        let total = Self.dockTotal(counts, participants: badgeParticipants())
+        NSApp.dockTile.badgeLabel = Self.badgeLabel(
+            total: total,
+            anySignedOut: !signedOutAccounts.isEmpty || !stalledAccounts.isEmpty
+        )
     }
 }

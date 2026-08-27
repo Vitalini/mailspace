@@ -116,7 +116,9 @@ final class UpdateScheduleTests: XCTestCase {
     }
 }
 
-final class AppSettingsTests: XCTestCase {
+/// The update half of `AppSettings`. The rest of the domain — and the shape of
+/// `registerDefaults` itself — lives in `AppSettingsTests`.
+final class UpdateSettingsTests: XCTestCase {
     private func scratchDefaults() -> UserDefaults {
         let suite = "MailSpaceTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

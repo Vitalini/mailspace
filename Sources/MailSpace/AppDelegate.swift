@@ -2,19 +2,25 @@ import AppKit
 import Network
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, SessionLocating, NotificationRouting, TabRecyclerHost {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, AccountHosting, SessionLocating, NotificationRouting, TabRecyclerHost {
     let accountStore = AccountStore()
 
+    private let settings = AppSettings.shared
     private let navigationPolicy = NavigationPolicy()
     private let loginAutofill = LoginAutofill()
     private let notificationBridge = NotificationBridge()
-    private let unreadPoller = UnreadPoller()
+    private lazy var unreadPoller = UnreadPoller(interval: settings.unreadPollSeconds)
     private let tabRecycler = TabRecycler()
     private let health = SessionHealthTracker()
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private let updateController = UpdateController()
-    private lazy var settingsWindowController = SettingsWindowController(updates: updateController)
+    /// `lazy` is what makes `self` available as the account host here.
+    private lazy var settingsWindowController = SettingsWindowController(
+        updates: updateController,
+        settings: settings,
+        accounts: self
+    )
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
     private var autofillProbe: AutofillProbe?
@@ -22,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     private var updateProbe: UpdateProbe?
     private var benchProbe: BenchProbe?
     private var assumptionProbe: AssumptionProbe?
+    private var settingsProbe: SettingsProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
@@ -65,12 +72,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         notificationBridge.onMailNotification = { [weak self] accountId in
             self?.unreadPoller.refresh(accountId: accountId)
         }
+        notificationBridge.currentSelection = { [weak self] in
+            guard let selection = self?.windowController?.selection else { return nil }
+            return TabRef(accountId: selection.accountId, view: selection.view)
+        }
+        navigationPolicy.notifyDownloadFinished = { [weak self] url in
+            self?.notificationBridge.postDownloadFinished(at: url)
+        }
         unreadPoller.mailWebViews = { [weak self] in
             guard let self else { return [] }
             return self.accountStore.accounts.compactMap { account in
                 guard account.mailEnabled, let webView = self.sessions[account.id]?.webView(for: .mail) else { return nil }
                 return (accountId: account.id, webView: webView)
             }
+        }
+        // A4 is applied here, at the summing step — not by filtering the
+        // provider above, which would leave an opted-out account unpolled
+        // (KTD-S7).
+        unreadPoller.badgeParticipants = { [weak self] in
+            guard let self else { return [] }
+            return Set(self.accountStore.accounts.filter { $0.mailEnabled && $0.countInBadge }.map(\.id))
         }
         unreadPoller.onObservation = { [weak self] accountId, observation in
             self?.health.record(observation, for: accountId)
@@ -123,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         if SelfTest.mode == .assume {
             assumptionProbe = AssumptionProbe()
             assumptionProbe?.run()
+            return
+        }
+        if SelfTest.mode == .settings {
+            settingsProbe = SettingsProbe()
+            settingsProbe?.run()
             return
         }
         if SelfTest.mode == .tabshot {
@@ -207,8 +233,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         sessions[id]?.syncEnabledViews(with: updated)
         sessions[id]?.loadIfNeeded()
         if !updated.mailEnabled { unreadPoller.forget(accountId: id) }
-        windowController?.refresh()
+        accountsChanged()
         unreadPoller.refresh(accountId: id)
+    }
+
+    /// The account list changed. Nothing in MailSpace posts to
+    /// `NotificationCenter` and this plan does not invent it (KTD-S10): the
+    /// window and the Settings pane are told by hand, in one place, so no
+    /// account path can update one and forget the other.
+    private func accountsChanged() {
+        windowController?.refresh()
+        settingsWindowController.reloadAccounts()
+    }
+
+    func badgeInputsChanged(repoll: Bool) {
+        if repoll {
+            // The scope changed what the number means, so the number has to be
+            // fetched again — not a stop()/start() cycle, which only the
+            // interval needs.
+            unreadPoller.refresh()
+        } else {
+            unreadPoller.refreshBadge()
+        }
     }
 
     /// The user has just brought this tab up. A webview the crash throttle
@@ -378,7 +424,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         pathMonitor.start(queue: DispatchQueue(label: "com.vitalii.MailSpace.path"))
     }
 
-    func requestRemoveAccount(id: UUID) {
+    /// Confirms, then tears the account down. The confirmation belongs to the
+    /// window the user clicked in — a sheet on the Settings window when that is
+    /// where the − button was, and today's app-modal dialog when no window is
+    /// passed (a self-test, or a caller with nothing to attach to).
+    func requestRemoveAccount(id: UUID, presentedOn presentingWindow: NSWindow?) {
         guard let account = accountStore.account(id: id) else { return }
 
         let alert = NSAlert()
@@ -387,7 +437,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Remove Account")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        guard let presentingWindow else {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            performRemoval(id: id)
+            return
+        }
+        alert.beginSheetModal(for: presentingWindow) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.performRemoval(id: id)
+        }
+    }
+
+    /// The teardown, moved here verbatim from inside `requestRemoveAccount`.
+    /// Nothing in the ordering below is edited: every step of it is a bug
+    /// somebody already paid for, and `MAILSPACE_SELFTEST=store` is what proves
+    /// the move was mechanical.
+    private func performRemoval(id: UUID) {
+        // A sheet blocks only its own window, so the main window's tab context
+        // menu can remove the same account while the Settings sheet is up.
+        // Without this line the second removal runs against a released session
+        // and a Keychain item that is already gone.
+        guard let account = accountStore.account(id: id) else { return }
 
         // Ordering matters twice over. `forget` goes first so a poll still in
         // flight cannot write a stale count back after the account is gone. And
@@ -409,7 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         }
         accountStore.remove(id: id)
         KeychainStore.shared.deletePassword(for: account.email)
-        windowController?.refresh()
+        accountsChanged()
 
         let name = account.name
         WebViewFactory.destroyDataStore(for: id) { error in
@@ -500,9 +571,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         )
         applyPasswordEdit(edit, for: account)
         makeSession(for: account)
+        // `select` refreshes the main window and moves its first responder, but
+        // never activates it — so an account added from Settings lands behind
+        // the still-key Settings window.
         if let view = account.effectiveView {
             windowController?.select(accountId: account.id, view: view)
         }
+        settingsWindowController.reloadAccounts()
         unreadPoller.refresh(accountId: account.id)
     }
 
@@ -515,6 +590,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
     /// "you are up to date" or "GitHub could not be reached".
     @objc func checkForUpdates(_ sender: Any?) {
         updateController.checkForUpdates(sender)
+    }
+
+    /// B6. The way back when the window's saved frame points at a display that
+    /// is no longer there.
+    @objc func resetWindowPosition(_ sender: Any?) {
+        windowController?.resetWindowPosition()
     }
 
     @objc func showMailView(_ sender: Any?) {
@@ -581,42 +662,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
         openMailto(mailto)
     }
 
+    /// B4: a declined LaunchServices consent dialog has to be visible. From the
+    /// menu that means an alert; the Settings row says it inline instead.
     @objc func makeDefaultMailApp(_ sender: Any?) {
-        NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto") { error in
+        DefaultMailApp.makeDefault { error in
             guard let error else { return }
             Log.error("could not become the default mail app: \(error.localizedDescription)")
+            let alert = NSAlert()
+            alert.messageText = "MailSpace is not the default mail app"
+            alert.informativeText = "macOS declined the change: \(error.localizedDescription)"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
         }
     }
 
-    /// Which account composes a `mailto:` — the selected one while it has Mail
-    /// switched on, otherwise the first account that does.
-    ///
-    /// `selected ?? firstMailEnabled` does not work: `??` short-circuits on any
-    /// non-nil selection, and `reconciledSelection` installs one whenever there
-    /// is an account at all. So the fallback was dead code, and a `mailto:`
-    /// arriving while a Calendar-only account was selected was dropped on the
-    /// floor — the app just came to the front.
-    static func mailtoAccount(selected: UUID?, accounts: [Account]) -> UUID? {
-        if
-            let selected,
-            let account = accounts.first(where: { $0.id == selected }),
-            account.mailEnabled
-        {
-            return selected
-        }
-        return accounts.first(where: { $0.mailEnabled })?.id
+    /// B3: the File-menu item reads the same live, prompt-free state the
+    /// Settings row does, so it can never claim MailSpace owns `mailto:` while
+    /// a stale copy in a deleted worktree actually holds it.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == #selector(makeDefaultMailApp(_:)) else { return true }
+        let state = DefaultMailApp.current()
+        menuItem.title = DefaultMailApp.menuTitle(state)
+        return DefaultMailApp.canBecomeDefault(state)
+    }
+
+    /// The Mail-capable accounts in the order the tab bar shows them — the
+    /// order the compose picker offers, and the order "the first Mail account"
+    /// means.
+    private func mailAccountsInTabOrder() -> [Account] {
+        TabOrder.tabs(for: accountStore.accounts)
+            .filter { $0.view == .mail }
+            .compactMap { accountStore.account(id: $0.accountId) }
     }
 
     private func openMailto(_ url: URL) {
         guard let controller = windowController else { return }
 
-        // With no Mail-enabled account there is nowhere to compose — show the
-        // first-run prompt instead of failing silently.
+        let accounts = mailAccountsInTabOrder()
+        let resolution = ComposeRouting.resolve(
+            setting: settings.composeFrom,
+            selected: controller.selection?.accountId,
+            accounts: accounts
+        )
+
+        switch resolution {
+        case .account(let accountId):
+            compose(url, in: accountId, controller: controller)
+        case .ask(let candidates):
+            // The picker runs before the compose loads, so cancelling means
+            // nothing was sent anywhere.
+            guard let chosen = Self.askWhichAccount(
+                among: candidates.compactMap { accountStore.account(id: $0) },
+                preferring: controller.selection?.accountId,
+                recipients: Self.recipients(of: url)
+            ) else { return }
+            compose(url, in: chosen, controller: controller)
+        case .none:
+            // Nowhere to compose — show the first-run prompt instead of failing
+            // silently.
+            NSApp.activate(ignoringOtherApps: true)
+            controller.showWindow()
+        }
+    }
+
+    private func compose(_ url: URL, in accountId: UUID, controller: MainWindowController) {
         guard
-            let accountId = Self.mailtoAccount(
-                selected: controller.selection?.accountId,
-                accounts: accountStore.accounts
-            ),
             let webView = sessions[accountId]?.webView(for: .mail),
             let compose = Self.composeURL(for: url)
         else {
@@ -627,6 +738,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AccountHosting, Sessio
 
         webView.load(URLRequest(url: compose))
         controller.focus(accountId: accountId, view: .mail)
+    }
+
+    /// The `Ask me each time` picker: one button per account, the tab on screen
+    /// first so Return picks it, Esc cancels the compose outright. Buttons
+    /// rather than a pop-up so the whole thing is keyboard-only without anyone
+    /// having to tab into a control first.
+    private static func askWhichAccount(
+        among accounts: [Account],
+        preferring selected: UUID?,
+        recipients: String
+    ) -> UUID? {
+        guard !accounts.isEmpty else { return nil }
+        var ordered = accounts
+        if let selected, let index = ordered.firstIndex(where: { $0.id == selected }) {
+            ordered.insert(ordered.remove(at: index), at: 0)
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Compose from which account?"
+        alert.informativeText = recipients.isEmpty ? "" : "To: \(recipients)"
+        alert.alertStyle = .informational
+        for account in ordered {
+            let button = alert.addButton(withTitle: account.name)
+            button.image = account.color.dotImage()
+            button.imagePosition = .imageLeading
+        }
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        guard ordered.indices.contains(index) else { return nil }
+        return ordered[index].id
+    }
+
+    /// Who the message is addressed to, for the picker's subtitle. Read from
+    /// the URL only — nothing is logged and nothing is stored.
+    private static func recipients(of mailto: URL) -> String {
+        // `mailto:` is opaque, so the addresses sit between the scheme and the
+        // first `?` rather than in `path`.
+        let body = mailto.absoluteString.dropFirst("mailto:".count)
+        let addresses = body.components(separatedBy: "?").first ?? ""
+        return addresses.removingPercentEncoding ?? addresses
     }
 
     /// Hands the whole mailto payload to Gmail, which parses the recipients,
@@ -778,6 +932,9 @@ enum MainMenu {
         let menu = NSMenu(title: "Window")
         menu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         menu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        // The only recovery for a frame stranded on a display that has been
+        // unplugged. A rescue belongs in a menu, not in Settings (B6).
+        menu.addItem(withTitle: "Reset Window Position", action: #selector(AppDelegate.resetWindowPosition(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
         let item = submenuItem(menu)

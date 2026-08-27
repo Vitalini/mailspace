@@ -57,14 +57,22 @@ enum SessionHealth {
         var parsed: Bool
         /// HTTP status, or 0 for an opaque redirect and -1 for a thrown fetch.
         var status: Int
-        /// The `Response.type` — `basic`, `opaqueredirect`, `error`.
+        /// The `Response.type` — `basic`, `opaqueredirect`, `redirect-followed`,
+        /// `error`.
         var type: String
+        /// Whether Google answered at all. False only for a thrown fetch and
+        /// for a page that is not Gmail; true for every status and every
+        /// redirect shape, because all of those are answers. This is the app's
+        /// only evidence about reachability *to Google* rather than to the
+        /// local link, which is why the recycler prefers it over `NWPath`.
+        var reached: Bool
 
-        init(ok: Bool, parsed: Bool, status: Int, type: String) {
+        init(ok: Bool, parsed: Bool, status: Int, type: String, reached: Bool = false) {
             self.ok = ok
             self.parsed = parsed
             self.status = status
             self.type = type
+            self.reached = reached
         }
     }
 

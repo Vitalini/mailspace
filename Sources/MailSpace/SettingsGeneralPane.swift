@@ -1,14 +1,34 @@
 import AppKit
 
-/// Settings ▸ General.
+/// Settings ▸ General — G1…G5 plus the update preferences.
 ///
-/// Carries the update preferences only. The settings-window plan's G1–G5 belong
-/// in this file when they land; the section below is written as a section so
-/// adding them means adding stacks, not rearranging this one.
+/// Every control here writes its preference and is read back at the point of
+/// use, so nothing in this pane needs a relaunch (S3). None of them owns
+/// behaviour: the compose rule lives in `ComposeRouting`, the link and download
+/// behaviour in `NavigationPolicy`, the handler check in `DefaultMailApp`.
 final class SettingsGeneralPane: NSViewController {
     private let updates: UpdateController
     private let settings: AppSettings
+    private unowned let host: AccountHosting
 
+    // G1
+    private let composePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    // G2
+    private let backgroundLinksBox = NSButton(
+        checkboxWithTitle: "Open links without bringing the browser forward",
+        target: nil,
+        action: nil
+    )
+    // G3
+    private let downloadPathLabel = NSTextField(labelWithString: "")
+    private let downloadWarning = NSTextField(labelWithString: "")
+    // G4
+    private let downloadActionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    // G5
+    private let defaultMailStatus = NSTextField(labelWithString: "")
+    private let makeDefaultButton = NSButton(title: "Make MailSpace the Default", target: nil, action: nil)
+    private let defaultMailWarning = NSTextField(labelWithString: "")
+    // Software update
     private let automaticBox = NSButton(checkboxWithTitle: "Automatically check for updates", target: nil, action: nil)
     private let checkNowButton = NSButton(title: "Check Now", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
@@ -18,9 +38,10 @@ final class SettingsGeneralPane: NSViewController {
         action: nil
     )
 
-    init(updates: UpdateController, settings: AppSettings = .shared) {
+    init(updates: UpdateController, settings: AppSettings = .shared, accounts host: AccountHosting) {
         self.updates = updates
         self.settings = settings
+        self.host = host
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -30,89 +51,265 @@ final class SettingsGeneralPane: NSViewController {
     }
 
     override func loadView() {
-        let sectionTitle = NSTextField(labelWithString: "Software Update")
-        sectionTitle.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-
-        automaticBox.target = self
-        automaticBox.action = #selector(toggleAutomatic(_:))
-        automaticBox.state = settings.automaticallyChecksForUpdates ? .on : .off
-
-        let caption = NSTextField(labelWithString:
-            "MailSpace looks for a new release once a day and shows you what changed. "
-            + "Nothing is ever installed until you click Update.")
-        caption.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        caption.textColor = .secondaryLabelColor
-        caption.lineBreakMode = .byWordWrapping
-        caption.maximumNumberOfLines = 3
-        caption.preferredMaxLayoutWidth = 420
-
-        checkNowButton.target = self
-        checkNowButton.action = #selector(checkNow(_:))
-        checkNowButton.bezelStyle = .rounded
-
-        statusLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        statusLabel.textColor = .secondaryLabelColor
-
-        let checkRow = NSStackView(views: [checkNowButton, statusLabel])
-        checkRow.orientation = .horizontal
-        checkRow.spacing = 10
-        checkRow.alignment = .centerY
-
-        let versionLabel = NSTextField(labelWithString: updates.versionDescription)
-        versionLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        versionLabel.textColor = .tertiaryLabelColor
-
-        let tabsTitle = NSTextField(labelWithString: "Tabs")
-        tabsTitle.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-
-        recycleBox.target = self
-        recycleBox.action = #selector(toggleRecycling(_:))
-        recycleBox.state = settings.automaticTabRecycling ? .on : .off
-
-        // No interval picker on purpose: the useful setting is on or off, and a
-        // number here would be one more thing to get wrong.
-        let recycleCaption = NSTextField(labelWithString:
+        let composeRow = labeledRow("Compose mailto: links from:", composePopup)
+        let linksCaption = Self.caption("Works when your browser is already running.")
+        let downloadActionRow = labeledRow("When a download finishes:", downloadActionPopup)
+        let recycleCaption = Self.caption(
             "A Gmail or Calendar tab left open for half a day quietly grows and can stop "
             + "syncing. MailSpace rebuilds it in the background, keeping the view you were "
-            + "on. It waits while you are typing, while a message is being written, and "
-            + "while a download is running.")
-        recycleCaption.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        recycleCaption.textColor = .secondaryLabelColor
-        recycleCaption.lineBreakMode = .byWordWrapping
-        recycleCaption.maximumNumberOfLines = 5
-        recycleCaption.preferredMaxLayoutWidth = 420
-
+            + "on. It waits while you are typing, while a message is being written, while a "
+            + "download is running, and while the network is down."
+        )
         let stack = NSStackView(views: [
-            sectionTitle, automaticBox, caption, checkRow, versionLabel,
-            tabsTitle, recycleBox, recycleCaption
+            Self.sectionTitle("Composing"),
+            composeRow,
+
+            Self.sectionTitle("Links"),
+            backgroundLinksBox,
+            linksCaption,
+
+            Self.sectionTitle("Downloads"),
+            labeledRow("Save downloads to:", downloadRow()),
+            downloadWarning,
+            downloadActionRow,
+
+            Self.sectionTitle("Default Mail App"),
+            defaultMailStatus,
+            makeDefaultButton,
+            defaultMailWarning,
+
+            Self.sectionTitle("Tabs"),
+            recycleBox,
+            // No interval picker on purpose: the useful setting is on or off,
+            // and a number here would be one more thing to get wrong.
+            recycleCaption,
+
+            Self.sectionTitle("Software Update"),
+            automaticBox,
+            Self.caption(
+                "MailSpace looks for a new release once a day and shows you what changed. "
+                + "Nothing is ever installed until you click Update."
+            ),
+            NSStackView(views: [checkNowButton, statusLabel]).horizontal(),
+            Self.footnote(updates.versionDescription)
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        stack.setCustomSpacing(4, after: automaticBox)
-        stack.setCustomSpacing(14, after: caption)
-        stack.setCustomSpacing(20, after: versionLabel)
+        // A section title belongs to what comes after it, so the gap goes above.
+        // `makeDefaultButton` carries the gap as well as the warning under it: a
+        // hidden view contributes no spacing of its own, and that warning is
+        // hidden whenever macOS has not just refused.
+        for view in [
+            composeRow, linksCaption, downloadActionRow,
+            makeDefaultButton, defaultMailWarning, recycleCaption
+        ] {
+            stack.setCustomSpacing(18, after: view)
+        }
+        stack.setCustomSpacing(4, after: backgroundLinksBox)
         stack.setCustomSpacing(4, after: recycleBox)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 340))
+        configureControls()
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 700))
         content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -24)
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -20)
         ])
         view = content
-        refreshStatus()
+        reload()
     }
 
     override func viewWillAppear() {
         super.viewWillAppear()
+        reload()
+    }
+
+    /// Re-reads everything the window can be out of step with: the account list
+    /// behind G1, the download folder's writability, and who owns `mailto:`.
+    func reload() {
+        guard isViewLoaded else { return }
+        rebuildComposePopup()
+        backgroundLinksBox.state = settings.openLinksInBackground ? .on : .off
+        refreshDownloadFolder()
+        downloadActionPopup.selectItem(withTag: Self.tag(for: settings.downloadFinishedAction))
+        refreshDefaultMailApp()
         automaticBox.state = settings.automaticallyChecksForUpdates ? .on : .off
         recycleBox.state = settings.automaticTabRecycling ? .on : .off
-        refreshStatus()
+        statusLabel.stringValue = updates.lastCheckDescription
     }
+
+    // MARK: - Wiring
+
+    private func configureControls() {
+        composePopup.target = self
+        composePopup.action = #selector(composeFromChanged(_:))
+
+        backgroundLinksBox.target = self
+        backgroundLinksBox.action = #selector(toggleBackgroundLinks(_:))
+
+        downloadActionPopup.target = self
+        downloadActionPopup.action = #selector(downloadActionChanged(_:))
+        downloadActionPopup.removeAllItems()
+        for action in DownloadFinishedAction.allCases {
+            downloadActionPopup.addItem(withTitle: action.displayName)
+            downloadActionPopup.lastItem?.tag = Self.tag(for: action)
+        }
+
+        downloadPathLabel.lineBreakMode = .byTruncatingMiddle
+        downloadPathLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        Self.style(downloadWarning, as: .warning)
+        Self.style(defaultMailWarning, as: .warning)
+        defaultMailStatus.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+
+        makeDefaultButton.target = self
+        makeDefaultButton.action = #selector(makeDefault(_:))
+        makeDefaultButton.bezelStyle = .rounded
+
+        automaticBox.target = self
+        automaticBox.action = #selector(toggleAutomatic(_:))
+
+        recycleBox.target = self
+        recycleBox.action = #selector(toggleRecycling(_:))
+
+        checkNowButton.target = self
+        checkNowButton.action = #selector(checkNow(_:))
+        checkNowButton.bezelStyle = .rounded
+        Self.style(statusLabel, as: .secondary)
+    }
+
+    // MARK: - G1
+
+    private func rebuildComposePopup() {
+        let accounts = mailAccounts()
+        composePopup.removeAllItems()
+        composePopup.addItem(withTitle: "Ask me each time")
+        composePopup.lastItem?.representedObject = ComposeFrom.ask.rawValue
+        composePopup.addItem(withTitle: "The account I'm looking at")
+        composePopup.lastItem?.representedObject = ComposeFrom.current.rawValue
+        if !accounts.isEmpty {
+            composePopup.menu?.addItem(.separator())
+            for account in accounts {
+                composePopup.addItem(withTitle: account.name)
+                composePopup.lastItem?.representedObject = account.id.uuidString
+                composePopup.lastItem?.image = account.color.dotImage()
+            }
+        }
+
+        let stored = settings.composeFrom.rawValue
+        let match = composePopup.itemArray.first { ($0.representedObject as? String) == stored }
+        // A fixed account that has been removed, or has lost Mail, shows as the
+        // rule it actually degrades to rather than as a blank row.
+        composePopup.select(match ?? composePopup.itemArray.first)
+        if match == nil, settings.composeFrom != .ask { settings.composeFrom = .ask }
+    }
+
+    private func mailAccounts() -> [Account] {
+        TabOrder.tabs(for: host.accountStore.accounts)
+            .filter { $0.view == .mail }
+            .compactMap { tab in host.accountStore.account(id: tab.accountId) }
+    }
+
+    @objc private func composeFromChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String else { return }
+        settings.composeFrom = ComposeFrom(rawValue: raw)
+    }
+
+    // MARK: - G2
+
+    @objc private func toggleBackgroundLinks(_ sender: NSButton) {
+        settings.openLinksInBackground = sender.state == .on
+    }
+
+    // MARK: - G3
+
+    private func downloadRow() -> NSView {
+        let choose = NSButton(title: "Choose…", target: self, action: #selector(chooseDownloadFolder(_:)))
+        choose.bezelStyle = .rounded
+        let useDefault = NSButton(title: "Use Default", target: self, action: #selector(useDefaultDownloadFolder(_:)))
+        useDefault.bezelStyle = .rounded
+        let row = NSStackView(views: [downloadPathLabel, choose, useDefault]).horizontal()
+        row.widthAnchor.constraint(lessThanOrEqualToConstant: 400).isActive = true
+        return row
+    }
+
+    @objc private func chooseDownloadFolder(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.directoryURL = settings.downloadDirectory
+        guard panel.runModal() == .OK, let chosen = panel.url else { return }
+        settings.downloadDirectory = chosen
+        refreshDownloadFolder()
+    }
+
+    @objc private func useDefaultDownloadFolder(_ sender: Any?) {
+        settings.useSystemDownloadDirectory()
+        refreshDownloadFolder()
+    }
+
+    private func refreshDownloadFolder() {
+        let directory = settings.downloadDirectory
+        downloadPathLabel.stringValue = settings.usesSystemDownloadDirectory
+            ? "Downloads"
+            : (directory.path as NSString).abbreviatingWithTildeInPath
+
+        // The setting is never silently reverted — he chose it, so he sees why
+        // it is failing.
+        let writable = FileManager.default.isWritableFile(atPath: directory.path)
+        let exists = FileManager.default.fileExists(atPath: directory.path)
+        downloadPathLabel.textColor = writable ? .labelColor : .systemRed
+        downloadWarning.stringValue = writable
+            ? ""
+            : (exists ? "MailSpace cannot write here." : "This folder no longer exists.")
+        downloadWarning.isHidden = writable
+    }
+
+    // MARK: - G4
+
+    @objc private func downloadActionChanged(_ sender: NSPopUpButton) {
+        guard let action = DownloadFinishedAction.allCases.first(where: { Self.tag(for: $0) == sender.selectedTag() })
+        else { return }
+        settings.downloadFinishedAction = action
+    }
+
+    private static func tag(for action: DownloadFinishedAction) -> Int {
+        (DownloadFinishedAction.allCases.firstIndex(of: action) ?? 0) + 1
+    }
+
+    // MARK: - G5
+
+    private func refreshDefaultMailApp() {
+        let state = DefaultMailApp.current()
+        defaultMailStatus.stringValue = DefaultMailApp.statusText(state)
+        makeDefaultButton.isEnabled = DefaultMailApp.canBecomeDefault(state)
+        defaultMailWarning.isHidden = defaultMailWarning.stringValue.isEmpty
+    }
+
+    @objc private func makeDefault(_ sender: Any?) {
+        defaultMailWarning.stringValue = ""
+        defaultMailWarning.isHidden = true
+        DefaultMailApp.makeDefault { [weak self] error in
+            guard let self else { return }
+            if let error {
+                // B4: a declined consent dialog says so, right here, instead of
+                // going to stderr while the status line pretends nothing was
+                // asked.
+                self.defaultMailWarning.stringValue = "macOS declined the change: \(error.localizedDescription)"
+                self.defaultMailWarning.isHidden = false
+            }
+            self.refreshDefaultMailApp()
+        }
+    }
+
+    // MARK: - Software update
 
     @objc private func toggleAutomatic(_ sender: NSButton) {
         settings.automaticallyChecksForUpdates = sender.state == .on
@@ -129,11 +326,60 @@ final class SettingsGeneralPane: NSViewController {
         // reports failures — the same contract as the menu item.
         updates.check(userInitiated: true) { [weak self] in
             self?.checkNowButton.isEnabled = true
-            self?.refreshStatus()
+            self?.statusLabel.stringValue = self?.updates.lastCheckDescription ?? ""
         }
     }
 
-    private func refreshStatus() {
-        statusLabel.stringValue = updates.lastCheckDescription
+    // MARK: - Layout helpers
+
+    private func labeledRow(_ title: String, _ control: NSView) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.alignment = .right
+        label.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        let row = NSStackView(views: [label, control]).horizontal()
+        row.alignment = .firstBaseline
+        return row
+    }
+
+    private static func sectionTitle(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        return label
+    }
+
+    private static func caption(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        style(label, as: .secondary)
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 3
+        label.preferredMaxLayoutWidth = 460
+        return label
+    }
+
+    private static func footnote(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .tertiaryLabelColor
+        return label
+    }
+
+    private enum LabelStyle { case secondary, warning }
+
+    private static func style(_ label: NSTextField, as style: LabelStyle) {
+        label.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = style == .warning ? .systemRed : .secondaryLabelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 3
+        label.preferredMaxLayoutWidth = 460
+    }
+}
+
+extension NSStackView {
+    /// The horizontal row this window is built out of.
+    func horizontal(spacing: CGFloat = 8) -> NSStackView {
+        orientation = .horizontal
+        alignment = .centerY
+        self.spacing = spacing
+        return self
     }
 }

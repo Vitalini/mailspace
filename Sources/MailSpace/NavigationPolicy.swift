@@ -592,6 +592,20 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// Handles a `mailto:` link clicked inside a webview.
     var mailtoHandler: ((URL) -> Void)?
 
+    /// Posts the "your download is ready" notification (G4). Injected rather
+    /// than reached for: the notification centre belongs to
+    /// `NotificationBridge`, which is the app's only delegate for it.
+    var notifyDownloadFinished: ((URL) -> Void)?
+
+    /// Injected the same way the closures above are (KTD-S3) — no global
+    /// lookup, and a probe can hand in its own scratch domain.
+    private let settings: AppSettings
+
+    init(settings: AppSettings = .shared) {
+        self.settings = settings
+        super.init()
+    }
+
     /// Fires once when a webview on an account's data store finishes the Google
     /// sign-in chain, so that account's other tabs can leave their signed-out
     /// pages behind.
@@ -653,10 +667,50 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// is for "an upload may be running here" — WebKit exposes no signal for a
     /// request body still going out (see G7 in `RecycleDecision`).
     private var lastOpenPanelAt = WeakObjectMap<WKWebView, Date>()
+    /// Where each in-flight download is being written. The delegate is one
+    /// shared object across every account's webviews, so "the download that
+    /// just finished" is only answerable through the object itself. Cleared on
+    /// both finish and failure, or it leaks an entry per download for the life
+    /// of the process.
+    private var destinations: [ObjectIdentifier: URL] = [:]
 
-    private static var downloadsDirectory: URL {
-        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Downloads")
+    /// Hands a link to the browser (G2).
+    ///
+    /// `activates = false` keeps MailSpace frontmost when the browser is
+    /// already running; a browser launching cold activates itself and nothing
+    /// here stops it, which is what the checkbox's sublabel says.
+    private func openExternally(_ url: URL, commandHeld: Bool = false) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = Self.activatesBrowser(
+            openInBackground: settings.openLinksInBackground,
+            commandHeld: commandHeld
+        )
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.open(url, configuration: configuration)
+    }
+
+    /// Whether handing the link over is allowed to take the screen (G2).
+    ///
+    /// ⌘-click means "put it over there and let me carry on", whatever the
+    /// checkbox says — it can only ever force the quieter direction.
+    static func activatesBrowser(openInBackground: Bool, commandHeld: Bool) -> Bool {
+        !(openInBackground || commandHeld)
+    }
+
+    /// Where a download lands, and the one place that can refuse (G3, B5).
+    ///
+    /// Throwing rather than returning an optional is the point: this used to be
+    /// `try? createDirectory` followed by handing WebKit a destination anyway,
+    /// which is how a download could disappear with no feedback at all.
+    static func downloadDestination(suggestedFilename: String, in directory: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard FileManager.default.isWritableFile(atPath: directory.path) else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        // `safeFilename` inside `uniqueDestination` is what keeps a
+        // `../../Library/…` suggested filename inside the folder — more
+        // load-bearing now that the folder is the user's choice, not less.
+        return LinkRouter.uniqueDestination(in: directory, filename: suggestedFilename)
     }
 
     // MARK: - WKNavigationDelegate
@@ -697,7 +751,7 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             decisionHandler(.cancel)
 
         case .openExternally(let url):
-            NSWorkspace.shared.open(url)
+            openExternally(url, commandHeld: navigationAction.modifierFlags.contains(.command))
             decisionHandler(.cancel)
         }
     }
@@ -975,7 +1029,9 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         if let requested = navigationAction.request.url, !requested.absoluteString.isEmpty {
             switch LinkRouter.destination(for: requested) {
             case .openExternally(let url):
-                NSWorkspace.shared.open(url)
+                // A `window.open` has no navigation action of its own to read a
+                // modifier from, so it follows the setting alone.
+                openExternally(url)
                 return nil
             case .compose(let mailto):
                 mailtoHandler?(mailto)
@@ -1174,18 +1230,56 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        let directory = Self.downloadsDirectory
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        completionHandler(LinkRouter.uniqueDestination(in: directory, filename: suggestedFilename))
+        let directory = settings.downloadDirectory
+        do {
+            let destination = try Self.downloadDestination(suggestedFilename: suggestedFilename, in: directory)
+            destinations[ObjectIdentifier(download)] = destination
+            completionHandler(destination)
+        } catch {
+            // B5: the failure is shown and the download stops, instead of
+            // WebKit being handed a path it cannot write.
+            Self.reportUnwritableDownloadFolder(directory, error: error)
+            completionHandler(nil)
+        }
     }
 
     func downloadDidFinish(_ download: WKDownload) {
         downloads[ObjectIdentifier(download)] = nil
+        guard let destination = destinations.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        announce(destination)
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
         downloads[ObjectIdentifier(download)] = nil
+        destinations[ObjectIdentifier(download)] = nil
         Log.error("download failed: \(error.localizedDescription)")
+    }
+
+    /// G4. What happens the moment a download lands.
+    private func announce(_ destination: URL) {
+        switch settings.downloadFinishedAction {
+        case .notify:
+            notifyDownloadFinished?(destination)
+        case .reveal:
+            NSWorkspace.shared.activateFileViewerSelecting([destination])
+        case .open:
+            NSWorkspace.shared.open(destination)
+        case .nothing:
+            break
+        }
+    }
+
+    private static func reportUnwritableDownloadFolder(_ directory: URL, error: Error) {
+        Log.error("download folder \(directory.path) is not writable: \(error.localizedDescription)")
+        let alert = NSAlert()
+        alert.messageText = "MailSpace cannot save downloads to “\(directory.lastPathComponent)”"
+        alert.informativeText =
+            "\(directory.path)\n\n\(error.localizedDescription)\n\n"
+            + "The download was stopped rather than left to disappear. "
+            + "Pick another folder in Settings ▸ General."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// Cancels every download still running on this account's data store.
@@ -1198,6 +1292,7 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     func cancelDownloads(for accountId: UUID) {
         for (key, active) in downloads where active.accountId == accountId {
             downloads[key] = nil
+            destinations[key] = nil
             active.download.cancel { _ in }
         }
     }
