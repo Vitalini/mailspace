@@ -403,7 +403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    private static let editorProbeScript = """
+    /// Shared with `AssumptionProbe`, which settles that it actually sees a
+    /// Gmail-shaped inline reply — G18 rests on that the way the other guards
+    /// rest on `url` tracking a fragment change.
+    static let editorProbeScript = """
     const active = document.activeElement;
     const focused = !!(active && (
       active.isContentEditable ||
@@ -415,6 +418,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
       '[contenteditable="true"], [g_editable="true"], [role="textbox"], textarea'
     );
     for (const box of boxes) {
+      // Hidden nodes do not count. Gmail keeps offscreen templates around, and
+      // one of those holding text permanently would block every rebuild in the
+      // app — silently, for the twelve hours before the persistent-block log
+      // line lands.
+      const rect = box.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) { continue; }
       // A length, never the text. Nothing here can carry a word of anyone's
       // mail back across the bridge.
       const value = box.value !== undefined ? box.value : box.textContent;

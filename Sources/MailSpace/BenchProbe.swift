@@ -318,8 +318,9 @@ final class BenchProbe: NSObject, WKNavigationDelegate {
     }
 }
 
-/// Settles the two platform behaviours the recycling guards rest on, before any
-/// of it ships. Both are cheap to test and both would silently break a guard.
+/// Settles the three platform behaviours the recycling guards rest on, before
+/// any of it ships. All three are cheap to test and each would silently break a
+/// guard.
 ///
 /// 1. Does `WKWebView.url` track a Gmail-style same-document fragment change
 ///    (`#inbox` → `#inbox?compose=new`)? If it does not, the compose guard is
@@ -328,6 +329,11 @@ final class BenchProbe: NSObject, WKNavigationDelegate {
 /// 2. Does a local `NSEvent` monitor see a key event delivered while a
 ///    `WKWebView` is first responder? That is what feeds the hard deadline's
 ///    90-second input-quiet requirement.
+/// 3. Does the G18 editor probe actually see a Gmail-shaped inline reply — a
+///    `contenteditable` div with text in it and nothing about it in the URL —
+///    and stay quiet on an inbox that has none? G18 is the only guard standing
+///    between a background tab and a rebuilt-away reply, and a selector that
+///    matched nothing would fail open with no symptom at all.
 ///
 /// Offline: the document is `loadHTMLString` against a Gmail base URL, so
 /// nothing is fetched and no account is involved.
@@ -399,10 +405,67 @@ final class AssumptionProbe: NSObject, WKNavigationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self else { return }
             if let monitor = self.monitor { NSEvent.removeMonitor(monitor) }
-            SelfTest.finish(
-                "assume result=\(tracked && self.sawEvent ? "ok" : "PROBLEM") "
-                + "fragmentTracked=\(tracked ? 1 : 0) localMonitorSawKey=\(self.sawEvent ? 1 : 0) "
-                + "before=\(before) after=\(after?.absoluteString ?? "none")"
+            self.checkEditorProbe(tracked: tracked, before: before, after: after)
+        }
+    }
+
+    /// Assumption 3. The page is the shape of a Gmail thread with the Reply box
+    /// open: a `contenteditable` div carrying text, and — the whole point —
+    /// nothing in the URL that says so.
+    private func checkEditorProbe(tracked: Bool, before: String, after: URL?) {
+        // Back to a plain thread URL first: assumption 1 left `compose=new` in
+        // the hash, and the point of this one is that an inline reply puts
+        // *nothing* there.
+        let quiet = """
+        location.hash = 'inbox/FMfcgz';
+        document.body.innerHTML =
+          '<div id="t">a thread</div>' +
+          '<div contenteditable="true" style="width:400px;height:80px"></div>' +
+          '<div role="textbox" style="display:none">offscreen template text</div>';
+        """
+        webView.evaluateJavaScript(quiet) { [weak self] _, _ in
+            guard let self else { return }
+            self.runEditorProbe { empty in
+                // An empty reply box, and a hidden template that must not count.
+                let quietOK = !RecycleDecision.hasLiveEditor(empty)
+
+                self.webView.evaluateJavaScript(
+                    "document.querySelector('[contenteditable]').textContent = 'thanks, will do';"
+                ) { _, _ in
+                    self.runEditorProbe { typed in
+                        let seesReply = RecycleDecision.hasLiveEditor(typed)
+                        let urlIsSilent = (self.webView.url).map { !RecycleDecision.hasOpenCompose($0) } ?? false
+                        let ok = tracked && self.sawEvent && quietOK && seesReply && urlIsSilent
+                        SelfTest.finish(
+                            "assume result=\(ok ? "ok" : "PROBLEM") "
+                            + "fragmentTracked=\(tracked ? 1 : 0) localMonitorSawKey=\(self.sawEvent ? 1 : 0) "
+                            + "quietPageHasNoEditor=\(quietOK ? 1 : 0) "
+                            + "inlineReplySeen=\(seesReply ? 1 : 0) "
+                            + "inlineReplyInvisibleToTheUrl=\(urlIsSilent ? 1 : 0) "
+                            + "before=\(before) after=\(after?.absoluteString ?? "none")"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func runEditorProbe(_ completion: @escaping (RecycleDecision.EditorState?) -> Void) {
+        webView.callAsyncJavaScript(
+            AppDelegate.editorProbeScript,
+            arguments: [:],
+            in: nil,
+            in: .defaultClient
+        ) { result in
+            guard let payload = (try? result.get()) as? [String: Any] else {
+                completion(nil)
+                return
+            }
+            completion(
+                RecycleDecision.EditorState(
+                    focused: (payload["focused"] as? Bool) ?? false,
+                    dirty: (payload["dirty"] as? Int) ?? 0
+                )
             )
         }
     }
