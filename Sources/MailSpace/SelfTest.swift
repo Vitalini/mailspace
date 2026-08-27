@@ -46,6 +46,14 @@ import WebKit
 /// panes into PNGs. The window is built at negative coordinates and ordered
 /// back, never front: nothing appears on any display.
 ///
+/// `MAILSPACE_SELFTEST=agenda` runs the *production* agenda parser — the one
+/// that lives inside the page, because the response holds event titles — over
+/// every hand-written fixture in `AgendaFixtures`, and asserts it agrees with
+/// `AgendaParser`, the Swift reference, on all of them. It is the only way to
+/// test the parser that actually ships. **It touches no network**: an offscreen
+/// webview on a non-persistent store, `loadHTMLString`, no `htmlembed` fetch, no
+/// signed-in session, no real calendar.
+///
 /// `MAILSPACE_SELFTEST=store` builds a real `AccountSession`, uses its data
 /// store, then tears it down exactly the way account removal does and deletes
 /// the store — proof that "signed out and deleted from this Mac" is true.
@@ -81,6 +89,7 @@ enum SelfTest {
         /// Renders the tab bar offscreen to a PNG, so the signed-out signal can
         /// be looked at without opening a window on anyone's screen.
         case tabshot
+        case agenda
     }
 
     /// The throwaway identity self-tests run under. Assembled by
@@ -955,6 +964,8 @@ final class SettingsProbe: NSObject, AccountHosting {
     /// and never a parallel implementation, so "the button is wired to
     /// `AccountHosting`" is worth asserting rather than reading.
     private var hostCalls: [String] = []
+    /// And what G6 told the countdown poller to do.
+    private var calendarCalls: [Bool] = []
 
     /// Its own directory under the temporary folder: a probe never writes the
     /// account list of the app the user runs.
@@ -1001,6 +1012,7 @@ final class SettingsProbe: NSObject, AccountHosting {
         expect(settings.openLinksInBackground, "openLinksInBackground")
         expect(settings.downloadFinishedAction == .notify, "downloadFinishedAction")
         expect(settings.badgeScope == .primary, "badgeScope")
+        expect(settings.showsCalendarCountdown, "showCalendarCountdown")
         expect(settings.usesSystemDownloadDirectory, "downloadDirectory")
         expect(settings.unreadPollSeconds == 60, "unreadPollSeconds")
         expect(!settings.unreadUsePlainFeed, "unreadUsePlainFeed")
@@ -1023,7 +1035,14 @@ final class SettingsProbe: NSObject, AccountHosting {
         let controller = SettingsWindowController(
             updates: UpdateController(settings: settings),
             settings: settings,
-            accounts: self
+            accounts: self,
+            // Records the ask and stops there: no poller, no webview, no fetch.
+            // What is under test is that G6 reaches this seam at all.
+            calendar: CalendarCountdownControls(
+                status: { CalendarCountdownStatus(kind: .notCheckedYet, checked: 0, showing: 0) },
+                setEnabled: { [weak self] enabled in self?.calendarCalls.append(enabled) },
+                recheck: { done in done() }
+            )
         )
         self.controller = controller
 
@@ -1034,7 +1053,7 @@ final class SettingsProbe: NSObject, AccountHosting {
 
         guard let directory = ProcessInfo.processInfo.environment["MAILSPACE_SETTINGS_SHOT"] else {
             SelfTest.finish(
-                "settings result=ok defaults=8 applied=\(applied.checked) "
+                "settings result=ok defaults=9 applied=\(applied.checked) "
                 + "domain=\(SelfTest.bundleIdentifier) render=skipped"
             )
         }
@@ -1084,6 +1103,22 @@ final class SettingsProbe: NSObject, AccountHosting {
             expect(settings.downloadFinishedAction == .notify, "G4-notify")
         } else {
             failures.append("G4-missing")
+        }
+
+        // G6 — the countdown switch, and the seam it drives. The pane must move
+        // the preference *and* tell the poller, or switching it off would leave
+        // both clocks running behind a hidden pill.
+        if let box: NSButton = Self.control(in: generalView, where: { $0.title.hasPrefix("Show time until") }) {
+            box.state = .off
+            Self.click(box)
+            expect(!settings.showsCalendarCountdown, "G6-off")
+            expect(calendarCalls.last == false, "G6-off-reaches-the-poller")
+            box.state = .on
+            Self.click(box)
+            expect(settings.showsCalendarCountdown, "G6-on")
+            expect(calendarCalls.last == true, "G6-on-reaches-the-poller")
+        } else {
+            failures.append("G6-missing")
         }
 
         // G1 — the pop-up is rebuilt from the account list, so the third item is
@@ -1258,5 +1293,159 @@ final class SettingsProbe: NSObject, AccountHosting {
         target.cacheDisplay(in: target.bounds, to: rep)
         guard let data = rep.representation(using: .png, properties: [:]) else { return false }
         return (try? data.write(to: url)) != nil
+    }
+}
+
+
+/// Proves the parser that ships and the parser that is tested are the same
+/// parser.
+///
+/// Privacy forces the agenda parse into the page (KTD-S14): the response holds
+/// meeting titles, so it is read where it lands and only numbers cross the
+/// bridge. That leaves the shipped parser out of reach of `swift test`. This
+/// probe closes the gap from the other side — it loads each hand-written
+/// fixture into an offscreen webview, runs the **production** `msParseAgenda`
+/// over it, and asserts the answer equals `AgendaParser`'s on the same bytes at
+/// the same instant. A disagreement means one of them is wrong and neither is
+/// trusted.
+///
+/// Nothing here goes near the network, a real calendar or a signed-in session:
+/// a non-persistent data store, `loadHTMLString`, and fixtures written by hand
+/// with placeholder titles.
+final class AgendaProbe: NSObject, WKNavigationDelegate {
+    /// Two moments on the fixtures' day: one in the morning, when most of them
+    /// have something ahead, and one late at night, when none of them do.
+    private static let hours = [9, 23]
+
+    private let webView: WKWebView
+    private var pending: [(name: String, html: String, now: Date)] = []
+    private var mismatches: [String] = []
+    private var compared = 0
+    private var started = false
+
+    override init() {
+        webView = WebViewFactory.makeWebView(configuration: SelfTest.makeProbeConfiguration())
+        super.init()
+        webView.navigationDelegate = self
+    }
+
+    func run(timeout: TimeInterval = 60) {
+        SelfTest.armWatchdog(timeout) { [weak self] in
+            "agenda result=TIMEOUT compared=\(self?.compared ?? 0)"
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        for hour in Self.hours {
+            guard let now = calendar.date(from: DateComponents(
+                year: AgendaFixtures.day.year,
+                month: AgendaFixtures.day.month,
+                day: AgendaFixtures.day.day,
+                hour: hour,
+                minute: 0
+            )) else { continue }
+            for fixture in AgendaFixtures.all {
+                pending.append((fixture.name, fixture.html, now))
+            }
+        }
+
+        SelfTest.presentOffscreen(webView)
+        // Any page will do — the fixture is an argument, not the document. This
+        // one just gives the production script a JavaScript context to run in.
+        webView.loadHTMLString(
+            "<html><head><title>agenda self-test</title></head><body></body></html>",
+            baseURL: URL(string: "about:blank")
+        )
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !started else { return }
+        started = true
+        compareNext()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        SelfTest.finish("agenda result=FAILED reason=page-load error=\(error.localizedDescription)")
+    }
+
+    private func compareNext() {
+        guard let next = pending.first else { return report() }
+        pending.removeFirst()
+
+        let expected = AgendaParser.parse(html: next.html, now: next.now, timeZone: .current)
+        webView.callAsyncJavaScript(
+            AgendaScript.parseFunction + "\n\nreturn msParseAgenda(html, nowMs);",
+            arguments: [
+                "html": next.html,
+                "nowMs": next.now.timeIntervalSince1970 * 1000
+            ],
+            in: nil,
+            in: .defaultClient
+        ) { [weak self] result in
+            guard let self else { return }
+            self.compared += 1
+            switch result {
+            case .failure(let error):
+                // The fixture name is ours, not the calendar's; the error is
+                // WebKit's. Neither can carry event content.
+                self.mismatches.append(
+                    "\(next.name)@\(Self.hour(of: next.now)):script-\(error.localizedDescription)"
+                )
+            case .success(let value):
+                if let complaint = Self.disagreement(swift: expected, javaScript: value) {
+                    self.mismatches.append("\(next.name)@\(Self.hour(of: next.now)):\(complaint)")
+                }
+            }
+            self.compareNext()
+        }
+    }
+
+    /// Compares the two answers. `nil` when they agree, and a short
+    /// machine-shaped complaint when they do not — numbers and the fixture's own
+    /// name only.
+    private static func disagreement(swift expected: AgendaParser.Result?, javaScript value: Any) -> String? {
+        guard let payload = value as? [String: Any],
+              let status = payload["status"] as? Int
+        else { return "no-payload" }
+
+        guard let expected else {
+            // Swift did not understand it, so the script must not have either.
+            return status == AgendaOutcome.notUnderstood.rawValue ? nil : "swift=nil js-status=\(status)"
+        }
+        guard status == AgendaOutcome.ok.rawValue else { return "swift=ok js-status=\(status)" }
+
+        let seconds = payload["startsInSeconds"] as? Int
+        if seconds != expected.startsInSeconds {
+            return "starts swift=\(expected.startsInSeconds.map(String.init) ?? "nil") "
+                + "js=\(seconds.map(String.init) ?? "nil")"
+        }
+        let remaining = (payload["remainingCount"] as? Int) ?? -1
+        if remaining != expected.remainingCount {
+            return "remaining swift=\(expected.remainingCount) js=\(remaining)"
+        }
+        return nil
+    }
+
+    private static func hour(of date: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.component(.hour, from: date)
+    }
+
+    private func report() {
+        guard mismatches.isEmpty else {
+            SelfTest.finish(
+                "agenda result=FAILED fixtures=\(AgendaFixtures.all.count) compared=\(compared) "
+                + "mismatches=\(mismatches.count) at=\(mismatches.joined(separator: ","))"
+            )
+        }
+        SelfTest.finish(
+            "agenda result=ok fixtures=\(AgendaFixtures.all.count) compared=\(compared) "
+            + "mismatches=0 network=none"
+        )
     }
 }

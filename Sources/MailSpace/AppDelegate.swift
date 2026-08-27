@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private lazy var unreadPoller = UnreadPoller(interval: settings.unreadPollSeconds)
     private let tabRecycler = TabRecycler()
     private let health = SessionHealthTracker()
+    private lazy var nextEventPoller = NextEventPoller(settings: settings)
     private var sessions: [UUID: AccountSession] = [:]
     private var windowController: MainWindowController?
     private let updateController = UpdateController()
@@ -19,7 +20,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private lazy var settingsWindowController = SettingsWindowController(
         updates: updateController,
         settings: settings,
-        accounts: self
+        accounts: self,
+        calendar: CalendarCountdownControls(
+            status: { [weak self] in
+                self?.nextEventPoller.status
+                    ?? CalendarCountdownStatus(kind: .notCheckedYet, checked: 0, showing: 0)
+            },
+            setEnabled: { [weak self] enabled in self?.calendarCountdownEnabledChanged(enabled) },
+            recheck: { [weak self] done in
+                guard let self else { return done() }
+                self.nextEventPoller.refresh(completion: done)
+            }
+        )
     )
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
@@ -30,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var assumptionProbe: AssumptionProbe?
     private var recoveryProbe: RecoveryProbe?
     private var settingsProbe: SettingsProbe?
+    private var agendaProbe: AgendaProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
@@ -82,6 +95,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         notificationBridge.onMailNotification = { [weak self] accountId in
             self?.unreadPoller.refresh(accountId: accountId)
         }
+        // Calendar's own reminder is free to listen to and says only "something
+        // happened on this calendar". Throttled like the tab-switch poke, so a
+        // burst of reminders is still one fetch.
+        notificationBridge.onCalendarNotification = { [weak self] accountId in
+            self?.nextEventPoller.refreshIfStale(accountId: accountId)
+        }
         notificationBridge.currentSelection = { [weak self] in
             guard let selection = self?.windowController?.selection else { return nil }
             return TabRef(accountId: selection.accountId, view: selection.view)
@@ -121,6 +140,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.tabRecycler.webViewWasDiscarded(webView)
         }
         observeSleepAndNetwork()
+        // An account needs Calendar on *and* an address to ask about: `src` has
+        // to be a concrete calendar id, so an account with no email gets no
+        // countdown rather than a wrong one (G-C3).
+        nextEventPoller.calendarWebViews = { [weak self] in
+            guard let self else { return [] }
+            return self.accountStore.accounts.compactMap { account in
+                guard account.calendarEnabled, !account.email.isEmpty,
+                      let webView = self.sessions[account.id]?.webView(for: .calendar)
+                else { return nil }
+                return (accountId: account.id, calendarId: account.email, webView: webView)
+            }
+        }
+        nextEventPoller.onCountdownsChanged = { [weak self] in self?.countdownsChanged() }
 
         if SelfTest.mode == .login {
             loginProbe = LoginProbe()
@@ -171,6 +203,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             TabShotProbe().run()
             return
         }
+        if SelfTest.mode == .agenda {
+            agendaProbe = AgendaProbe()
+            agendaProbe?.run()
+            return
+        }
 
         for account in accountStore.accounts {
             makeSession(for: account)
@@ -186,6 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Started only once every account has a session, so the very first tick
         // sees the real tab list.
         tabRecycler.start()
+        if settings.showsCalendarCountdown { nextEventPoller.start() }
         updateController.start()
         sweepOrphanedDataStores()
         if let pending = pendingMailto {
@@ -249,8 +287,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         sessions[id]?.syncEnabledViews(with: updated)
         sessions[id]?.loadIfNeeded()
         if !updated.mailEnabled { unreadPoller.forget(accountId: id) }
+        if !updated.calendarEnabled { nextEventPoller.forget(accountId: id) }
         accountsChanged()
         unreadPoller.refresh(accountId: id)
+        nextEventPoller.refresh(accountId: id)
     }
 
     /// The account list changed. Nothing in MailSpace posts to
@@ -261,6 +301,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         windowController?.refresh()
         settingsWindowController.reloadAccounts()
     }
+
+    /// G6 was switched. Starting and stopping the poller is the whole of it —
+    /// `stop()` invalidates both clocks and drops the cache, so switching the
+    /// countdown off is the precise inverse of switching it on, with no
+    /// relaunch (S3, S20).
+    private func calendarCountdownEnabledChanged(_ enabled: Bool) {
+        if enabled {
+            nextEventPoller.start()
+        } else {
+            nextEventPoller.stop()
+        }
+        countdownsChanged()
+    }
+
+    /// A Calendar tab's countdown changed.
+    ///
+    /// The value is ready in `nextEventPoller`; drawing it is a separate pass,
+    /// which hooks the tab bar in here alongside the unread pill. Keeping this
+    /// method now means the poller has one settled place to report to rather
+    /// than two callbacks bolted on later.
+    private func countdownsChanged() {}
 
     func badgeInputsChanged(repoll: Bool) {
         if repoll {
@@ -285,6 +346,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// straight to the sign-in form, and `shouldLoadInOpener` then keeps the
     /// whole chain in the tab.
     func tabBecameVisible(accountId: UUID, view: AccountView, isSelectionChange: Bool) {
+        // Coming back to a Calendar tab is the moment the countdown is most
+        // worth being right, so ask again — throttled, because this fires on
+        // every `refresh()` of the main window, not only on a user tab switch.
+        if view == .calendar { nextEventPoller.refreshIfStale(accountId: accountId) }
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
         // A recycle that gave up aimed at a specific page — the label and
         // thread he was on — so that, not the view's generic entry point, is
@@ -607,6 +672,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         pathMonitor.start(queue: DispatchQueue(label: "com.vitalii.MailSpace.path"))
     }
 
+    /// How long until this account's next event later today, and the label a
+    /// Calendar tab would draw for it — `5m`, or `(5m)`, or nothing at all.
+    ///
+    /// The pair the rendering pass reads, mirroring the way the unread count is
+    /// published. Both are `nil` whenever there is nothing honest to say.
+    func calendarCountdownSeconds(for accountId: UUID) -> Int? {
+        nextEventPoller.secondsUntilNextEvent(for: accountId)
+    }
+
+    func calendarCountdownLabel(
+        for accountId: UUID,
+        style: CalendarCountdown.LabelStyle = .bare
+    ) -> String? {
+        nextEventPoller.countdown(for: accountId, style: style)
+    }
+
+    /// The tooltip and `accessibilityLabel` form, generated from the integer —
+    /// never read from the page.
+    func calendarCountdownDescription(for accountId: UUID) -> String? {
+        nextEventPoller.longFormCountdown(for: accountId)
+    }
+
     /// Confirms, then tears the account down. The confirmation belongs to the
     /// window the user clicked in — a sheet on the Settings window when that is
     /// where the − button was, and today's app-modal dialog when no window is
@@ -651,6 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         unreadPoller.forget(accountId: id)
         health.forget(id)
         badgeSeeded.remove(id)
+        nextEventPoller.forget(accountId: id)
         navigationPolicy.closePopups(for: id)
         navigationPolicy.cancelDownloads(for: id)
         // Scoped on purpose: detaching is not enough, the session object itself

@@ -20,8 +20,18 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
     private var window: NSWindow?
     private var selected: NSToolbarItem.Identifier
 
-    init(updates: UpdateController, settings: AppSettings = .shared, accounts host: AccountHosting) {
-        generalPane = SettingsGeneralPane(updates: updates, settings: settings, accounts: host)
+    init(
+        updates: UpdateController,
+        settings: AppSettings = .shared,
+        accounts host: AccountHosting,
+        calendar: CalendarCountdownControls = CalendarCountdownControls()
+    ) {
+        generalPane = SettingsGeneralPane(
+            updates: updates,
+            settings: settings,
+            accounts: host,
+            calendar: calendar
+        )
         accountsPane = SettingsAccountsPane(accounts: host, settings: settings)
         panes = [
             Pane(

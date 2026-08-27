@@ -36,6 +36,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.downloadDirectory, AppSettings.systemDownloadDirectory)
         XCTAssertEqual(settings.downloadFinishedAction, .notify)
         XCTAssertEqual(settings.badgeScope, .primary)
+        XCTAssertTrue(settings.showsCalendarCountdown)
         XCTAssertEqual(settings.unreadPollSeconds, 60)
         XCTAssertFalse(settings.unreadUsePlainFeed)
         XCTAssertFalse(settings.disableSignInAutofill)
@@ -53,6 +54,9 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.composeFrom, .ask)
         XCTAssertTrue(settings.openLinksInBackground)
         XCTAssertEqual(settings.badgeScope, .primary)
+        // On by default. A domain written before G6 existed must not read it as
+        // a false-shaped `false`.
+        XCTAssertTrue(settings.showsCalendarCountdown)
         XCTAssertEqual(settings.unreadPollSeconds, 60)
         // And the values that were already there are untouched.
         XCTAssertTrue(settings.automaticallyChecksForUpdates)
@@ -90,6 +94,14 @@ final class AppSettingsTests: XCTestCase {
             settings.badgeScope = scope
             XCTAssertEqual(settings.badgeScope, scope)
         }
+    }
+
+    func testTheCalendarCountdownSwitchRoundTrips() {
+        let settings = settings()
+        settings.showsCalendarCountdown = false
+        XCTAssertFalse(settings.showsCalendarCountdown)
+        settings.showsCalendarCountdown = true
+        XCTAssertTrue(settings.showsCalendarCountdown)
     }
 
     func testAnUnknownStoredValueFallsBackRatherThanCrashing() {
