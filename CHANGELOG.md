@@ -12,8 +12,6 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [1.1.2] - 2026-08-28
 
-## [1.1.1] - 2026-08-27
-
 ### Fixed
 - **Clicking an attachment downloads it again.** A PDF, image or text
   attachment was opened rather than saved — and because Gmail fetches it in a
@@ -44,6 +42,9 @@ a wrapped line belongs to the bullet above it, here and in the update window.
   until the next launch. A check that was never answered — most often because
   the tab was rebuilt while it was running — used to stop that account being
   checked again at all.
+## [1.1.1] - 2026-08-27
+
+### Fixed
 - The unread count on a Mail tab, and the Dock badge, are the number of unread
   messages in that account's **Inbox** again. Since 1.1.0 the default setting
   counted unread mail anywhere in the mailbox — archived messages and everything
