@@ -41,7 +41,8 @@ final class AccountSession {
         account: Account,
         userScripts: [WKUserScript] = [],
         messageHandlers: [String: WKScriptMessageHandler] = [:],
-        replyHandlers: [ScriptReplyHandler] = []
+        replyHandlers: [ScriptReplyHandler] = [],
+        schemeHandlers: [String: WKURLSchemeHandler] = [:]
     ) {
         self.accountId = account.id
         self.displayName = account.name
@@ -49,7 +50,8 @@ final class AccountSession {
             dataStoreIdentifier: account.id,
             userScripts: userScripts,
             messageHandlers: messageHandlers,
-            replyHandlers: replyHandlers
+            replyHandlers: replyHandlers,
+            schemeHandlers: schemeHandlers
         )
         syncEnabledViews(with: account)
     }
@@ -73,9 +75,33 @@ final class AccountSession {
     func setDelegates<D: AccountSessionDelegate>(_ delegate: D) {
         self.delegate = delegate
         for webView in webViews {
-            webView.navigationDelegate = delegate
-            webView.uiDelegate = delegate
+            Self.wire(webView, to: delegate)
         }
+    }
+
+    /// The one place a webview is told who drives it.
+    ///
+    /// One function rather than a list repeated at each creation site, because
+    /// the sites drift: a webview is built when a service is switched on, and
+    /// again every time the recycler rebuilds a tab, and a delegate added to
+    /// one list and not the other breaks that feature on recycled tabs only —
+    /// which is to say hours after launch, on the machine of whoever leaves the
+    /// app open. Everything a fresh webview needs from the session goes here,
+    /// and both paths call it.
+    ///
+    /// `WKDownloadDelegate` is deliberately *not* here: it is set per
+    /// `WKDownload` in `NavigationPolicy.adopt`, never on the webview, so it
+    /// cannot go stale across a rebuild.
+    private static func wire(_ webView: WKWebView, to delegate: AccountSessionDelegate?) {
+        webView.navigationDelegate = delegate
+        webView.uiDelegate = delegate
+    }
+
+    /// A new webview on this session's configuration, already wired.
+    private func makeWebView() -> WKWebView {
+        let webView = WebViewFactory.makeWebView(configuration: configuration)
+        Self.wire(webView, to: delegate)
+        return webView
     }
 
     /// Brings the live webviews in line with the account's current settings:
@@ -86,12 +112,7 @@ final class AccountSession {
         for view in AccountView.allCases {
             switch (account.isEnabled(view), views[view]) {
             case (true, nil):
-                let webView = WebViewFactory.makeWebView(configuration: configuration)
-                if let delegate {
-                    webView.navigationDelegate = delegate
-                    webView.uiDelegate = delegate
-                }
-                views[view] = webView
+                views[view] = makeWebView()
             case (false, .some(let webView)):
                 teardown(webView)
                 views[view] = nil
@@ -149,11 +170,7 @@ final class AccountSession {
     func recycle(_ view: AccountView) -> WKWebView? {
         guard let old = views[view] else { return nil }
 
-        let fresh = WebViewFactory.makeWebView(configuration: configuration)
-        if let delegate {
-            fresh.navigationDelegate = delegate
-            fresh.uiDelegate = delegate
-        }
+        let fresh = makeWebView()
         views[view] = fresh
         teardown(old)
         return fresh

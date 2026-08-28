@@ -11,6 +11,20 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 ## [Unreleased]
 
 ### Fixed
+- **Clicking an attachment downloads it again.** A PDF, image or text
+  attachment was opened rather than saved — and because Gmail fetches it in a
+  frame you cannot see, that looked like nothing happening at all: no file, no
+  window, no error. Attachments the server marks as downloads are now saved
+  whatever their type, while a file you asked to preview still opens.
+- Large and Drive-hosted attachments download too. Since 1.1.0 those were handed
+  to your browser, which cannot fetch them — your Google session lives only
+  inside MailSpace — so with *Open links without bringing the browser forward*
+  on, a click produced a silent background tab and no file.
+- A download that fails now says so, naming the file and the reason, instead of
+  ending in silence. MailSpace also writes its diagnostics where Console can see
+  them, so there is something to read when something goes wrong.
+- The empty window left behind after downloading an attachment that opened in a
+  new window now closes itself.
 - The unread count on a Mail tab, and the Dock badge, are the number of unread
   messages in that account's **Inbox** again. Since 1.1.0 the default setting
   counted unread mail anywhere in the mailbox — archived messages and everything
