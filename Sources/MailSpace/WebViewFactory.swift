@@ -31,13 +31,21 @@ enum WebViewFactory {
 
     /// One configuration per account. Mail and Calendar share it (and therefore
     /// the same `WKWebsiteDataStore`), so one Google sign-in covers both.
+    /// - Parameter schemeHandlers: Extra URL schemes this configuration answers
+    ///   itself. Always empty in the app; a self-test probe passes one so a
+    ///   fixture can be served without a network, a real Google host or a
+    ///   listening socket.
     static func makeConfiguration(
         dataStoreIdentifier: UUID,
         userScripts: [WKUserScript] = [],
         messageHandlers: [String: WKScriptMessageHandler] = [:],
-        replyHandlers: [ScriptReplyHandler] = []
+        replyHandlers: [ScriptReplyHandler] = [],
+        schemeHandlers: [String: WKURLSchemeHandler] = [:]
     ) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
+        for (scheme, handler) in schemeHandlers {
+            configuration.setURLSchemeHandler(handler, forURLScheme: scheme)
+        }
         configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: dataStoreIdentifier)
         configuration.applicationNameForUserAgent = applicationName
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true

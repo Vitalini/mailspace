@@ -623,25 +623,25 @@ final class LinkRouterTests: XCTestCase {
     func testAnEmptyPopupIsClosedWhenItsLinkGoesToTheBrowser() {
         XCTAssertTrue(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: true
         ))
         // A popup showing print preview or an attachment keeps its window.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: true,
+            hasShownAPage: true,
             isMainFrameTarget: true
         ))
         // A subframe inside a popup is not the popup's reason to exist.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: false
         ))
         // And a tab is never closed by a link leaving.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: false,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: true
         ))
     }
@@ -727,6 +727,90 @@ final class LinkRouterTests: XCTestCase {
             LinkRouter.uniqueDestination(in: directory, filename: "../../x.plist").lastPathComponent,
             "x (2).plist"
         )
+    }
+
+    // MARK: - Attachments are downloads, not destinations
+
+    /// The routing half of "I click and nothing". v1.1.0 correctly stopped
+    /// keeping every Google host in-app — but a Gmail attachment is not always
+    /// served from `mail.google.com` or `googleusercontent.com`. A
+    /// Drive-hosted or large attachment comes from these, and they fell through
+    /// to a background Chrome tab that cannot fetch them: the session lives
+    /// only in this app's data store.
+    func testTheEndpointsAnAttachmentIsServedFromAreDownloads() {
+        for candidate in [
+            "https://drive.usercontent.google.com/download?id=abc&export=download",
+            "https://drive.usercontent.google.com/uc?id=abc",
+            "https://drive.google.com/uc?export=download&id=abc",
+            "https://drive.google.com/u/0/uc?id=abc&export=download",
+            "https://docs.google.com/document/d/abc/export?format=pdf",
+            "https://docs.google.com/spreadsheets/d/abc/export?format=xlsx",
+            "https://chat.google.com/api/get_attachment_url?url_type=DOWNLOAD_URL"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(candidate)),
+                .download(url(candidate)),
+                "should download: \(candidate)"
+            )
+        }
+    }
+
+    /// And the rule is not "Drive stays": the pages around those endpoints are
+    /// still the browser's, exactly as v1.1.0 made them.
+    func testThePagesAroundThoseEndpointsStillLeave() {
+        for candidate in [
+            "https://drive.google.com/file/d/abc/view",
+            "https://drive.google.com/drive/my-drive",
+            "https://docs.google.com/document/d/abc/edit",
+            "https://chat.google.com/room/abc",
+            "https://meet.google.com/abc-defg-hij",
+            // A look-alike must never be read as a Google download endpoint.
+            "https://drive.usercontent.google.com.evil.example/download?export=download",
+            "https://notgoogle.com/uc?export=download"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(candidate)),
+                .openExternally(url(candidate)),
+                "should leave: \(candidate)"
+            )
+        }
+    }
+
+    /// The attachments that never broke, and must not start: Gmail serves these
+    /// itself, in-app, on the account's own session.
+    func testGmailsOwnAttachmentSurfacesAreUnchanged() {
+        for candidate in [
+            "https://mail.google.com/mail/u/0/?ui=2&ik=abc&view=att&disp=attd&attid=0.1",
+            "https://mail.google.com/mail/u/0/?ui=2&view=att&disp=inline",
+            "https://mail-attachment.googleusercontent.com/attachment/u/0/?view=att&disp=attd"
+        ] {
+            XCTAssertEqual(
+                LinkRouter.destination(for: url(candidate)),
+                .allowInApp,
+                "should stay in-app: \(candidate)"
+            )
+        }
+    }
+
+    /// A download is a download whatever frame asked for it — an attachment
+    /// fetched by a hidden frame is the shape Gmail actually uses.
+    func testAFrameCannotTurnADownloadIntoAPage() {
+        let attachment = url("https://drive.usercontent.google.com/download?id=abc&export=download")
+        for isMainFrame in [true, false] {
+            XCTAssertEqual(
+                LinkRouter.destination(for: attachment, isMainFrameTarget: isMainFrame, isSSOEscorted: false),
+                .download(attachment)
+            )
+        }
+    }
+
+    /// A download never spends a sign-in escort pass: it is not a page leaving
+    /// Google, and the budget belongs to a real sign-in.
+    func testADownloadNeedsNoEscort() {
+        XCTAssertFalse(LinkRouter.needsEscort(
+            for: url("https://drive.usercontent.google.com/download?id=abc"),
+            isMainFrameTarget: true
+        ))
     }
 
     private func makeTemporaryDirectory() throws -> URL {

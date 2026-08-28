@@ -50,6 +50,9 @@ enum LinkRouter {
         /// the page drives itself (`about:blank`, `blob:`, `data:`,
         /// `javascript:`).
         case allowInApp
+        /// Not a page at all: a file body, on an endpoint that exists to serve
+        /// one. It is fetched and saved here, on the session that can read it.
+        case download(URL)
         /// A real web page somewhere else — the user's browser owns it.
         case openExternally(URL)
         /// A `mailto:` link, which MailSpace composes itself.
@@ -70,6 +73,10 @@ enum LinkRouter {
         guard scheme == "http" || scheme == "https" else { return .allowInApp }
         guard let host = url.host, !host.isEmpty else { return .allowInApp }
 
+        // Asked before `isInApp`, because a file body is not a destination and
+        // the "is this one of our two surfaces" question has no useful answer
+        // for it. See `isDownloadEndpoint`.
+        if isDownloadEndpoint(url) { return .download(url) }
         return isInApp(url) ? .allowInApp : .openExternally(url)
     }
 
@@ -144,6 +151,58 @@ enum LinkRouter {
         // halfway through signing in.
         if AuthSurface.isSignInHost(host) { return true }
         if case .app = AuthSurface.classify(url) { return true }
+        return false
+    }
+
+    /// Whether this URL is a Google endpoint that serves a *file body* rather
+    /// than a page.
+    ///
+    /// This is the routing bug the owner hit. v1.1.0 correctly stopped treating
+    /// "is a Google host" as "belongs in the app" — but a Gmail attachment is
+    /// not always served from `mail.google.com` or `googleusercontent.com`.
+    /// A Drive-hosted attachment, a large attachment, and "Download" from the
+    /// Drive-backed preview all come from `drive.usercontent.google.com`,
+    /// `drive.google.com/uc?export=download` or a Docs `/export`, and those
+    /// fell through to the browser — which, with "open links without bringing
+    /// the browser forward" on, means a background Chrome tab that cannot even
+    /// fetch the bytes, because the session lives only in this app's data
+    /// store. Nothing appeared, nothing was written, nothing was logged.
+    ///
+    /// The fix is not to widen `isInApp` back to "Google stays": these are not
+    /// pages and must not be *rendered* here either. They are recognised as
+    /// what they are and downloaded, on the session that can read them.
+    ///
+    /// Narrow by construction — a first-party Google host **and** a path that
+    /// only ever serves a payload. `drive.google.com/file/d/…/view`,
+    /// `docs.google.com/document/d/…/edit` and every other product page are
+    /// untouched and still leave for the browser.
+    static func isDownloadEndpoint(_ url: URL) -> Bool {
+        guard let host = webHost(of: url) else { return false }
+        guard isGoogleDomain(host) || matches(host: host, domain: "googlemail.com") else { return false }
+
+        // Drive's dedicated payload host. It serves file bodies and nothing
+        // else — the same category as `mail-attachment.googleusercontent.com`,
+        // under a name that happens to sit under `google.com`.
+        if host == "drive.usercontent.google.com" { return true }
+
+        let segments = url.path.split(separator: "/").map { $0.lowercased() }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        // `…/uc?export=download` — Drive's download endpoint, with and without
+        // the `/u/N/` account index.
+        if segments.last == "uc",
+           items.contains(where: { $0.name.lowercased() == "export" && $0.value?.lowercased() == "download" }) {
+            return true
+        }
+        // `…/d/<id>/export?format=pdf` — a Docs/Sheets/Slides export. The `/d/`
+        // is what separates it from any other path ending in "export".
+        if segments.last == "export", segments.contains("d") { return true }
+        // Chat's attachment payload endpoint. `chat.google.com` itself is a
+        // product surface and still leaves.
+        if host == "chat.google.com", segments.first == "api",
+           segments.dropFirst().first == "get_attachment_url" {
+            return true
+        }
         return false
     }
 
@@ -323,19 +382,83 @@ enum LinkRouter {
         return trimmed
     }
 
+    /// The longest a single path component may be on APFS and HFS+.
+    ///
+    /// **Bytes, not characters**, and that is the whole of this bug: 255 bytes
+    /// is 255 Latin letters but only 127 Cyrillic ones, because UTF-8 spends
+    /// two bytes on each. A suggested name past the limit made `open(2)` fail
+    /// with `ENAMETOOLONG`, which WebKit reported back as
+    /// `NSURLErrorCancelled (-999)` — the same code a cancelled download
+    /// carries. So the file never appeared *and* the failure was read as the
+    /// user changing their mind, and nothing was said. Measured on the owner's
+    /// Mac: 204 characters saved, 264 and 404 vanished in silence.
+    static let maxFilenameBytes = 255
+
+    /// The longest prefix of `value` that fits in `maxBytes` of UTF-8, cut on a
+    /// character boundary.
+    ///
+    /// Never on a byte boundary: half of a Cyrillic letter — or of an emoji,
+    /// or of a combining sequence — is not a filename, and `String` would
+    /// replace it with U+FFFD rather than refuse.
+    static func truncated(_ value: String, toBytes maxBytes: Int) -> String {
+        guard maxBytes > 0 else { return "" }
+        guard value.utf8.count > maxBytes else { return value }
+        var result = ""
+        var used = 0
+        for character in value {
+            let size = String(character).utf8.count
+            guard used + size <= maxBytes else { break }
+            result.append(character)
+            used += size
+        }
+        return result
+    }
+
+    /// Assembles `<base><marker>.<ext>` so the whole component fits on disk.
+    ///
+    /// The room is always taken out of the *base*. Never out of the extension,
+    /// because that is what decides which app opens the file; and never out of
+    /// the collision marker, because " (2)" being trimmed away would make every
+    /// candidate in `uniqueDestination` the same name and the loop would never
+    /// end.
+    static func fittedFilename(
+        base: String,
+        marker: String = "",
+        extension ext: String,
+        maxBytes: Int = maxFilenameBytes
+    ) -> String {
+        let tail = marker + (ext.isEmpty ? "" : ".\(ext)")
+        // An "extension" long enough to leave no room for a name at all is not
+        // an extension — a server can put anything after the last dot. Cut the
+        // whole thing rather than hand back a file with no name.
+        guard tail.utf8.count < maxBytes else {
+            return truncated(base + tail, toBytes: maxBytes)
+        }
+        let head = truncated(base, toBytes: maxBytes - tail.utf8.count)
+        guard head.isEmpty else { return head + tail }
+        // The first character alone did not fit. `safeFilename`'s own fallback,
+        // trimmed to whatever is left.
+        return truncated("download", toBytes: maxBytes - tail.utf8.count) + tail
+    }
+
     /// Picks a non-colliding destination in `directory`, appending " (2)",
-    /// " (3)" … the way Safari does.
+    /// " (3)" … the way Safari does — and one the filesystem will actually
+    /// accept, however long the server's suggestion was.
     static func uniqueDestination(in directory: URL, filename: String) -> URL {
         let name = safeFilename(filename)
-        var candidate = directory.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
-
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
+
+        var candidate = directory.appendingPathComponent(
+            fittedFilename(base: base, extension: ext)
+        )
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
+
         var counter = 2
         repeat {
-            let suffixed = ext.isEmpty ? "\(base) (\(counter))" : "\(base) (\(counter)).\(ext)"
-            candidate = directory.appendingPathComponent(suffixed)
+            candidate = directory.appendingPathComponent(
+                fittedFilename(base: base, marker: " (\(counter))", extension: ext)
+            )
             counter += 1
         } while FileManager.default.fileExists(atPath: candidate.path)
         return candidate
@@ -778,6 +901,27 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// `AccountStore`, and this object only ever sees data stores.
     var accountEmail: ((UUID) -> String?)?
 
+    /// How a popup window is put on screen. The same seam as `Log.sink` and
+    /// `TabRecycler.schedule`, and for the same reason: a self-test probe drives
+    /// the real popup path, and no repository command may draw a window on
+    /// anybody's display. Nothing in the app ever replaces this.
+    var presentPopupWindow: (NSWindow) -> Void = { window in
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// How a download failure is put in front of the user. Replaced only by the
+    /// probe that asserts a failed download says so — a modal alert cannot be
+    /// answered by an automated run, and would be a window on screen.
+    static var reportFailure: (_ title: String, _ detail: String) -> Void = { title, detail in
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     /// Injected the same way the closures above are (KTD-S3) — no global
     /// lookup, and a probe can hand in its own scratch domain.
     private let settings: AppSettings
@@ -815,6 +959,17 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     private struct Popup {
         let window: NSWindow
         let accountId: UUID?
+        /// Whether this window has ever finished a page of its own.
+        ///
+        /// The one thing that separates a window the user is looking at — a
+        /// print preview, a popped-out compose, a Drive page opened
+        /// deliberately — from a window that only ever existed to carry a
+        /// download. `webView.url != nil` was the old test and it is not that
+        /// distinction: a popup whose download URL is set as the provisional
+        /// one has a `url` and has still shown nobody anything, so an empty
+        /// window stayed on screen, un-closable, and `hasPopup(for:)` then
+        /// vetoed that account's recycling for the rest of the session.
+        var hasShownAPage = false
     }
 
     /// One in-flight download, and the account whose data store it is running
@@ -854,6 +1009,14 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// both finish and failure, or it leaks an entry per download for the life
     /// of the process.
     private var destinations: [ObjectIdentifier: URL] = [:]
+    /// Downloads already refused at the destination step, so WebKit's own
+    /// failure callback does not tell the user a second time about one click.
+    private var refused: Set<ObjectIdentifier> = []
+    /// Downloads this app cancelled itself, when an account was removed out
+    /// from under them. The only cancellation MailSpace can vouch for, and
+    /// therefore the only failure it is allowed to swallow — see
+    /// `shouldReportFailure`.
+    private var cancelledByApp: Set<ObjectIdentifier> = []
 
     /// Hands a link to the browser (G2).
     ///
@@ -870,6 +1033,14 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             commandHeld: commandHeld
         )
         configuration.addsToRecentItems = false
+        // A hand-off that does not bring the browser forward is invisible from
+        // inside MailSpace, and "I clicked and nothing happened" is exactly what
+        // it looks like. The host only — never the path, which can carry a
+        // message id.
+        Log.info(
+            "handed \(url.host ?? "a link") to the default browser"
+                + (configuration.activates ? "" : " in the background")
+        )
         NSWorkspace.shared.open(LinkRouter.forBrowser(url, accountEmail: email(of: webView)), configuration: configuration)
     }
 
@@ -936,6 +1107,12 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         case .allowInApp:
             decisionHandler(.allow)
 
+        case .download(let url):
+            // Recognised as a file body rather than a destination, and fetched
+            // here because this is the only place the account's session exists.
+            Log.info("downloading a file from \(url.host ?? "an unnamed host")")
+            decisionHandler(.download)
+
         case .compose(let mailto):
             // Our own compose, never the system's default mail app — that
             // could be MailSpace itself and loop.
@@ -950,31 +1127,45 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     }
 
     /// Closes a popup window whose only reason to exist has just gone to the
-    /// browser.
+    /// browser, or turned out to be a file.
     ///
     /// WebKit asks for the window before the page says where it is going —
     /// `window.open()` and then `location = …` — so a link that belongs in the
-    /// browser can only be recognised once the navigation arrives, by which
-    /// time an empty window is already on screen. Nothing has rendered in it,
-    /// so there is nothing to lose by closing it, and leaving it would put back
-    /// exactly the blank popup this routing exists to get rid of.
+    /// browser, or a URL that turns out to serve a file body, can only be
+    /// recognised once the navigation arrives, by which time an empty window is
+    /// already on screen. It has finished nothing, so there is nothing to lose
+    /// by closing it, and leaving it would put back exactly the blank popup
+    /// this routing exists to get rid of — with a second cost the empty window
+    /// hides: `hasPopup(for:)` vetoes that account's tab recycling while it is
+    /// open, and a window that can never be closed vetoes it forever.
+    ///
+    /// Keyed by identity rather than by a captured `weak` webview: a popup
+    /// released before the hop to the next run loop turn used to leave its
+    /// entry in `popupWindows` — the same permanent veto, arrived at the other
+    /// way round.
     private func closeIfNothingLeftToShow(_ webView: WKWebView, isMainFrameTarget: Bool) {
+        let key = ObjectIdentifier(webView)
         guard Self.shouldCloseEmptyPopup(
-            isPopup: popupWindows[ObjectIdentifier(webView)] != nil,
-            hasRenderedAPage: webView.url != nil,
+            isPopup: popupWindows[key] != nil,
+            hasShownAPage: popupWindows[key]?.hasShownAPage ?? false,
             isMainFrameTarget: isMainFrameTarget
         ) else { return }
 
         // Never tear a webview down from inside its own navigation callback.
-        DispatchQueue.main.async { [weak self, weak webView] in
-            guard let self, let webView else { return }
-            self.closePopup(hosting: webView)
+        DispatchQueue.main.async { [weak self] in
+            self?.closePopup(key)
         }
     }
 
     /// Pure, so the rule is covered by a test rather than by a real popup.
-    static func shouldCloseEmptyPopup(isPopup: Bool, hasRenderedAPage: Bool, isMainFrameTarget: Bool) -> Bool {
-        isPopup && !hasRenderedAPage && isMainFrameTarget
+    ///
+    /// `hasShownAPage` is "this window has finished a page of its own", not
+    /// "this webview has a URL". A print preview, a popped-out compose and a
+    /// Google page opened on purpose have all finished one and are never closed
+    /// here; a window opened for a download has finished nothing and never
+    /// will, whatever URL its provisional navigation left behind.
+    static func shouldCloseEmptyPopup(isPopup: Bool, hasShownAPage: Bool, isMainFrameTarget: Bool) -> Bool {
+        isPopup && !hasShownAPage && isMainFrameTarget
     }
 
     /// Asks this webview's `SSOEscort` pass to cover one navigation, and spends
@@ -993,12 +1184,52 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         }
     }
 
+    /// Whether the server said "save this, do not show it".
+    ///
+    /// Parsed rather than searched: the disposition type is the first token of
+    /// the header, and `filename="attachment report.pdf"` must not be read as
+    /// one.
+    static func isAttachment(contentDisposition header: String?) -> Bool {
+        guard let header else { return false }
+        let type = header.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        return type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "attachment"
+    }
+
+    /// Show it or save it. The whole download bug, in one predicate.
+    ///
+    /// This used to be `canShowMIMEType ? .allow : .download`, which asks only
+    /// "can WebKit render these bytes" and never reads `Content-Disposition`.
+    /// `canShowMIMEType` is true for `application/pdf`, images, text and HTML
+    /// *even when the server said `attachment`* — so exactly the attachments a
+    /// person downloads most often were rendered instead of saved. Gmail points
+    /// a hidden frame at the attachment URL, so the render landed in a frame
+    /// nobody can see: no file, no window, no error, no log line. "I click and
+    /// nothing." Only types WebKit cannot render — zip, `.docx`,
+    /// `octet-stream` — ever reached `.download`, which is why the feature
+    /// looked fine whenever it was tested with a zip.
+    ///
+    /// The server's intent wins; `canShowMIMEType` stays as the fallback for a
+    /// response that states no intent at all.
+    ///
+    /// Pure and static so the rule is covered by a test rather than by a real
+    /// server.
+    static func responsePolicy(isAttachment: Bool, canShowMIMEType: Bool) -> WKNavigationResponsePolicy {
+        isAttachment || !canShowMIMEType ? .download : .allow
+    }
+
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
-        decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
+        let disposition = (navigationResponse.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Disposition")
+        decisionHandler(
+            Self.responsePolicy(
+                isAttachment: Self.isAttachment(contentDisposition: disposition),
+                canShowMIMEType: navigationResponse.canShowMIMEType
+            )
+        )
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
@@ -1017,6 +1248,13 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             download: download,
             accountId: webView.configuration.websiteDataStore.identifier
         )
+        // A `target="_blank"` or `window.open` download opened a window first
+        // and then turned out to be a file, so the window has nothing to show
+        // and never will — whatever URL its provisional navigation left on it.
+        // A popup that has finished a page of its own (a print preview, a Drive
+        // page, a popped-out compose the user is downloading from) has, and is
+        // left alone; see `shouldCloseEmptyPopup`.
+        closeIfNothingLeftToShow(webView, isMainFrameTarget: true)
     }
 
     /// Keeps the webview's sign-in provenance in step with what it just landed
@@ -1059,6 +1297,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// appears as a redirect hop back to `accounts.google.com`, so a *finished*
     /// navigation there is itself the proof the session took.
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // A popup that gets this far has shown the user a page, so it is a
+        // window in its own right and nothing may close it out from under them.
+        // A response that becomes a download never commits and never finishes,
+        // which is exactly how the two are told apart.
+        popupWindows[ObjectIdentifier(webView)]?.hasShownAPage = true
         onDidFinish?(webView)
         guard case .app = AuthSurface.classify(webView.url) else { return }
         completeSignIn(for: webView)
@@ -1153,8 +1396,13 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     /// attempts, not an endless reload loop.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard crashThrottle.shouldReload(ObjectIdentifier(webView)) else {
+            // The host, never the whole URL: a Gmail tab's address carries the
+            // id of the thread that is open in it, and this line goes to the
+            // unified log where anything on this Mac can read it. Which of the
+            // two surfaces died is the diagnostic; which message was on screen
+            // is nobody's business.
             Log.error(
-                "web content process kept terminating for \(webView.url?.absoluteString ?? "an unloaded page")"
+                "web content process kept terminating for \(webView.url?.host ?? "an unloaded page")"
                 + "; not reloading again until the tab is selected or reloaded by hand"
             )
             // Remembered rather than abandoned: the throttle exists to stop a
@@ -1284,6 +1532,13 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
             case .compose(let mailto):
                 mailtoHandler?(mailto)
                 return nil
+            case .download:
+                // Falls through to a popup on purpose. `window.open(fileURL)`
+                // has to get a window back — a page that branches on a null
+                // result does nothing at all and says nothing — and the
+                // navigation inside it turns into a download, which then closes
+                // the window that never had anything to show (`adopt`).
+                break
             case .allowInApp:
                 // A clicked "Sign in" on a signed-out Google page belongs to
                 // the tab, not to a window of its own: run the whole flow
@@ -1404,8 +1659,7 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         // when it goes, or its entry (and the webview under it) is retained
         // for the rest of the session.
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        presentPopupWindow(window)
 
         popupWindows[ObjectIdentifier(popup)] = Popup(
             window: window,
@@ -1436,7 +1690,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
     }
 
     private func closePopup(hosting webView: WKWebView) {
-        guard let popup = popupWindows.removeValue(forKey: ObjectIdentifier(webView)) else { return }
+        closePopup(ObjectIdentifier(webView))
+    }
+
+    private func closePopup(_ key: ObjectIdentifier) {
+        guard let popup = popupWindows.removeValue(forKey: key) else { return }
         dismiss(popup.window)
     }
 
@@ -1486,21 +1744,89 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         } catch {
             // B5: the failure is shown and the download stops, instead of
             // WebKit being handed a path it cannot write.
+            //
+            // Remembered, because refusing the destination makes WebKit fail
+            // the download a moment later and the user would be told twice
+            // about one click.
+            refused.insert(ObjectIdentifier(download))
             Self.reportUnwritableDownloadFolder(directory, error: error)
             completionHandler(nil)
         }
     }
 
     func downloadDidFinish(_ download: WKDownload) {
-        downloads[ObjectIdentifier(download)] = nil
-        guard let destination = destinations.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        let key = ObjectIdentifier(download)
+        downloads[key] = nil
+        // A download can finish in the same turn a cancel was asked for, so
+        // both bookkeeping sets are cleared here too rather than only on the
+        // failure path — otherwise one entry per race outlives the process.
+        refused.remove(key)
+        cancelledByApp.remove(key)
+        guard let destination = destinations.removeValue(forKey: key) else { return }
         announce(destination)
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        downloads[ObjectIdentifier(download)] = nil
-        destinations[ObjectIdentifier(download)] = nil
-        Log.error("download failed: \(error.localizedDescription)")
+        let key = ObjectIdentifier(download)
+        downloads[key] = nil
+        let name = destinations.removeValue(forKey: key)?.lastPathComponent
+        Log.error(Self.downloadFailureLine(filename: name, error: error))
+
+        // Already reported, in the words that actually name the cause.
+        guard refused.remove(key) == nil else { return }
+        guard Self.shouldReportFailure(error, cancelledByApp: cancelledByApp.remove(key) != nil) else { return }
+        Self.reportDownloadFailed(filename: name, error: error)
+    }
+
+    /// What a failed download says in the log — and it never says the name.
+    ///
+    /// A downloaded attachment's filename is mail content: it is what a person
+    /// wrote on a contract, an invoice, an X-ray. `os_log` messages are
+    /// world-readable on this Mac and survive in the unified log for days, so a
+    /// name interpolated into one leaves the app's own privacy boundary behind
+    /// for anything that runs `log show`. What a person debugging this actually
+    /// needs is the *shape*, which is also the shape the bug had: an extension
+    /// and a byte count. See `LinkRouter.maxFilenameBytes`.
+    ///
+    /// The dialog is the opposite case and keeps the real name: it is shown to
+    /// the one person who is owed it, and it goes nowhere else.
+    ///
+    /// The domain and code go in rather than `localizedDescription`, for the same
+    /// reason: a Cocoa file error spells the filename out in its own message,
+    /// and a URL error carries the failing URL — which on this path is an
+    /// attachment endpoint, ids and all. `NSURLErrorDomain -999` is the fact
+    /// worth having, and it carries nothing.
+    static func downloadFailureLine(filename: String?, error: Error) -> String {
+        let error = error as NSError
+        return "download failed (\(redactedName(filename))): \(error.domain) \(error.code)"
+    }
+
+    /// A download name reduced to what a diagnostic needs and nothing a person
+    /// wrote.
+    static func redactedName(_ filename: String?) -> String {
+        guard let filename, !filename.isEmpty else { return "no destination yet" }
+        let ext = (filename as NSString).pathExtension.lowercased()
+        return (ext.isEmpty ? "no extension" : ".\(ext)") + ", \(filename.utf8.count) bytes"
+    }
+
+    /// Whether a failed download is worth putting in front of the user.
+    ///
+    /// The subtlety that cost the owner a file: WebKit reports a destination it
+    /// *could not write* as `NSURLErrorCancelled (-999)` — the same code the
+    /// app's own `cancel()` produces. Reading the code alone therefore swallowed
+    /// exactly the failures that most need saying: a name too long for the
+    /// filesystem produced no file, no dialog and no clue, and looked from the
+    /// outside like the user changing their mind.
+    ///
+    /// So a cancellation is *remembered* rather than inferred. MailSpace has no
+    /// UI that cancels a download; the only cancellation it can vouch for is its
+    /// own, when an account is removed out from under one. `NSUserCancelledError`
+    /// stays trusted because it is unambiguous — something asked a person and
+    /// they said no. Everything else is a failure and is reported.
+    static func shouldReportFailure(_ error: Error, cancelledByApp: Bool) -> Bool {
+        if cancelledByApp { return false }
+        let error = error as NSError
+        return !(error.domain == NSCocoaErrorDomain && error.code == NSUserCancelledError)
     }
 
     /// G4. What happens the moment a download lands.
@@ -1517,17 +1843,28 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         }
     }
 
+    /// A download that started and then died. Silent before this: the only
+    /// record was a `Log.error` line on a stderr that a Dock-launched app does
+    /// not have, so a dropped connection or a refused write left the user with
+    /// a click that did nothing and nothing to read anywhere.
+    private static func reportDownloadFailed(filename: String?, error: Error) {
+        reportFailure(
+            filename.map { "MailSpace could not finish downloading “\($0)”" }
+                ?? "MailSpace could not finish a download",
+            "\(error.localizedDescription)\n\n"
+                + "Nothing was saved. Try the download again; if it keeps failing, "
+                + "open the message in your browser."
+        )
+    }
+
     private static func reportUnwritableDownloadFolder(_ directory: URL, error: Error) {
         Log.error("download folder \(directory.path) is not writable: \(error.localizedDescription)")
-        let alert = NSAlert()
-        alert.messageText = "MailSpace cannot save downloads to “\(directory.lastPathComponent)”"
-        alert.informativeText =
+        reportFailure(
+            "MailSpace cannot save downloads to “\(directory.lastPathComponent)”",
             "\(directory.path)\n\n\(error.localizedDescription)\n\n"
-            + "The download was stopped rather than left to disappear. "
-            + "Pick another folder in Settings ▸ General."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+                + "The download was stopped rather than left to disappear. "
+                + "Pick another folder in Settings ▸ General."
+        )
     }
 
     /// Cancels every download still running on this account's data store.
@@ -1541,6 +1878,10 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         for (key, active) in downloads where active.accountId == accountId {
             downloads[key] = nil
             destinations[key] = nil
+            // Written down before the call, because the failure callback it
+            // provokes cannot tell this apart from a write that failed: WebKit
+            // reports both as `NSURLErrorCancelled`.
+            cancelledByApp.insert(key)
             active.download.cancel { _ in }
         }
     }

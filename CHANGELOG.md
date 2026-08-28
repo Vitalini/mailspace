@@ -13,6 +13,35 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 ## [1.1.1] - 2026-08-27
 
 ### Fixed
+- **Clicking an attachment downloads it again.** A PDF, image or text
+  attachment was opened rather than saved — and because Gmail fetches it in a
+  frame you cannot see, that looked like nothing happening at all: no file, no
+  window, no error. Attachments the server marks as downloads are now saved
+  whatever their type, while a file you asked to preview still opens.
+- Large and Drive-hosted attachments download too. Since 1.1.0 those were handed
+  to your browser, which cannot fetch them — your Google session lives only
+  inside MailSpace — so with *Open links without bringing the browser forward*
+  on, a click produced a silent background tab and no file.
+- A download that fails now says so, naming the file and the reason, instead of
+  ending in silence. MailSpace also writes its diagnostics where Console can see
+  them, so there is something to read when something goes wrong.
+- An attachment with a very long name saves instead of disappearing. Past about
+  127 Cyrillic characters the name was longer than macOS allows, and the failure
+  arrived looking exactly like you cancelling the download, so nothing was saved
+  and nothing was said. Long names are now shortened to fit, keeping the file
+  type, and a failed write is never mistaken for a cancellation again.
+- The empty window left behind after downloading an attachment that opened in a
+  new window now closes itself — every time, not only when the window happened
+  to still be blank. One that stayed open could not be closed and quietly
+  stopped MailSpace from reclaiming that account's memory.
+- Diagnostics no longer carry anything out of your mail. Attachment names, page
+  addresses and the system's own error text are reduced to what is useful for
+  debugging — a file type, a size, a host — because the system log they go to is
+  readable by anything else on the Mac.
+- A Mail tab's unread count and a Calendar tab's countdown can no longer freeze
+  until the next launch. A check that was never answered — most often because
+  the tab was rebuilt while it was running — used to stop that account being
+  checked again at all.
 - The unread count on a Mail tab, and the Dock badge, are the number of unread
   messages in that account's **Inbox** again. Since 1.1.0 the default setting
   counted unread mail anywhere in the mailbox — archived messages and everything
