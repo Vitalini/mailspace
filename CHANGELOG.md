@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-27
+
 ### Fixed
 - The unread count on a Mail tab, and the Dock badge, are the number of unread
   messages in that account's **Inbox** again. Since 1.1.0 the default setting
