@@ -323,9 +323,14 @@ esac
 #      invisible to every unit test in the suite: the response policy decided on
 #      the MIME type alone and rendered attachments instead of saving them, into
 #      a hidden frame where that looks exactly like nothing happening. So this
-#      drives the shipping NavigationPolicy through the five shapes a download
-#      arrives in, once more after AccountSession.recycle has replaced the
-#      webview, and checks that a download which cannot be written says so.
+#      drives the shipping NavigationPolicy through every shape a download
+#      arrives in — including a suggested filename far longer than a path
+#      component may be — once more after AccountSession.recycle has replaced
+#      the webview, and checks that a download which cannot be written says so.
+#      It also proves the window a download opened closes itself (an open one
+#      vetoes that account's tab recycling for good), that nothing written to
+#      the log carries a filename, and that the probe's own data store is gone
+#      when it finishes.
 #      No network and no listening socket: the page comes from a URL scheme
 #      handler the probe owns and every download is a Blob the page mints.
 DOWNLOADS_OUT="$(MAILSPACE_SELFTEST=downloads run_with_timeout 180 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"

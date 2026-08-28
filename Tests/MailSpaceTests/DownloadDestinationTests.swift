@@ -97,6 +97,105 @@ final class DownloadDestinationTests: XCTestCase {
         XCTAssertEqual(destination.deletingLastPathComponent().standardizedFileURL, fresh.standardizedFileURL)
     }
 
+    // MARK: - Names longer than the filesystem accepts
+
+    /// The failure that looked exactly like nothing happening.
+    ///
+    /// A path component may be 255 **bytes**, and UTF-8 spends two on every
+    /// Cyrillic letter — so 264 of them is 528 bytes, `open(2)` refused it, and
+    /// WebKit reported that back as `NSURLErrorCancelled (-999)`. The app read
+    /// -999 as the user cancelling and said nothing. Measured on the owner's
+    /// Mac at 204, 264 and 404 characters: the first landed, the other two
+    /// vanished.
+    ///
+    /// Proved against the filesystem rather than against arithmetic: the file
+    /// is actually written.
+    func testAnOverLongNameIsTruncatedRatherThanFailing() throws {
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        for characters in [204, 264, 404] {
+            for (script, letter) in [("Cyrillic", "и"), ("Latin", "a")] {
+                let suggested = String(repeating: letter, count: characters) + ".pdf"
+                let destination = try NavigationPolicy.downloadDestination(
+                    suggestedFilename: suggested, in: base
+                )
+                let name = destination.lastPathComponent
+
+                XCTAssertLessThanOrEqual(
+                    name.utf8.count, LinkRouter.maxFilenameBytes,
+                    "\(script) \(characters)"
+                )
+                XCTAssertEqual((name as NSString).pathExtension, "pdf", "\(script) \(characters)")
+                // The one assertion that cannot be argued with.
+                XCTAssertNoThrow(
+                    try Data("bytes".utf8).write(to: destination),
+                    "\(script) \(characters) could not be written"
+                )
+                XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+            }
+        }
+    }
+
+    /// A name that already fits is left exactly as it is — truncation must not
+    /// become a rename.
+    func testANameThatFitsIsUntouched() throws {
+        let fits = String(repeating: "и", count: 100) + ".pdf"
+        XCTAssertEqual(
+            try NavigationPolicy.downloadDestination(suggestedFilename: fits, in: base).lastPathComponent,
+            fits
+        )
+    }
+
+    /// Three over-long names that truncate to the same thing still get three
+    /// files, and the collision marker survives the fit — take " (2)" out of the
+    /// name that is being shortened and the loop can never terminate.
+    func testOverLongNamesThatCollideStillGetSeparateFiles() throws {
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        var written: Set<String> = []
+
+        for characters in [264, 300, 404] {
+            let destination = try NavigationPolicy.downloadDestination(
+                suggestedFilename: String(repeating: "и", count: characters) + ".pdf", in: base
+            )
+            try Data("bytes".utf8).write(to: destination)
+            XCTAssertLessThanOrEqual(destination.lastPathComponent.utf8.count, LinkRouter.maxFilenameBytes)
+            written.insert(destination.lastPathComponent)
+        }
+        XCTAssertEqual(written.count, 3)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: base.path).count, 3)
+    }
+
+    /// Cut on a character boundary, never on a byte one: half a Cyrillic letter
+    /// is not a filename, and `String` would turn it into U+FFFD rather than
+    /// refuse.
+    func testTruncationNeverSplitsACharacter() {
+        let cut = LinkRouter.truncated(String(repeating: "и", count: 10), toBytes: 5)
+        XCTAssertEqual(cut, String(repeating: "и", count: 2))
+        XCTAssertFalse(cut.unicodeScalars.contains("\u{FFFD}"))
+        XCTAssertEqual(LinkRouter.truncated("🇺🇦🇺🇦", toBytes: 9), "🇺🇦")
+    }
+
+    /// The extension decides which app opens the file, so the room comes out of
+    /// the name and never out of it.
+    func testTheExtensionSurvivesEvenWhenTheNameDoesNot() {
+        let fitted = LinkRouter.fittedFilename(
+            base: String(repeating: "и", count: 400), extension: "docx"
+        )
+        XCTAssertTrue(fitted.hasSuffix(".docx"))
+        XCTAssertLessThanOrEqual(fitted.utf8.count, LinkRouter.maxFilenameBytes)
+    }
+
+    /// A server can put anything after the last dot. An "extension" with no room
+    /// left for a name is not one, and must not yield a file with no name.
+    func testAnAbsurdExtensionCannotProduceANamelessFile() {
+        let fitted = LinkRouter.fittedFilename(
+            base: "report", extension: String(repeating: "z", count: 400)
+        )
+        XCTAssertLessThanOrEqual(fitted.utf8.count, LinkRouter.maxFilenameBytes)
+        XCTAssertFalse(fitted.isEmpty)
+        XCTAssertTrue(fitted.hasPrefix("report"))
+    }
+
     // MARK: - G2
 
     func testTheCheckboxDecidesWhetherTheBrowserComesForward() {

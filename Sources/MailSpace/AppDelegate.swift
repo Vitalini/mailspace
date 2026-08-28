@@ -155,7 +155,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.tabRecycler.webViewDidFail(webView)
         }
         navigationPolicy.onWebViewDiscarded = { [weak self] webView in
-            self?.tabRecycler.webViewWasDiscarded(webView)
+            guard let self else { return }
+            self.tabRecycler.webViewWasDiscarded(webView)
+            // A poll asked of this webview will never be answered — the
+            // recycler replaces one twice a day per account, mid-cycle as often
+            // as not. Told here rather than left to each poller's deadline so
+            // the badge and the countdown come back on the next tick instead of
+            // half a minute later.
+            self.unreadPoller.webViewWasDiscarded(webView)
+            self.nextEventPoller.webViewWasDiscarded(webView)
         }
         observeSleepAndNetwork()
         // An account needs Calendar on *and* an address to ask about: `src` has

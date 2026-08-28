@@ -205,13 +205,60 @@ final class UnreadPoller {
     /// shorter than forever.
     static let unansweredLimit = 10
 
+    /// One poll in flight.
+    ///
+    /// Three things can end it — the page answers, the deadline passes, or the
+    /// webview it was asked of is thrown away — and exactly one of them may.
+    /// `finish` is both the group's `leave` and the settled flag, so a "Check
+    /// Now" cannot be left waiting and cannot be left twice.
+    ///
+    /// The freeze this exists to stop: the token used to be a bare account id
+    /// cleared only by the JavaScript completion handler. When the recycler
+    /// replaced a mail webview mid-poll — which it does on its own, twice a day
+    /// per account — that handler was never called, the id stayed in the set,
+    /// and every later cycle skipped the account on `guard !inFlight.contains`.
+    /// Its unread count and its calendar countdown then sat frozen until the
+    /// app was relaunched, with nothing on screen to say so.
+    private final class PollToken {
+        let accountId: UUID
+        /// The webview the question was put to, so a discard can find the poll
+        /// that died with it. Weak: the token must never keep it alive.
+        weak var webView: WKWebView?
+        var deadline: DispatchWorkItem?
+        private var finish: (() -> Void)?
+
+        init(accountId: UUID, webView: WKWebView, finish: @escaping () -> Void) {
+            self.accountId = accountId
+            self.webView = webView
+            self.finish = finish
+        }
+
+        /// True for the one ending that gets to act on this poll.
+        func claim() -> Bool {
+            guard let finish else { return false }
+            self.finish = nil
+            deadline?.cancel()
+            deadline = nil
+            finish()
+            return true
+        }
+    }
+
+    /// How long a poll may go unanswered before the slot is taken back.
+    ///
+    /// Longer than the script's own 20-second `AbortController`, so a slow but
+    /// live page still answers for itself, and well inside the 60-second cycle
+    /// so the next tick can ask again.
+    static let defaultTimeout: TimeInterval = 30
+
     private let interval: TimeInterval
+    private let pollTimeout: TimeInterval
     private var timer: Timer?
     private var counts: [UUID: Int] = [:]
     /// Accounts with a poll still running. Doubles as the completion's
-    /// permission to write: `forget` drops the id, so a poll that outlives its
-    /// account cannot put a stale count back.
-    private var inFlight: Set<UUID> = []
+    /// permission to write: `forget` drops the token, so a poll that outlives
+    /// its account cannot put a stale count back.
+    private var inFlight: [UUID: PollToken] = [:]
     /// Consecutive cycles an account has failed to answer. Bounds "keep the
     /// previous count" so it cannot become "stale forever".
     private var unansweredCycles: [UUID: Int] = [:]
@@ -284,10 +331,27 @@ final class UnreadPoller {
         lastChecks[accountId]
     }
 
+    /// How the feed script is put to a webview.
+    ///
+    /// The same seam as `Log.sink` and `TabRecycler.now`, and for the same
+    /// reason: the two endings that exist precisely because an answer may never
+    /// arrive cannot be driven through a real page — a test would have to make
+    /// a callback go missing on purpose. Nothing in the app ever replaces this.
+    var ask: (WKWebView, @escaping (Result<Any, any Error>) -> Void) -> Void = { webView, answer in
+        webView.callAsyncJavaScript(
+            UnreadPoller.feedScript(path: UnreadPoller.feedPath),
+            arguments: [:],
+            in: nil,
+            in: .defaultClient,
+            completionHandler: answer
+        )
+    }
+
     /// No `AppSettings`: there is nothing left for a preference to choose. The
     /// feed is one constant, and the poll interval arrives already read.
-    init(interval: TimeInterval = 60) {
+    init(interval: TimeInterval = 60, timeout: TimeInterval = UnreadPoller.defaultTimeout) {
         self.interval = interval
+        self.pollTimeout = timeout
     }
 
     func start() {
@@ -328,8 +392,9 @@ final class UnreadPoller {
 
         for target in targets {
             // A poll that has not come back yet must not be stacked on by the
-            // next 60s tick.
-            guard !inFlight.contains(target.accountId) else { continue }
+            // next 60s tick. Bounded by the token's own deadline, so silence
+            // here can never become permanent.
+            guard inFlight[target.accountId] == nil else { continue }
             // Google is answering 429/5xx: halve the rate for this account
             // rather than keep hammering a surface that is already pushing back.
             if accountId == nil, isBackingOff?(target.accountId) == true, cycle % 2 == 0 { continue }
@@ -372,6 +437,12 @@ final class UnreadPoller {
     static let notOnMail = UnreadFeedAnswer(
         outcome: .notMail, count: nil, status: -1, type: "not-gmail"
     )
+    /// A poll that was asked and never came back at all. Reported in the
+    /// Settings line as its own thing rather than left reading as the last
+    /// successful check, which is what "frozen" looked like from there.
+    static let notAnswering = UnreadFeedAnswer(
+        outcome: .noAnswer, count: nil, status: -1, type: "timeout"
+    )
 
     /// Where the feed can actually be read from, and what silence there means.
     static func reading(for url: URL?) -> Reading {
@@ -407,7 +478,7 @@ final class UnreadPoller {
     /// switched off for it.
     func forget(accountId: UUID) {
         counts[accountId] = nil
-        inFlight.remove(accountId)
+        if let token = inFlight[accountId] { release(token) }
         unansweredCycles[accountId] = nil
         lastChecks[accountId] = nil
         reportedStale.remove(accountId)
@@ -444,17 +515,22 @@ final class UnreadPoller {
         busy: Bool,
         completion: @escaping () -> Void
     ) {
-        inFlight.insert(accountId)
-        webView.callAsyncJavaScript(
-            Self.feedScript(path: Self.feedPath),
-            arguments: [:],
-            in: nil,
-            in: .defaultClient
-        ) { [weak self] result in
-            guard let self else { return completion() }
-            // `forget` clears the token, so an account removed mid-poll never
+        let token = PollToken(accountId: accountId, webView: webView, finish: completion)
+        inFlight[accountId] = token
+
+        let deadline = DispatchWorkItem { [weak self] in self?.pollTimedOut(token) }
+        token.deadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + pollTimeout, execute: deadline)
+
+        ask(webView) { [weak self] result in
+            guard let self else {
+                _ = token.claim()
+                return
+            }
+            // `forget`, the deadline and a discarded webview all clear the
+            // token, so a poll that outlives its webview or its account never
             // gets a stale count written back.
-            guard self.inFlight.remove(accountId) != nil else { return completion() }
+            guard self.release(token) else { return }
 
             let payload = (try? result.get()) as? [String: Any]
             let probe = Self.probe(from: payload)
@@ -478,8 +554,39 @@ final class UnreadPoller {
                 self.noteUnanswered(accountId)
             }
             self.updateBadge()
-            completion()
         }
+    }
+
+    /// Hands this poll to the caller, if it is still the live one for its
+    /// account and nothing else has claimed it.
+    @discardableResult
+    private func release(_ token: PollToken) -> Bool {
+        guard token.claim() else { return false }
+        if inFlight[token.accountId] === token { inFlight[token.accountId] = nil }
+        return true
+    }
+
+    /// The page never answered. Handled exactly as the `noAnswer` reading is —
+    /// keep the previous count, bounded at ten cycles — and, above all, hand the
+    /// slot back so the next cycle asks again.
+    private func pollTimedOut(_ token: PollToken) {
+        guard release(token) else { return }
+        record(Self.notAnswering, for: token.accountId)
+        noteUnanswered(token.accountId)
+        observe(token.accountId, isBusy?(token.accountId) == true ? .busy : .unreachable)
+        updateBadge()
+    }
+
+    /// The webview a poll was asked of has been thrown away — the recycler
+    /// rebuilding a tab, an account's service being switched off — so its
+    /// callback is never coming.
+    ///
+    /// Without this the account's badge froze until the app was relaunched. The
+    /// deadline alone would eventually free it; this frees it at once, on the
+    /// event that already knows.
+    func webViewWasDiscarded(_ webView: WKWebView) {
+        guard let token = inFlight.values.first(where: { $0.webView === webView }) else { return }
+        release(token)
     }
 
     private func record(_ answer: UnreadFeedAnswer, for accountId: UUID) {
@@ -535,7 +642,12 @@ final class UnreadPoller {
         for id in lastChecks.keys where !active.contains(id) {
             lastChecks[id] = nil
         }
-        inFlight.formIntersection(active)
+        // Released rather than dropped: the token owns a "Check Now" caller's
+        // completion, and forgetting it silently would leave that button
+        // spinning for the rest of the session.
+        for (id, token) in inFlight where !active.contains(id) {
+            release(token)
+        }
         reportedStale.formIntersection(active)
         signedOutAccounts.formIntersection(active)
         stalledAccounts.formIntersection(active)

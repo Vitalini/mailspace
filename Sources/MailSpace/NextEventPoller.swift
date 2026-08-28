@@ -64,8 +64,44 @@ final class NextEventPoller {
         return calendarHosts.contains(host)
     }
 
+    /// One fetch in flight. The calendar twin of `UnreadPoller.PollToken`, and
+    /// there for the same freeze: the token used to be a bare account id
+    /// cleared only by the JavaScript completion handler, so a webview the
+    /// recycler replaced mid-fetch left the id set forever and this account's
+    /// countdown stopped updating until the app was relaunched.
+    ///
+    /// Three endings, exactly one of which may act: the page answers, the
+    /// deadline passes, or the webview is thrown away.
+    private final class FetchToken {
+        let accountId: UUID
+        /// Weak, so a token can never keep a discarded webview alive.
+        weak var webView: WKWebView?
+        var deadline: DispatchWorkItem?
+        private var finish: (() -> Void)?
+
+        init(accountId: UUID, webView: WKWebView, finish: @escaping () -> Void) {
+            self.accountId = accountId
+            self.webView = webView
+            self.finish = finish
+        }
+
+        func claim() -> Bool {
+            guard let finish else { return false }
+            self.finish = nil
+            deadline?.cancel()
+            deadline = nil
+            finish()
+            return true
+        }
+    }
+
+    /// How long a fetch may go unanswered before the slot is taken back.
+    /// Comfortably inside the five-minute cycle.
+    static let defaultTimeout: TimeInterval = 30
+
     private let settings: AppSettings
     private let fetchInterval: TimeInterval
+    private let fetchTimeout: TimeInterval
     private let renderInterval: TimeInterval
     /// At most one fetch per account per this long, for the tab-became-visible
     /// poke: `tabBecameVisible` fires on every `refresh()`, not only on a user
@@ -83,9 +119,9 @@ final class NextEventPoller {
     /// anyone reading his session.
     private var outcomes: [UUID: AgendaOutcome] = [:]
     /// Accounts with a fetch still running. Doubles as the completion's
-    /// permission to write: `forget` drops the id, so a fetch that outlives its
-    /// account cannot put a stale entry back.
-    private var inFlight: Set<UUID> = []
+    /// permission to write: `forget` drops the token, so a fetch that outlives
+    /// its account cannot put a stale entry back.
+    private var inFlight: [UUID: FetchToken] = [:]
     private var lastFetchStarted: [UUID: Date] = [:]
     /// The labels last handed out, so the change callback fires when the tab
     /// bar would actually look different rather than every 30 seconds.
@@ -101,14 +137,30 @@ final class NextEventPoller {
     /// settle — the single place, mirroring `UnreadPoller.updateBadge()`.
     var onCountdownsChanged: (() -> Void)?
 
+    /// How the agenda script is put to a webview. The seam
+    /// `UnreadPoller.ask` is, for the same reason: an answer that never arrives
+    /// cannot be staged through a real page. Nothing in the app replaces it.
+    var ask: (WKWebView, [String: Any], @escaping (Result<Any, any Error>) -> Void) -> Void = {
+        webView, arguments, answer in
+        webView.callAsyncJavaScript(
+            AgendaScript.fetchScript,
+            arguments: arguments,
+            in: nil,
+            in: .defaultClient,
+            completionHandler: answer
+        )
+    }
+
     init(
         settings: AppSettings = .shared,
         fetchInterval: TimeInterval = 300,
+        fetchTimeout: TimeInterval = NextEventPoller.defaultTimeout,
         renderInterval: TimeInterval = 30,
         pokeThrottle: TimeInterval = 60
     ) {
         self.settings = settings
         self.fetchInterval = fetchInterval
+        self.fetchTimeout = fetchTimeout
         self.renderInterval = renderInterval
         self.pokeThrottle = pokeThrottle
     }
@@ -214,7 +266,11 @@ final class NextEventPoller {
         observers = []
         entries = [:]
         outcomes = [:]
-        inFlight = []
+        // Released rather than dropped: a token owns a "Check Now" caller's
+        // completion, and switching the countdown off must not leave that
+        // button spinning.
+        for token in inFlight.values { release(token) }
+        inFlight = [:]
         lastFetchStarted = [:]
         notifyIfChanged()
     }
@@ -224,7 +280,7 @@ final class NextEventPoller {
     func forget(accountId: UUID) {
         entries[accountId] = nil
         outcomes[accountId] = nil
-        inFlight.remove(accountId)
+        if let token = inFlight[accountId] { release(token) }
         lastFetchStarted[accountId] = nil
         notifyIfChanged()
     }
@@ -248,7 +304,9 @@ final class NextEventPoller {
         let group = DispatchGroup()
 
         for target in targets {
-            guard !inFlight.contains(target.accountId) else { continue }
+            // Bounded by the token's own deadline, so a fetch that never comes
+            // back cannot keep this account out of every later cycle.
+            guard inFlight[target.accountId] == nil else { continue }
             // Not on a Calendar page: a definite nothing, not a failed check.
             guard Self.canPoll(target.webView.url) else {
                 entries[target.accountId] = nil
@@ -290,24 +348,57 @@ final class NextEventPoller {
             window: CalendarCountdown.todayWindow(now: requestedAt, timeZone: timeZone)
         )
 
-        inFlight.insert(accountId)
+        let token = FetchToken(accountId: accountId, webView: webView, finish: completion)
+        inFlight[accountId] = token
         lastFetchStarted[accountId] = requestedAt
-        webView.callAsyncJavaScript(
-            AgendaScript.fetchScript,
-            arguments: [
+
+        let deadline = DispatchWorkItem { [weak self] in self?.fetchTimedOut(token) }
+        token.deadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + fetchTimeout, execute: deadline)
+
+        ask(
+            webView,
+            [
                 "path": path,
                 "nowMs": requestedAt.timeIntervalSince1970 * 1000
-            ],
-            in: nil,
-            in: .defaultClient
+            ]
         ) { [weak self] result in
-            defer { completion() }
-            guard let self else { return }
-            // `forget` clears the token, so an account removed mid-fetch never
+            guard let self else {
+                _ = token.claim()
+                return
+            }
+            // `forget`, the deadline and a discarded webview all clear the
+            // token, so a fetch that outlives its webview or its account never
             // gets a stale entry written back.
-            guard self.inFlight.remove(accountId) != nil else { return }
+            guard self.release(token) else { return }
             self.apply(result: result, accountId: accountId, requestedAt: requestedAt)
         }
+    }
+
+    /// Hands this fetch to the caller, if it is still the live one for its
+    /// account and nothing else has claimed it.
+    @discardableResult
+    private func release(_ token: FetchToken) -> Bool {
+        guard token.claim() else { return false }
+        if inFlight[token.accountId] === token { inFlight[token.accountId] = nil }
+        return true
+    }
+
+    /// The page never answered. Recorded as the no-answer it is — the cached
+    /// entry retires on its own — and, above all, the slot goes back so the next
+    /// cycle asks again.
+    private func fetchTimedOut(_ token: FetchToken) {
+        guard release(token) else { return }
+        outcomes[token.accountId] = .noAnswer
+        notifyIfChanged()
+    }
+
+    /// The webview a fetch was asked of has been thrown away, so its callback is
+    /// never coming. Without this, a tab the recycler rebuilt mid-fetch left the
+    /// countdown frozen until the app was relaunched.
+    func webViewWasDiscarded(_ webView: WKWebView) {
+        guard let token = inFlight.values.first(where: { $0.webView === webView }) else { return }
+        release(token)
     }
 
     /// The failure policy, in one switch.
@@ -353,7 +444,7 @@ final class NextEventPoller {
     private func prune(keeping active: Set<UUID>) {
         for id in entries.keys where !active.contains(id) { entries[id] = nil }
         for id in outcomes.keys where !active.contains(id) { outcomes[id] = nil }
-        inFlight.formIntersection(active)
+        for (id, token) in inFlight where !active.contains(id) { release(token) }
     }
 
     // MARK: - The render clock

@@ -623,25 +623,25 @@ final class LinkRouterTests: XCTestCase {
     func testAnEmptyPopupIsClosedWhenItsLinkGoesToTheBrowser() {
         XCTAssertTrue(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: true
         ))
         // A popup showing print preview or an attachment keeps its window.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: true,
+            hasShownAPage: true,
             isMainFrameTarget: true
         ))
         // A subframe inside a popup is not the popup's reason to exist.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: true,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: false
         ))
         // And a tab is never closed by a link leaving.
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
             isPopup: false,
-            hasRenderedAPage: false,
+            hasShownAPage: false,
             isMainFrameTarget: true
         ))
     }

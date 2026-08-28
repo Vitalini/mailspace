@@ -89,34 +89,124 @@ final class NavigationResponsePolicyTests: XCTestCase {
 
     // MARK: - Failure is never silent
 
-    /// The app cancelling its own downloads (account removal) must not put a
-    /// dialog up; anything else must.
-    func testOnlyACancellationPassesWithoutTellingTheUser() {
-        XCTAssertTrue(NavigationPolicy.isCancellation(
-            NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+    /// Only a cancellation MailSpace can vouch for passes without a word.
+    ///
+    /// The regression this pins: WebKit reports a destination it *could not
+    /// write* as `NSURLErrorCancelled (-999)`, the same code the app's own
+    /// `cancel()` produces. Reading the code alone therefore threw away exactly
+    /// the failures that need saying — an over-long filename produced no file,
+    /// no dialog and no clue. So `-999` is now a failure unless this app is the
+    /// one that asked for it.
+    func testOnlyTheAppsOwnCancellationPassesWithoutTellingTheUser() {
+        let cancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+
+        XCTAssertFalse(NavigationPolicy.shouldReportFailure(cancelled, cancelledByApp: true))
+        // The bug, in one assertion: the same error, not asked for by us.
+        XCTAssertTrue(NavigationPolicy.shouldReportFailure(cancelled, cancelledByApp: false))
+
+        // `NSUserCancelledError` is unambiguous — something asked a person and
+        // they said no — and stays trusted.
+        XCTAssertFalse(NavigationPolicy.shouldReportFailure(
+            NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError), cancelledByApp: false
         ))
-        XCTAssertTrue(NavigationPolicy.isCancellation(
-            NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)
+        XCTAssertTrue(NavigationPolicy.shouldReportFailure(
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost), cancelledByApp: false
         ))
-        XCTAssertFalse(NavigationPolicy.isCancellation(
-            NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
-        ))
-        XCTAssertFalse(NavigationPolicy.isCancellation(
-            NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        XCTAssertTrue(NavigationPolicy.shouldReportFailure(
+            NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError), cancelledByApp: false
         ))
     }
 
-    /// A window opened only to carry a download has nothing to show and must go
-    /// — the empty popup left behind after every `target="_blank"` download.
-    func testAPopupWithNothingInItIsClosed() {
+    // MARK: - What a download says about itself in the log
+
+    /// A downloaded attachment's name is mail content. `os_log` messages are
+    /// world-readable on this Mac and keep for days, so a name interpolated
+    /// into one marked `.public` left the app's privacy boundary for anything
+    /// that runs `log show`.
+    func testAFailedDownloadNeverWritesTheFilenameToTheLog() {
+        let name = "Договор аренды — подпись Виталия.pdf"
+        let line = NavigationPolicy.downloadFailureLine(
+            filename: name,
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        )
+
+        XCTAssertFalse(line.contains(name))
+        XCTAssertFalse(line.contains("Договор"))
+        XCTAssertFalse(line.contains("Виталия"))
+        // And it is still a diagnostic: the type, the size that may be the
+        // cause, and the code that used to be misread.
+        XCTAssertTrue(line.contains(".pdf"))
+        XCTAssertTrue(line.contains("\(name.utf8.count) bytes"))
+        XCTAssertTrue(line.contains("-999"))
+    }
+
+    /// The error's own text is kept out for the same reason: a Cocoa file error
+    /// spells the filename out in its message, and a URL error carries the
+    /// failing URL — an attachment endpoint, ids and all.
+    func testTheErrorsOwnMessageIsNotCopiedIntoTheLog() {
+        let error = NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileWriteInvalidFileNameError,
+            userInfo: [
+                NSLocalizedDescriptionKey: "The file “Медкарта Иванов.pdf” could not be saved.",
+                NSFilePathErrorKey: "/Users/someone/Downloads/Медкарта Иванов.pdf"
+            ]
+        )
+        let line = NavigationPolicy.downloadFailureLine(filename: "Медкарта Иванов.pdf", error: error)
+
+        XCTAssertFalse(line.contains("Медкарта"))
+        XCTAssertFalse(line.contains("Иванов"))
+        XCTAssertFalse(line.contains("/Users/"))
+        XCTAssertTrue(line.contains(NSCocoaErrorDomain))
+    }
+
+    func testADownloadWithNoDestinationYetSaysSoRatherThanNothing() {
+        let line = NavigationPolicy.downloadFailureLine(
+            filename: nil,
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+        )
+        XCTAssertTrue(line.contains("no destination yet"))
+    }
+
+    func testANameWithNoExtensionStillReducesToAShape() {
+        XCTAssertEqual(NavigationPolicy.redactedName("счёт"), "no extension, 8 bytes")
+        XCTAssertEqual(NavigationPolicy.redactedName(nil), "no destination yet")
+    }
+
+    // MARK: - The window that only ever carried a download
+
+    /// A window opened only to carry a download has nothing to show and must
+    /// go, **whatever URL it committed**.
+    ///
+    /// The freeze this pins: the old rule was `webView.url != nil`, and a popup
+    /// whose download URL had already been set as its provisional one satisfied
+    /// that while having shown nobody anything. It stayed on screen as an empty
+    /// window with no way to close it — and `hasPopup(for:)` vetoes that
+    /// account's tab recycling while a popup is open, so the 2.3 GB of growth
+    /// this whole feature exists to prevent came straight back, silently.
+    func testAPopupThatShowedNothingIsClosedWhateverItCommitted() {
         XCTAssertTrue(NavigationPolicy.shouldCloseEmptyPopup(
-            isPopup: true, hasRenderedAPage: false, isMainFrameTarget: true
+            isPopup: true, hasShownAPage: false, isMainFrameTarget: true
         ))
+    }
+
+    /// And the other half: a window the user is actually looking at — a print
+    /// preview, a popped-out compose, a Google page opened on purpose — has
+    /// finished a page of its own and is never closed by this rule, not even
+    /// when a download starts inside it.
+    func testAPopupThatShowedAPageIsLeftAlone() {
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
-            isPopup: true, hasRenderedAPage: true, isMainFrameTarget: true
+            isPopup: true, hasShownAPage: true, isMainFrameTarget: true
         ))
+    }
+
+    func testATabIsNeverClosedByThisRule() {
         XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
-            isPopup: false, hasRenderedAPage: false, isMainFrameTarget: true
+            isPopup: false, hasShownAPage: false, isMainFrameTarget: true
+        ))
+        // A subframe load is not the window's reason to exist either way.
+        XCTAssertFalse(NavigationPolicy.shouldCloseEmptyPopup(
+            isPopup: true, hasShownAPage: false, isMainFrameTarget: false
         ))
     }
 }

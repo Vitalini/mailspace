@@ -12,7 +12,12 @@ import WebKit
 /// could render was rendered — into the hidden frame Gmail points at the
 /// attachment URL, where it is indistinguishable from nothing happening. Every
 /// unit test in the suite passed throughout. So this probe asserts on **files**,
-/// and on the two cases that must produce none.
+/// and on the cases that must produce none: a response nobody asked to save, and
+/// a download that cannot be written anywhere.
+///
+/// Every step waits on the thing it is about — a file landing, a render
+/// finishing, a refusal being reported — never on a fixed sleep. A probe whose
+/// answer depends on how busy the Mac is teaches people to ignore a red run.
 ///
 /// ## The harness's server
 ///
@@ -112,28 +117,63 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
 
     // MARK: - The cases
 
+    /// What the run had reached when a step was started, so the step can be
+    /// judged on what *it* changed.
+    private struct Snapshot {
+        let files: Int
+        let announced: Int
+        let failures: Int
+        let pageLoads: Int
+    }
+
     /// One driven shape. `expectsFile` is what the owner would call "it worked".
+    ///
+    /// `settled` is the condition the step is *about*, and waiting on it rather
+    /// than on a clock is the difference between a probe and a coin toss. The
+    /// fixed two-second window this replaces attributed a download that landed
+    /// at 2.1s to the following step: one case read zero files, the next read
+    /// two, and `make smoke` went red for reasons that had nothing to do with
+    /// downloads. A red run nobody believes is worse than no run at all.
     private struct Step {
         let name: String
         let expectsFile: Bool
         let action: (DownloadProbe) -> Void
+        /// Default: the file this step exists to produce has arrived *and* been
+        /// announced. Both, because WebKit creates the file while it is still
+        /// writing it, so the directory alone is true too early.
+        var settled: (DownloadProbe, Snapshot) -> Bool = { probe, before in
+            probe.announced > before.announced && probe.savedFiles() > before.files
+        }
     }
 
     /// Clicks a freshly made link, optionally into a new window.
-    private static func clickScript(target: String?) -> String {
+    private static func clickScript(target: String? = nil, download: String? = nil) -> String {
         """
         var a = document.createElement('a');
         a.href = \(fileBlob);
         \(target.map { "a.target = '\($0)';" } ?? "")
+        \(download.map { "a.download = '\($0)';" } ?? "")
         a.textContent = 'file';
         document.body.appendChild(a);
         a.click();
         """
     }
 
+    /// A suggested filename of `characters` Cyrillic letters plus `.pdf`.
+    ///
+    /// Cyrillic because the limit that bit is **255 bytes**, not 255
+    /// characters, and UTF-8 spends two bytes on each of these — so 264 of them
+    /// is 528 bytes and the write failed, with WebKit reporting it as
+    /// `NSURLErrorCancelled (-999)`, which the app then read as the user
+    /// cancelling. No file, no message. Synthetic throughout: the letter is
+    /// repeated, and nothing here came out of anyone's mail.
+    private static func longName(_ characters: Int) -> String {
+        String(repeating: "и", count: characters) + ".pdf"
+    }
+
     private static let steps: [Step] = [
         // The plain click.
-        Step(name: "link", expectsFile: true) { $0.run(script: clickScript(target: nil)) },
+        Step(name: "link", expectsFile: true) { $0.run(script: clickScript()) },
         // target="_blank": WebKit asks for a window first, and the navigation
         // in it turns out to be a file.
         Step(name: "blank", expectsFile: true) { $0.run(script: clickScript(target: "_blank")) },
@@ -152,21 +192,58 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
             document.body.appendChild(f);
             """)
         },
+        // The three names the owner measured. 204 characters landed; 264 and
+        // 404 disappeared with nothing said, because the destination was longer
+        // than a path component may be and WebKit called that a cancellation.
+        Step(name: "long204", expectsFile: true) { $0.run(script: clickScript(download: longName(204))) },
+        Step(name: "long264", expectsFile: true) { $0.run(script: clickScript(download: longName(264))) },
+        Step(name: "long404", expectsFile: true) { $0.run(script: clickScript(download: longName(404))) },
         // The recycler's replacement webview. Nothing is re-wired by hand: this
         // is `AccountSession.recycle`, the call the tick makes at twelve hours.
-        Step(name: "recycled", expectsFile: false) { $0.recycle() },
-        Step(name: "recycledlink", expectsFile: true) { $0.run(script: clickScript(target: nil)) },
+        Step(name: "recycled", expectsFile: false, action: { $0.recycle() }, settled: { probe, _ in
+            probe.webView != nil
+        }),
+        Step(name: "recycledlink", expectsFile: true) { $0.run(script: clickScript()) },
         // The control. Renderable, and nothing asked for it to be saved, so this
         // one must open — a policy that downloaded everything would otherwise
         // pass this probe.
-        Step(name: "renders", expectsFile: false) { $0.run(script: "location.href = \(renderableBlob)") },
+        // Settled on the render *finishing*, not on the URL committing. The
+        // next step puts the tab back on the fixture page, and issuing that
+        // load into a half-rendered PDF cancels it — which took the WebContent
+        // process with it often enough to make one run in ten fail somewhere
+        // else entirely. A step is over when the thing it is testing has
+        // happened, not when it has started.
+        Step(
+            name: "renders",
+            expectsFile: false,
+            action: { $0.run(script: "location.href = \(renderableBlob)") },
+            settled: { probe, before in
+                probe.pageLoads > before.pageLoads
+                    && (probe.webView?.url?.absoluteString.hasPrefix("blob:") ?? false)
+            }
+        ),
         // And the one that must never be silent: a download that cannot be
         // written anywhere. No file, and the user is told in words.
-        Step(name: "refused", expectsFile: false) {
-            $0.settings.downloadDirectory = $0.lockedDirectory
-            $0.run(script: clickScript(target: nil))
-        }
+        Step(
+            name: "refused",
+            expectsFile: false,
+            action: {
+                $0.settings.downloadDirectory = $0.lockedDirectory
+                $0.run(script: clickScript())
+            },
+            settled: { probe, before in probe.failureReports.count > before.failures }
+        )
     ]
+
+    /// How many files the run as a whole must put on disk. Every step that
+    /// expects one, counted once — checked at the end as well as per step, so a
+    /// file that arrives late cannot be credited to the wrong case.
+    private static var expectedFiles: Int { steps.filter(\.expectsFile).count }
+
+    /// The longest a single step may take before the run is called broken.
+    /// Every one of them settles in well under a second in practice; this is
+    /// only here so a wedged step reports rather than hangs.
+    private static let stepDeadline: TimeInterval = 15
 
     // MARK: - The run
 
@@ -193,6 +270,9 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
         // And the routing half: a Drive-hosted attachment is a download, while
         // the Drive pages around it are still the browser's.
         notes.append("routesAttachments=\(Self.attachmentRoutingHolds ? 1 : 0)")
+        // The privacy half. A failed download's log line carries the shape of
+        // the name and never the name, whatever a person called the file.
+        notes.append("redactsNames=\(Self.redactionHolds ? 1 : 0)")
 
         previousSink = Log.sink
         let forward = Log.sink
@@ -218,7 +298,7 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
                 forName: NSWindow.willCloseNotification, object: window, queue: .main
             ) { [weak self] _ in self?.popupsClosed += 1 }
         }
-        policy.onDidFinish = { [weak self] _ in self?.pageDidLoad() }
+        policy.onDidFinish = { [weak self] webView in self?.pageDidLoad(webView) }
 
         let session = AccountSession(account: account, schemeHandlers: [Self.scheme: self])
         self.session = session
@@ -269,6 +349,25 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
             && leaves("https://docs.google.com/document/d/abc/edit")
     }
 
+    /// What a failed download says about itself, against the shipping function.
+    ///
+    /// The line has to be useful — the extension and the size that made the
+    /// write fail — while carrying nothing anybody wrote. `os_log` output is
+    /// world-readable on this Mac and keeps for days; an attachment's name is
+    /// mail content, and interpolating one into a message marked `.public` put
+    /// it there for anything that runs `log show`.
+    private static var redactionHolds: Bool {
+        let name = longName(264)
+        let line = NavigationPolicy.downloadFailureLine(
+            filename: name,
+            error: NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        )
+        return !line.contains("и")
+            && line.contains(".pdf")
+            && line.contains("\(name.utf8.count) bytes")
+            && line.contains("-999")
+    }
+
     private var currentStepName: String {
         index < Self.steps.count ? Self.steps[index].name : "report"
     }
@@ -280,8 +379,14 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
         webView.load(URLRequest(url: Self.page))
     }
 
-    private func pageDidLoad() {
+    /// Only the fixture page finishing resumes the run.
+    ///
+    /// Anything else that finishes — a popup, the renderable blob still on its
+    /// way in when the reload was issued — used to hand the next step a tab
+    /// that was not on the page the step assumes.
+    private func pageDidLoad(_ webView: WKWebView) {
         pageLoads += 1
+        guard webView === self.webView, webView.url?.path == Self.page.path else { return }
         guard let completion = onPageLoad else { return }
         onPageLoad = nil
         DispatchQueue.main.async(execute: completion)
@@ -316,13 +421,14 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
         fresh.translatesAutoresizingMaskIntoConstraints = true
     }
 
-    /// Drives one step, waits for it to settle, records what landed on disk.
+    /// Drives one step, waits for the thing it is about to actually happen, and
+    /// records what landed on disk.
     ///
     /// Every step starts from the fixture page: a case that legitimately
     /// navigates the tab (`renders`) must not decide the next one.
     private func next() {
         guard index < Self.steps.count, let webView else {
-            report()
+            settleAndReport()
             return
         }
         guard webView.url?.path == Self.page.path else {
@@ -332,14 +438,29 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
         }
 
         let step = Self.steps[index]
-        let before = savedFiles()
-        let failuresBefore = failureReports.count
+        let before = Snapshot(
+            files: savedFiles(),
+            announced: announced,
+            failures: failureReports.count,
+            pageLoads: pageLoads
+        )
         step.action(self)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        let settledYet: () -> Bool = { [weak self] in
+            guard let self else { return true }
+            return step.settled(self, before)
+        }
+        wait(for: settledYet, upTo: Self.stepDeadline) { [weak self] settled in
             guard let self else { return }
-            let landed = self.savedFiles() - before
+            let landed = self.savedFiles() - before.files
             self.notes.append("\(step.name)=\(landed)")
+            if !settled {
+                // Where the tab actually was when the step gave up. The scheme
+                // only — this is the probe's own fixture, but the habit is the
+                // point: nothing about a page goes into a report.
+                let at = self.webView?.url?.scheme ?? "nothing"
+                self.notes.append("FAILED_\(step.name)=never-settled-on-\(at)")
+            }
             if step.expectsFile, landed < 1 {
                 self.notes.append("FAILED_\(step.name)=no-file")
             }
@@ -355,47 +476,115 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
                 self.notes.append("rendered=\(shown ? 1 : 0)")
             }
             if step.name == "refused" {
-                self.notes.append("refusedWasReported=\(self.failureReports.count - failuresBefore)")
+                self.notes.append("refusedWasReported=\(self.failureReports.count - before.failures)")
             }
             self.index += 1
             self.next()
         }
     }
 
+    /// Waits on a condition rather than on a clock, polling the run loop.
+    ///
+    /// Recursive `asyncAfter` rather than a `Timer`, so it works the same in a
+    /// process that never activates and never draws.
+    private func wait(
+        for condition: @escaping () -> Bool,
+        upTo remaining: TimeInterval,
+        step: TimeInterval = 0.02,
+        then done: @escaping (Bool) -> Void
+    ) {
+        if condition() { return done(true) }
+        guard remaining > 0 else { return done(false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + step) { [weak self] in
+            guard let self else { return done(false) }
+            self.wait(for: condition, upTo: remaining - step, step: step, then: done)
+        }
+    }
+
     private func savedFiles() -> Int {
-        (try? FileManager.default.contentsOfDirectory(atPath: downloadDirectory.path).count) ?? 0
+        savedNames().count
+    }
+
+    private func savedNames() -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: downloadDirectory.path)) ?? []
+    }
+
+    /// Every popup this run opened had to close itself, and the last one may
+    /// still be on its way out — closing is deliberately deferred past the
+    /// navigation callback that decided it. Waited on, not slept through, and
+    /// then asserted: an open popup is not just an empty window, it is a
+    /// permanent veto on that account's tab recycling.
+    private func settleAndReport() {
+        wait(for: { [weak self] in
+            guard let self else { return true }
+            return self.popupsClosed == self.popupsPresented
+        }, upTo: Self.stepDeadline) { [weak self] _ in
+            self?.report()
+        }
     }
 
     private func report() {
         guard !finished else { return }
         finished = true
 
+        // The longest name that actually reached the disk, in bytes. The
+        // filesystem's own limit is 255, and a name over it is what used to
+        // fail as a cancellation. Lengths only — never a name.
+        let longest = savedNames().map(\.utf8.count).max() ?? 0
+        let total = savedFiles()
+        notes.append("files=\(total) longestName=\(longest)")
         notes.append("pageLoads=\(pageLoads) reloads=\(reloads)")
         notes.append("announced=\(announced)")
         notes.append("popups=\(popupsPresented) closed=\(popupsClosed)")
+        notes.append("popupVeto=\(policy.hasPopup(for: account.id) ? 1 : 0)")
         notes.append("refusalLogged=\(logLines.contains { $0.contains("not writable") } ? 1 : 0)")
+        // Nothing the app writes about a download may carry the name of one.
+        notes.append("namesInLog=\(logLines.contains { $0.contains("и") } ? 1 : 0)")
 
         var verdict = !notes.contains { $0.hasPrefix("FAILED_") }
-        // Six files: five shapes plus the one after the recycle.
-        verdict = verdict && announced == 6
-        // Every window opened for a download had nothing to show and went away.
+        verdict = verdict && announced == Self.expectedFiles
+        verdict = verdict && total == Self.expectedFiles
+        // Every name the filesystem accepted, including the 404-character one.
+        verdict = verdict && longest > 0 && longest <= LinkRouter.maxFilenameBytes
+        // Every window opened for a download had nothing to show and went away,
+        // so nothing is left vetoing the recycler.
         verdict = verdict && popupsPresented > 0 && popupsClosed == popupsPresented
+        verdict = verdict && notes.contains("popupVeto=0")
         // The refused download told the user, once, and left a line to read.
         verdict = verdict && failureReports.count == 1
         verdict = verdict && logLines.contains { $0.contains("not writable") }
+        verdict = verdict && notes.contains("namesInLog=0")
         verdict = verdict && notes.contains("recycledDelegates=1")
         verdict = verdict && notes.contains("rendered=1")
         verdict = verdict && notes.contains("attachmentRule=1")
         verdict = verdict && notes.contains("routesAttachments=1")
+        verdict = verdict && notes.contains("redactsNames=1")
 
-        let line = "downloads result=\(verdict ? "ok" : "FAILED") " + notes.joined(separator: " ")
-        cleanUp { SelfTest.finish(line) }
+        cleanUp { [weak self] removed in
+            let notes = self?.notes ?? []
+            let line = "downloads result=\(verdict && removed ? "ok" : "FAILED") "
+                + (notes + ["storeRemoved=\(removed ? 1 : 0)"]).joined(separator: " ")
+            SelfTest.finish(line)
+        }
     }
 
-    private func cleanUp(then done: @escaping () -> Void) {
+    /// Puts the Mac back exactly as the run found it, and says whether it
+    /// managed to.
+    ///
+    /// The data store is the part that used to be silent: `remove(forIdentifier:)`
+    /// answered "in use by network process" and the error was thrown away, so
+    /// every run of `make smoke` orphaned a store under `~/Library/WebKit` for
+    /// good. What holds one is not obvious — a popup window, a download still
+    /// running and the window the webview sits in all do — so they go first, and
+    /// the answer is reported rather than assumed.
+    private func cleanUp(then done: @escaping (Bool) -> Void) {
         if let previousSink { Log.sink = previousSink }
         settings.useSystemDownloadDirectory()
+        policy.closePopups(for: account.id)
+        policy.cancelDownloads(for: account.id)
+        window?.contentView = nil
         window?.orderOut(nil)
+        window = nil
         let identifier = account.id
         // The same shape as account removal: detach, then let the session go,
         // or the store stays in use and cannot be deleted.
@@ -403,8 +592,13 @@ final class DownloadProbe: NSObject, WKURLSchemeHandler {
         session = nil
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedDirectory.path)
         try? FileManager.default.removeItem(at: downloadDirectory.deletingLastPathComponent())
-        // The probe's own data store, gone the way account removal deletes one.
-        // Nothing this probe created outlives the run.
-        WebViewFactory.destroyDataStore(for: identifier) { _ in done() }
+        // A longer ladder than account removal's: this run leaves nine finished
+        // downloads and two popups behind it, and the network process takes
+        // correspondingly longer to let go. `destroyDataStore` is also the one
+        // call that guarantees WebKit is initialised first — without it the
+        // class-level API dereferences a null run loop.
+        WebViewFactory.destroyDataStore(for: identifier, attempts: 60, retryDelay: 0.25) { error in
+            done(error == nil)
+        }
     }
 }

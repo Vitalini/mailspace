@@ -11,9 +11,25 @@ import os
 /// entries in the system log" was therefore never evidence of anything: a
 /// download could fail and leave no trace a person could find.
 ///
-/// `privacy: .public` on the message: these lines are written by this app about
-/// its own behaviour and carry hosts and paths, never mail content — redacting
-/// them to `<private>` would put the log back where it was.
+/// `privacy: .public` on the message, and that is a promise the *call sites*
+/// have to keep. The unified log is world-readable on this Mac and keeps for
+/// days, so anything handed to `Log` has left the app's privacy boundary. The
+/// rule, in three parts:
+///
+/// - **Never a downloaded file's name.** It is what a person wrote on a
+///   contract, an invoice, an X-ray. `NavigationPolicy.redactedName` reduces one
+///   to its extension and its size in bytes, which is also what a person
+///   debugging this actually needs.
+/// - **Never a whole URL from a page.** A Gmail address carries the id of the
+///   open thread and an attachment endpoint carries the attachment's. Hosts are
+///   logged; paths and fragments are not.
+/// - **Never an error's own text.** A Cocoa file error spells the filename out
+///   in its message and a URL error carries the failing URL, so a domain and a
+///   code go in instead.
+///
+/// Marking the message `.private` instead would put the log back where it was —
+/// unreadable, which is where a year of download failures went unnoticed. The
+/// content is left out, not hidden.
 enum Log {
     private static let system = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.vitalii.MailSpace",
