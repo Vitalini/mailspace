@@ -50,20 +50,6 @@ enum DownloadFinishedAction: String, CaseIterable {
     }
 }
 
-/// What the Dock badge — and every unread number that comes from the same poll
-/// — is counting (A5).
-enum BadgeScope: String, CaseIterable {
-    case primary
-    case everything
-
-    var displayName: String {
-        switch self {
-        case .primary: return "Primary inbox only"
-        case .everything: return "Everything in the inbox (includes Promotions and Social)"
-        }
-    }
-}
-
 /// App-level preferences, over `UserDefaults.standard`.
 ///
 /// The shape `docs/plans/2026-08-26-1224-feat-settings-window-plan.md` calls
@@ -82,11 +68,9 @@ final class AppSettings {
         static let openLinksInBackground = "OpenLinksInBackground"
         static let downloadDirectoryPath = "DownloadDirectoryPath"
         static let downloadFinishedAction = "DownloadFinishedAction"
-        static let badgeScope = "BadgeScope"
         static let showCalendarCountdown = "ShowCalendarCountdown"
         // Valves: read at the point of use, no row in the window (KTD-S6).
         static let unreadPollSeconds = "UnreadPollSeconds"
-        static let unreadUsePlainFeed = "UnreadUsePlainFeed"
         static let disableSignInAutofill = "DisableSignInAutofill"
     }
 
@@ -106,10 +90,8 @@ final class AppSettings {
             Key.openLinksInBackground: true,
             Key.downloadDirectoryPath: "",
             Key.downloadFinishedAction: DownloadFinishedAction.notify.rawValue,
-            Key.badgeScope: BadgeScope.primary.rawValue,
             Key.showCalendarCountdown: true,
             Key.unreadPollSeconds: 60.0,
-            Key.unreadUsePlainFeed: false,
             Key.disableSignInAutofill: false
         ])
     }
@@ -190,12 +172,13 @@ final class AppSettings {
 
     // MARK: - Accounts pane
 
-    /// A5. What "unread" means, for the Dock badge and for every surface fed by
-    /// the same poll.
-    var badgeScope: BadgeScope {
-        get { BadgeScope(rawValue: defaults.string(forKey: Key.badgeScope) ?? "") ?? .primary }
-        set { defaults.set(newValue.rawValue, forKey: Key.badgeScope) }
-    }
+    // A5 was a "Dock badge counts" pop-up — *Primary inbox only* against
+    // *Everything in the inbox*. It is gone rather than repaired: Primary was
+    // implemented as a Gmail *label* feed, which counts unread mail anywhere in
+    // the mailbox including archived, and no atom-feed URL expresses "unread in
+    // Primary" at all. A control with one honest option is not a control, so
+    // the pane states what the number is instead of offering a choice between a
+    // true answer and a false one. See `UnreadPoller.feedPath`.
 
     /// G6. Whether a Calendar tab says how long until that account's next event
     /// later today.
@@ -215,12 +198,6 @@ final class AppSettings {
     var unreadPollSeconds: TimeInterval {
         let stored = defaults.double(forKey: Key.unreadPollSeconds)
         return stored > 0 ? stored : 60
-    }
-
-    /// Forces the whole-inbox atom feed regardless of `badgeScope` — the way
-    /// out for the day Gmail retires the Primary smart label.
-    var unreadUsePlainFeed: Bool {
-        defaults.bool(forKey: Key.unreadUsePlainFeed)
     }
 
     /// Stops the native side answering the sign-in autofill request at all. The

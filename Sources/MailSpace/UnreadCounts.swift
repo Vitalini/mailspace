@@ -9,9 +9,14 @@ import Foundation
 enum UnreadCounts {
     /// Above this the pill caps and the exact figure moves to the tooltip.
     ///
-    /// His *Everything*-scope inboxes run past 4000, and four digits plus a
-    /// separator eats the tab width the account name needs. Gmail's own
-    /// surfaces cap too.
+    /// A busy inbox runs past 4000, and four digits plus a separator eats the
+    /// tab width the account name needs. Gmail's own surfaces cap too.
+    ///
+    /// Worth remembering what the cap cost once: it is what turned a count of
+    /// ~3,480 from the wrong feed into an unreadable `999+`, so the three
+    /// digits that would have identified it never reached the screen. The cap
+    /// is right; the defence against a wrong number belongs upstream of it, in
+    /// `UnreadCheck.answer`.
     static let cap = 999
 
     /// The pill text, or `nil` when the tab shows nothing at all.

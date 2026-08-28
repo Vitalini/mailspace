@@ -966,6 +966,23 @@ final class SettingsProbe: NSObject, AccountHosting {
     private var hostCalls: [String] = []
     /// And what G6 told the countdown poller to do.
     private var calendarCalls: [Bool] = []
+    /// How many times the unread diagnostic asked for a fresh check.
+    private var unreadCalls = 0
+    /// What that diagnostic reports back, so the pane's line can be asserted
+    /// without a poller: one account, one answer, one derived number.
+    private let unreadReport = UnreadCheckReport(
+        requestedPath: UnreadPoller.feedPath,
+        checkedAt: Date(timeIntervalSince1970: 0),
+        lines: [
+            UnreadCheckReport.Line(
+                name: "Probe",
+                answer: UnreadFeedAnswer(
+                    outcome: .ok, count: 2, status: 200, type: "basic",
+                    servedPath: UnreadPoller.feedPath
+                )
+            )
+        ]
+    )
 
     /// Its own directory under the temporary folder: a probe never writes the
     /// account list of the app the user runs.
@@ -1014,21 +1031,21 @@ final class SettingsProbe: NSObject, AccountHosting {
         expect(settings.composeFrom == .ask, "composeFrom")
         expect(settings.openLinksInBackground, "openLinksInBackground")
         expect(settings.downloadFinishedAction == .notify, "downloadFinishedAction")
-        expect(settings.badgeScope == .primary, "badgeScope")
         expect(settings.showsCalendarCountdown, "showCalendarCountdown")
         expect(settings.usesSystemDownloadDirectory, "downloadDirectory")
         expect(settings.unreadPollSeconds == 60, "unreadPollSeconds")
-        expect(!settings.unreadUsePlainFeed, "unreadUsePlainFeed")
         expect(!settings.disableSignInAutofill, "disableSignInAutofill")
 
         // A written value round-trips, and it lands in this bundle's own domain.
-        settings.badgeScope = .everything
-        expect(settings.badgeScope == .everything, "badgeScope-roundtrip")
+        settings.downloadFinishedAction = .reveal
+        expect(settings.downloadFinishedAction == .reveal, "downloadFinishedAction-roundtrip")
         expect(
-            defaults.persistentDomain(forName: SelfTest.bundleIdentifier)?[AppSettings.Key.badgeScope] != nil,
+            defaults.persistentDomain(forName: SelfTest.bundleIdentifier)?[
+                AppSettings.Key.downloadFinishedAction
+            ] != nil,
             "domain-is-the-self-test-one"
         )
-        settings.badgeScope = .primary
+        settings.downloadFinishedAction = .notify
 
         guard failures.isEmpty else {
             SelfTest.finish("settings result=FAILED failed=\(failures.joined(separator: ","))")
@@ -1045,6 +1062,16 @@ final class SettingsProbe: NSObject, AccountHosting {
                 status: { CalendarCountdownStatus(kind: .notCheckedYet, checked: 0, showing: 0) },
                 setEnabled: { [weak self] enabled in self?.calendarCalls.append(enabled) },
                 recheck: { done in done() }
+            ),
+            // Same discipline as the calendar seam above: record the ask and
+            // stop there. What is under test is that A5's replacement reaches
+            // the poller at all — no fetch, no webview, no Gmail.
+            unread: UnreadCheckControls(
+                report: { [weak self] in self?.unreadReport ?? UnreadCheckControls().report() },
+                recheck: { [weak self] done in
+                    self?.unreadCalls += 1
+                    done()
+                }
             )
         )
         self.controller = controller
@@ -1056,7 +1083,7 @@ final class SettingsProbe: NSObject, AccountHosting {
 
         guard let directory = ProcessInfo.processInfo.environment["MAILSPACE_SETTINGS_SHOT"] else {
             SelfTest.finish(
-                "settings result=ok defaults=9 applied=\(applied.checked) "
+                "settings result=ok defaults=7 applied=\(applied.checked) "
                 + "domain=\(SelfTest.bundleIdentifier) render=skipped"
             )
         }
@@ -1196,22 +1223,34 @@ final class SettingsProbe: NSObject, AccountHosting {
             expect(hostCalls == [expected], "button-\(expected)")
         }
 
-        // A5
-        if let popup: NSPopUpButton = Self.control(
+        // A5's replacement — the unread diagnostic. The button must reach the
+        // poller seam, and the line must then say which URL was asked for and
+        // what number came back. A scope pop-up that silently fetched a label
+        // feed is exactly what this replaces, so "no pop-up survives" is itself
+        // an assertion.
+        let scopePopup: NSPopUpButton? = Self.control(in: accountsView, where: { popup in
+            popup.itemTitles.contains { $0.localizedCaseInsensitiveContains("Primary inbox") }
+        })
+        expect(scopePopup == nil, "A5-scope-popup-is-gone")
+        if let button: NSButton = Self.control(
             in: accountsView,
-            where: { $0.itemTitles.contains(BadgeScope.primary.displayName) }
+            where: { $0.accessibilityLabel() == "Check the unread counts now" }
         ) {
-            badgeCalls = []
-            popup.selectItem(withTitle: BadgeScope.everything.displayName)
-            Self.click(popup)
-            expect(settings.badgeScope == .everything, "A5-everything")
-            // The number means something else now, so it is fetched again.
-            expect(badgeCalls == [true], "A5-repolls")
-            popup.selectItem(withTitle: BadgeScope.primary.displayName)
-            Self.click(popup)
-            expect(settings.badgeScope == .primary, "A5-primary")
+            unreadCalls = 0
+            Self.click(button)
+            expect(unreadCalls == 1, "A5-check-reaches-the-poller")
         } else {
-            failures.append("A5-missing")
+            failures.append("A5-check-missing")
+        }
+        if let status: NSTextField = Self.control(
+            in: accountsView,
+            where: { $0.accessibilityLabel() == "What the last unread check did" }
+        ) {
+            let text = status.stringValue
+            expect(text.contains(UnreadPoller.feedPath), "A5-status-names-the-feed")
+            expect(text.contains("2 unread"), "A5-status-names-the-number")
+        } else {
+            failures.append("A5-status-missing")
         }
 
         return (checked, failures)

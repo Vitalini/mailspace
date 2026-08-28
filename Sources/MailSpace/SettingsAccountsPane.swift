@@ -42,14 +42,23 @@ final class SettingsAccountsPane: NSViewController, NSTableViewDataSource, NSTab
     }
 
     private unowned let host: AccountHosting
-    private let settings: AppSettings
 
     private let tableView = NSTableView()
     private let addButton = NSButton()
     private let removeButton = NSButton()
     private let editButton = NSButton(title: "Edit Account…", target: nil, action: nil)
-    private let scopePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let scopeCaption = NSTextField(labelWithString: "")
+    /// A5's replacement: a statement of what the number is, and a way to check
+    /// it. The pop-up that stood here offered "Primary inbox only", captioned
+    /// "Matches the number Gmail shows on its own Primary tab", and fetched a
+    /// label feed that counted the whole mailbox. There is no honest second
+    /// option to offer, so there is no pop-up.
+    private let countsCaption = NSTextField(labelWithString: "")
+    private let countsCheckButton = NSButton(title: "Check Now", target: nil, action: nil)
+    private let countsStatus = NSTextField(labelWithString: "")
+
+    /// How the pane reaches the unread poller. Defaults to an inert set, so a
+    /// window built without one — the settings self-test — still works.
+    private let unread: UnreadCheckControls
 
     /// The rows as they are drawn right now. Read by the checkbox actions, so
     /// it has to be the same snapshot the table was reloaded from.
@@ -59,9 +68,9 @@ final class SettingsAccountsPane: NSViewController, NSTableViewDataSource, NSTab
     /// on whatever takes its place. Local UI state and nothing more.
     private var pendingSelectionRow: Int?
 
-    init(accounts host: AccountHosting, settings: AppSettings = .shared) {
+    init(accounts host: AccountHosting, unread: UnreadCheckControls = UnreadCheckControls()) {
         self.host = host
-        self.settings = settings
+        self.unread = unread
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -82,30 +91,36 @@ final class SettingsAccountsPane: NSViewController, NSTableViewDataSource, NSTab
 
         let buttons = buttonRow()
 
-        scopePopup.target = self
-        scopePopup.action = #selector(scopeChanged(_:))
-        for scope in BadgeScope.allCases {
-            scopePopup.addItem(withTitle: scope.displayName)
-            scopePopup.lastItem?.representedObject = scope.rawValue
-        }
-        let scopeLabel = NSTextField(labelWithString: "Dock badge counts:")
-        let scopeRow = NSStackView(views: [scopeLabel, scopePopup]).horizontal()
+        let countsTitle = NSTextField(labelWithString: "Unread counts")
+        countsTitle.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
 
-        scopeCaption.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        scopeCaption.textColor = .secondaryLabelColor
-        scopeCaption.lineBreakMode = .byWordWrapping
-        scopeCaption.maximumNumberOfLines = 2
-        scopeCaption.preferredMaxLayoutWidth = 480
+        countsCaption.stringValue = Self.caption
+        Self.style(countsCaption, lines: 5)
 
-        let stack = NSStackView(views: [scroll, buttons, scopeRow, scopeCaption])
+        countsCheckButton.target = self
+        countsCheckButton.action = #selector(recheckCounts(_:))
+        countsCheckButton.bezelStyle = .rounded
+        // The Settings window carries three buttons titled "Check Now" — this
+        // one, the calendar countdown's and the update check's. They are
+        // unambiguous under their own headings on screen, and this is what
+        // tells them apart to anything reading the view.
+        countsCheckButton.setAccessibilityLabel("Check the unread counts now")
+        Self.style(countsStatus, lines: 6)
+        countsStatus.setAccessibilityLabel("What the last unread check did")
+
+        let countsRow = NSStackView(views: [countsCheckButton, countsStatus]).horizontal()
+        countsRow.alignment = .top
+
+        let stack = NSStackView(views: [scroll, buttons, countsTitle, countsCaption, countsRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(4, after: scroll)
         stack.setCustomSpacing(16, after: buttons)
+        stack.setCustomSpacing(4, after: countsTitle)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 360))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 460))
         content.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
@@ -141,11 +156,53 @@ final class SettingsAccountsPane: NSViewController, NSTableViewDataSource, NSTab
         {
             tableView.selectRowIndexes([row], byExtendingSelection: false)
         }
-        scopePopup.selectItem(at: BadgeScope.allCases.firstIndex(of: settings.badgeScope) ?? 0)
-        scopeCaption.stringValue = settings.badgeScope == .primary
-            ? "Matches the number Gmail shows on its own Primary tab."
-            : "Includes Promotions and Social, so this number runs higher than Gmail's own."
+        refreshCountsStatus()
         updateButtons()
+    }
+
+    // MARK: - Unread counts (A5's replacement)
+
+    /// What the number on a Mail tab and in the Dock actually is. Three
+    /// sentences, and every one of them has to stay true of
+    /// `UnreadPoller.feedPath` — the previous caption did not, for a release.
+    private static let caption = """
+        Counts unread mail in each account's Inbox, from Gmail's own inbox feed — never \
+        archived mail, whatever labels it carries. With Gmail's category tabs on, the Inbox \
+        includes Promotions and Social. When the count cannot be read, the tab shows nothing \
+        rather than a number.
+        """
+
+    /// Asks for a fresh check and reports what came back.
+    ///
+    /// The cheap way to find out what the counts are actually being read from,
+    /// on the owner's own signed-in session, without anyone else going near it.
+    /// The line says which URL was requested, what each account answered, and
+    /// the number derived — counts and shapes, never a subject, sender or word
+    /// of any message.
+    @objc private func recheckCounts(_ sender: Any?) {
+        countsCheckButton.isEnabled = false
+        countsStatus.stringValue = "Checking…"
+        unread.recheck { [weak self] in
+            self?.countsCheckButton.isEnabled = true
+            self?.refreshCountsStatus()
+        }
+    }
+
+    private func refreshCountsStatus() {
+        let report = unread.report()
+        countsStatus.stringValue = report.text
+        // Red only for the answers that mean the count cannot be read at all.
+        // "Not checked yet" and a tab that is not on Gmail are ordinary.
+        countsStatus.textColor = report.isBroken ? .systemRed : .secondaryLabelColor
+        countsCheckButton.isEnabled = true
+    }
+
+    private static func style(_ label: NSTextField, lines: Int) {
+        label.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = lines
+        label.preferredMaxLayoutWidth = 400
     }
 
     // MARK: - Table
@@ -369,19 +426,5 @@ final class SettingsAccountsPane: NSViewController, NSTableViewDataSource, NSTab
         addButton.isEnabled = Buttons.addEnabled()
         removeButton.isEnabled = Buttons.removeEnabled(selectedRow: tableView.selectedRow, rowCount: accounts.count)
         editButton.isEnabled = Buttons.editEnabled(selectedRow: tableView.selectedRow, rowCount: accounts.count)
-    }
-
-    // MARK: - Badge scope (A5)
-
-    @objc private func scopeChanged(_ sender: NSPopUpButton) {
-        guard
-            let raw = sender.selectedItem?.representedObject as? String,
-            let scope = BadgeScope(rawValue: raw)
-        else { return }
-        settings.badgeScope = scope
-        // The number means something different now, so it is fetched again
-        // rather than relabelled.
-        host.badgeInputsChanged(repoll: true)
-        reload()
     }
 }

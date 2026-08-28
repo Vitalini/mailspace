@@ -19,14 +19,21 @@ final class UnreadPoller {
     /// cross-origin, gets no CORS headers and rejects.
     static let mailHosts: Set<String> = ["mail.google.com", "mail.googlemail.com"]
 
-    /// Returns `{ ok, feed, status, type }`.
+    /// Returns `{ ok, feed, status, type, reached, host, path }`.
     ///
-    /// `ok`/`feed` mean exactly what they always did, byte for byte, because
-    /// the Dock badge is load-bearing and has already had a stale-badge bug.
     /// `ok: false` means the poll never got an answer — a network error, or the
     /// 20s abort below — and the caller must keep the previous count rather
-    /// than read it as zero unread. A 4xx *is* an answer (signed out, feed
-    /// retired), so it counts as zero. So is "this page is not Gmail".
+    /// than read it as zero unread.
+    ///
+    /// A 4xx used to count as zero. It no longer does: only 401/403, which is
+    /// Google saying the session is gone, is a zero, and every other 4xx is an
+    /// answer without a count (`UnreadCheck.answer`). "This feed does not
+    /// exist" and "nothing unread" were the same number until that split.
+    ///
+    /// `host`/`path` say where the body actually came from, which only differs
+    /// from what was asked for on the followed-redirect branch below. A body
+    /// from another feed counts another set and is never attributed to the
+    /// inbox.
     ///
     /// `status` and `type` are new and additive, and they exist for one reason:
     /// `redirect: 'manual'`. With the default `follow`, a signed-out feed fetch
@@ -36,18 +43,48 @@ final class UnreadPoller {
     /// `type: 'opaqueredirect'` response while a genuine offline failure still
     /// throws. That one flag is the whole technical unlock; see `SessionHealth`.
     ///
-    /// The whole inbox, and Gmail's own Primary tab. The badge used to disagree
-    /// with Gmail by counting Promotions and Social; A5 is the choice between
-    /// the two, and the smart-label form is what Gmail's own `Inbox (N)` shows.
-    static let plainFeedPath = "/mail/feed/atom"
-    static let primaryFeedPath = "/mail/feed/atom/%5Esmartlabel_personal"
+    /// Gmail's inbox atom feed, and the only feed MailSpace ever asks for.
+    ///
+    /// It is the one form Google documents, and it says what it does: it
+    /// "outputs your inbox". Its `<fullcount>` is unread mail *in the Inbox* —
+    /// archived mail cannot appear in it whatever labels it carries.
+    ///
+    /// v1.1.0 asked for `/mail/feed/atom/%5Esmartlabel_personal` instead, under
+    /// a setting captioned "Matches the number Gmail shows on its own Primary
+    /// tab". Anything after `/atom/` is a *label* feed, and a label feed is not
+    /// inbox-scoped: it counts unread mail carrying that label anywhere in the
+    /// mailbox, archived included. On an account with ~3,500 unread sitting in
+    /// archived labels and 2 in the inbox, the tab read `999+`.
+    ///
+    /// There is no atom-feed URL for "unread in Primary" — the feed offers the
+    /// inbox and it offers labels, and Primary is the intersection of the two.
+    /// So the scope pop-up is gone rather than pointed at another label, and
+    /// this constant is the whole of the URL construction.
+    static let feedPath = "/mail/feed/atom"
 
-    /// The feed the scope asks for, unless the `UnreadUsePlainFeed` valve
-    /// (KTD-S6) forces the whole inbox — the way out for the day Gmail retires
-    /// the smart label.
-    static func feedPath(scope: BadgeScope, usePlainFeed: Bool) -> String {
-        guard scope == .primary, !usePlainFeed else { return plainFeedPath }
-        return primaryFeedPath
+    /// Whether a body served from `host`/`path` is this account's inbox feed.
+    ///
+    /// Only ever false in one situation, and it is the situation that matters:
+    /// the fetch met a redirect, followed it, and landed somewhere else. A body
+    /// from a different feed counts a different set, and attributing it to the
+    /// inbox is the same class of mistake as the label feed itself.
+    ///
+    /// `/mail/u/N/feed/atom` is accepted because that is the same inbox feed
+    /// under a multi-login profile — a redirect the app already meets in the
+    /// wild.
+    static func servesTheInboxFeed(host: String, path: String) -> Bool {
+        guard mailHosts.contains(host.lowercased()) else { return false }
+        var path = path
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        if path == feedPath { return true }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count == 5 else { return false }
+        return parts[0] == "mail"
+            && parts[1] == "u"
+            && !parts[2].isEmpty
+            && parts[2].allSatisfy(\.isNumber)
+            && parts[3] == "feed"
+            && parts[4] == "atom"
     }
 
     /// The Dock total: only the accounts that opted in (A4). An account left
@@ -64,12 +101,23 @@ final class UnreadPoller {
     private static func feedScript(path: String) -> String {
         """
         if (!/^mail\\.google(mail)?\\.com$/.test(location.hostname)) {
-          return { ok: true, feed: '', status: -1, type: 'not-gmail', reached: false };
+          return { ok: true, feed: '', status: -1, type: 'not-gmail', reached: false, host: '', path: '' };
         }
+        const requested = '\(path)';
+        // Host and path only, never the query: a redirect can carry a token,
+        // and nothing needs it to answer "was this the inbox feed".
+        const shape = function (raw) {
+          try {
+            const parsed = new URL(raw, location.origin);
+            return { host: parsed.host, path: parsed.pathname };
+          } catch (error) {
+            return { host: '', path: '' };
+          }
+        };
         const controller = new AbortController();
         const deadline = setTimeout(function () { controller.abort(); }, 20000);
         try {
-          const response = await fetch('\(path)', {
+          const response = await fetch(requested, {
             credentials: 'include',
             cache: 'no-store',
             redirect: 'manual',
@@ -82,38 +130,51 @@ final class UnreadPoller {
             // profile goes same-origin to /mail/u/N/. Following it separates
             // them, because only the cross-origin one fails CORS and throws.
             try {
-              const followed = await fetch('\(path)', {
+              const followed = await fetch(requested, {
                 credentials: 'include',
                 cache: 'no-store',
                 redirect: 'follow',
                 signal: controller.signal
               });
+              // The one branch where the body can come from somewhere other
+              // than the path that was asked for, so it is the one branch whose
+              // origin is reported back and checked.
+              const served = shape(followed.url);
               if (!followed.ok) {
                 return {
                   ok: followed.status < 500, feed: '',
-                  status: followed.status, type: 'redirect-followed', reached: true
+                  status: followed.status, type: 'redirect-followed', reached: true,
+                  host: served.host, path: served.path
                 };
               }
               return {
                 ok: true, feed: await followed.text(),
-                status: followed.status, type: 'redirect-followed', reached: true
+                status: followed.status, type: 'redirect-followed', reached: true,
+                host: served.host, path: served.path
               };
             } catch (followError) {
-              return { ok: false, feed: '', status: 0, type: 'opaqueredirect', reached: true };
+              return {
+                ok: false, feed: '', status: 0, type: 'opaqueredirect', reached: true,
+                host: '', path: ''
+              };
             }
           }
+          // `redirect: 'manual'` and not a redirect, so nothing was followed and
+          // the body is from the requested path by construction.
           if (!response.ok) {
             return {
               ok: response.status < 500, feed: '',
-              status: response.status, type: response.type, reached: true
+              status: response.status, type: response.type, reached: true,
+              host: location.host, path: requested
             };
           }
           return {
             ok: true, feed: await response.text(),
-            status: response.status, type: response.type, reached: true
+            status: response.status, type: response.type, reached: true,
+            host: location.host, path: requested
           };
         } catch (error) {
-          return { ok: false, feed: '', status: -1, type: 'error', reached: false };
+          return { ok: false, feed: '', status: -1, type: 'error', reached: false, host: '', path: '' };
         } finally {
           clearTimeout(deadline);
         }
@@ -145,7 +206,6 @@ final class UnreadPoller {
     static let unansweredLimit = 10
 
     private let interval: TimeInterval
-    private let settings: AppSettings
     private var timer: Timer?
     private var counts: [UUID: Int] = [:]
     /// Accounts with a poll still running. Doubles as the completion's
@@ -167,6 +227,12 @@ final class UnreadPoller {
     /// Cycle counter, so an account Google is rate-limiting can be polled at
     /// half the rate.
     private var cycle = 0
+    /// What each account's last check requested and got back — the whole of the
+    /// Settings diagnostic. Kept per account because that is the grain the
+    /// owner compares against Gmail's own sidebar.
+    private var lastChecks: [UUID: UnreadFeedAnswer] = [:]
+    /// When the last check of any account completed.
+    private(set) var lastCheckedAt: Date?
 
     /// Supplies the mail webview of every account that currently has Mail on.
     ///
@@ -212,9 +278,16 @@ final class UnreadPoller {
         counts[accountId]
     }
 
-    init(interval: TimeInterval = 60, settings: AppSettings = .shared) {
+    /// This account's last check, for the Settings status line. `nil` until it
+    /// has been checked once.
+    func lastCheck(for accountId: UUID) -> UnreadFeedAnswer? {
+        lastChecks[accountId]
+    }
+
+    /// No `AppSettings`: there is nothing left for a preference to choose. The
+    /// feed is one constant, and the poll interval arrives already read.
+    init(interval: TimeInterval = 60) {
         self.interval = interval
-        self.settings = settings
     }
 
     func start() {
@@ -235,7 +308,11 @@ final class UnreadPoller {
     /// Polls every mail account, or just one when `accountId` is given (used
     /// right after a new-mail notification, and on a mail webview's first
     /// `didFinish` so the badge does not sit blank for a minute after launch).
-    func refresh(accountId: UUID? = nil) {
+    ///
+    /// `completion` runs once every fetch this call started has answered — what
+    /// the Settings "Check Now" button waits on, the same contract
+    /// `NextEventPoller.refresh` already offers.
+    func refresh(accountId: UUID? = nil, completion: (() -> Void)? = nil) {
         let mailAccounts = mailWebViews()
         let active = Set(mailAccounts.map(\.accountId))
         let targets = mailAccounts.filter { accountId == nil || $0.accountId == accountId }
@@ -243,8 +320,11 @@ final class UnreadPoller {
         guard !targets.isEmpty else {
             pruneCounts(keeping: active)
             updateBadge()
+            completion?()
             return
         }
+
+        let group = DispatchGroup()
 
         for target in targets {
             // A poll that has not come back yet must not be stacked on by the
@@ -258,20 +338,40 @@ final class UnreadPoller {
 
             switch Self.reading(for: target.webView.url) {
             case .definiteZero:
+                // Google has the tab on its own login page. The only real zero
+                // there is, and it renders as nothing rather than as a `0`.
+                record(Self.signedOutOnThePage, for: target.accountId)
                 counts[target.accountId] = 0
                 clearUnanswered(target.accountId)
                 observe(target.accountId, busy ? .busy : .authFailedStrong)
             case .noAnswer:
+                record(Self.notOnMail, for: target.accountId)
                 noteUnanswered(target.accountId)
                 observe(target.accountId, busy ? .busy : .unreachable)
             case .poll:
-                poll(accountId: target.accountId, webView: target.webView, busy: busy)
+                group.enter()
+                poll(accountId: target.accountId, webView: target.webView, busy: busy) {
+                    group.leave()
+                }
             }
         }
 
         pruneCounts(keeping: active)
         updateBadge()
+        if let completion {
+            group.notify(queue: .main, execute: completion)
+        }
     }
+
+    /// The two answers the poller settles without asking Gmail anything, so the
+    /// Settings line covers them too rather than reading "not checked yet" for
+    /// an account that is plainly signed out.
+    static let signedOutOnThePage = UnreadFeedAnswer(
+        outcome: .signedOut, count: 0, status: -1, type: "sign-in"
+    )
+    static let notOnMail = UnreadFeedAnswer(
+        outcome: .notMail, count: nil, status: -1, type: "not-gmail"
+    )
 
     /// Where the feed can actually be read from, and what silence there means.
     static func reading(for url: URL?) -> Reading {
@@ -309,6 +409,7 @@ final class UnreadPoller {
         counts[accountId] = nil
         inFlight.remove(accountId)
         unansweredCycles[accountId] = nil
+        lastChecks[accountId] = nil
         reportedStale.remove(accountId)
         signedOutAccounts.remove(accountId)
         stalledAccounts.remove(accountId)
@@ -337,21 +438,23 @@ final class UnreadPoller {
         updateBadge()
     }
 
-    private func poll(accountId: UUID, webView: WKWebView, busy: Bool) {
+    private func poll(
+        accountId: UUID,
+        webView: WKWebView,
+        busy: Bool,
+        completion: @escaping () -> Void
+    ) {
         inFlight.insert(accountId)
-        let script = Self.feedScript(
-            path: Self.feedPath(scope: settings.badgeScope, usePlainFeed: settings.unreadUsePlainFeed)
-        )
         webView.callAsyncJavaScript(
-            script,
+            Self.feedScript(path: Self.feedPath),
             arguments: [:],
             in: nil,
             in: .defaultClient
         ) { [weak self] result in
-            guard let self else { return }
+            guard let self else { return completion() }
             // `forget` clears the token, so an account removed mid-poll never
             // gets a stale count written back.
-            guard self.inFlight.remove(accountId) != nil else { return }
+            guard self.inFlight.remove(accountId) != nil else { return completion() }
 
             let payload = (try? result.get()) as? [String: Any]
             let probe = Self.probe(from: payload)
@@ -362,19 +465,26 @@ final class UnreadPoller {
             if probe.reached { self.onReachability?(true) }
             self.observe(accountId, busy ? .busy : SessionHealth.observation(for: probe))
 
-            // A failed or aborted fetch is not "zero unread" — keep the last
-            // known count so a network blip does not clear the Dock badge.
-            guard let payload, (payload["ok"] as? Bool) == true else {
+            // One decision, in one place: an answer either carries a count this
+            // app can stand behind or it does not, and everything that does not
+            // is handled exactly as a failed fetch already was — keep the last
+            // count, bounded at ten cycles. Nothing here can produce a zero.
+            let answer = UnreadCheck.answer(from: payload, requestedPath: Self.feedPath)
+            self.record(answer, for: accountId)
+            if let count = answer.count {
+                self.clearUnanswered(accountId)
+                self.counts[accountId] = count
+            } else {
                 self.noteUnanswered(accountId)
-                self.updateBadge()
-                return
             }
-
-            let feed = (payload["feed"] as? String) ?? ""
-            self.clearUnanswered(accountId)
-            self.counts[accountId] = AtomFeedParser.unreadCount(from: feed) ?? 0
             self.updateBadge()
+            completion()
         }
+    }
+
+    private func record(_ answer: UnreadFeedAnswer, for accountId: UUID) {
+        lastChecks[accountId] = answer
+        lastCheckedAt = Date()
     }
 
     /// The script's answer as `SessionHealth` reads it. A payload that never
@@ -421,6 +531,9 @@ final class UnreadPoller {
         }
         for id in unansweredCycles.keys where !active.contains(id) {
             unansweredCycles[id] = nil
+        }
+        for id in lastChecks.keys where !active.contains(id) {
+            lastChecks[id] = nil
         }
         inFlight.formIntersection(active)
         reportedStale.formIntersection(active)

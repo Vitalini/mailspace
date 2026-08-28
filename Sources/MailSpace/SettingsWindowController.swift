@@ -24,7 +24,8 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
         updates: UpdateController,
         settings: AppSettings = .shared,
         accounts host: AccountHosting,
-        calendar: CalendarCountdownControls = CalendarCountdownControls()
+        calendar: CalendarCountdownControls = CalendarCountdownControls(),
+        unread: UnreadCheckControls = UnreadCheckControls()
     ) {
         generalPane = SettingsGeneralPane(
             updates: updates,
@@ -32,7 +33,7 @@ final class SettingsWindowController: NSObject, NSToolbarDelegate {
             accounts: host,
             calendar: calendar
         )
-        accountsPane = SettingsAccountsPane(accounts: host, settings: settings)
+        accountsPane = SettingsAccountsPane(accounts: host, unread: unread)
         panes = [
             Pane(
                 identifier: NSToolbarItem.Identifier("general"),

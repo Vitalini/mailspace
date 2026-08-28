@@ -35,10 +35,8 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.usesSystemDownloadDirectory)
         XCTAssertEqual(settings.downloadDirectory, AppSettings.systemDownloadDirectory)
         XCTAssertEqual(settings.downloadFinishedAction, .notify)
-        XCTAssertEqual(settings.badgeScope, .primary)
         XCTAssertTrue(settings.showsCalendarCountdown)
         XCTAssertEqual(settings.unreadPollSeconds, 60)
-        XCTAssertFalse(settings.unreadUsePlainFeed)
         XCTAssertFalse(settings.disableSignInAutofill)
     }
 
@@ -53,7 +51,6 @@ final class AppSettingsTests: XCTestCase {
         let settings = settings()
         XCTAssertEqual(settings.composeFrom, .ask)
         XCTAssertTrue(settings.openLinksInBackground)
-        XCTAssertEqual(settings.badgeScope, .primary)
         // On by default. A domain written before G6 existed must not read it as
         // a false-shaped `false`.
         XCTAssertTrue(settings.showsCalendarCountdown)
@@ -90,10 +87,6 @@ final class AppSettingsTests: XCTestCase {
             settings.downloadFinishedAction = action
             XCTAssertEqual(settings.downloadFinishedAction, action)
         }
-        for scope in BadgeScope.allCases {
-            settings.badgeScope = scope
-            XCTAssertEqual(settings.badgeScope, scope)
-        }
     }
 
     func testTheCalendarCountdownSwitchRoundTrips() {
@@ -108,11 +101,21 @@ final class AppSettingsTests: XCTestCase {
         let settings = settings()
         defaults.set("mailplane", forKey: AppSettings.Key.composeFrom)
         defaults.set("shred", forKey: AppSettings.Key.downloadFinishedAction)
-        defaults.set("inbox-zero", forKey: AppSettings.Key.badgeScope)
 
         XCTAssertEqual(settings.composeFrom, .ask)
         XCTAssertEqual(settings.downloadFinishedAction, .notify)
-        XCTAssertEqual(settings.badgeScope, .primary)
+    }
+
+    /// A5's key is gone. A domain that still carries the old `BadgeScope`
+    /// value — every domain written by 1.0.3 through 1.1.0 does — is simply
+    /// ignored, rather than being migrated into a scope that no longer exists.
+    func testALeftoverBadgeScopeValueIsIgnored() {
+        let settings = settings()
+        defaults.set("primary", forKey: "BadgeScope")
+        defaults.set(true, forKey: "UnreadUsePlainFeed")
+
+        XCTAssertEqual(settings.unreadPollSeconds, 60)
+        XCTAssertEqual(settings.downloadFinishedAction, .notify)
     }
 
     // MARK: - Download folder

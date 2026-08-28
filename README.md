@@ -149,16 +149,43 @@ never what it read. *Refused* means Google will not serve that calendar this
 way and the countdown cannot work for it; *not understood* means the page came
 back in a shape MailSpace does not recognise.
 
-Three switches deliberately have no row. They are debugging valves, read at the
+### The unread count
+
+The number on a Mail tab, and the Dock badge that sums them, is **unread mail in
+that account's Inbox**. It comes from Gmail's own inbox atom feed —
+`/mail/feed/atom`, fetched from inside the tab you are already signed in to — and
+the `<fullcount>` in it is the whole of what MailSpace reads. Archived mail is
+never counted, whatever labels it carries. With Gmail's category tabs switched
+on, the Inbox includes Promotions and Social, so the number can run above the one
+beside **Inbox** in Gmail's sidebar.
+
+There is no second option, and that is deliberate. 1.1.0 offered *Primary inbox
+only* and implemented it as a Gmail **label** feed, which is not inbox-scoped: it
+counted unread mail carrying that label anywhere in the mailbox, archived
+included, so an account with 2 unread in its inbox showed `999+`. No atom-feed
+URL expresses "unread in Primary" — the feed offers the inbox, and it offers
+labels, and Primary is the intersection of the two. A control with one honest
+option is not a control.
+
+When the count cannot be read, the tab shows **nothing** rather than a number.
+Only two answers ever become a count: a feed that parsed, and Google answering
+401/403, which is a real zero. A refused feed, an answer that is not a feed, and
+a redirect that landed on a different feed are all "no count" — the last count is
+kept briefly and then dropped.
+
+**Settings ▸ Accounts ▸ Unread counts** carries a **Check Now** button and a line
+saying what the last check did: the URL requested, and per account the HTTP
+status, the shape of the answer, and the number derived from it. It never shows
+anything out of your mail — no subject, sender or address — only what happened.
+Compare its number against what Gmail prints beside **Inbox** in its own sidebar
+and you have checked the badge yourself, without signing anything in twice.
+
+Two switches deliberately have no row. They are debugging valves, read at the
 point of use, and a row would suggest they are worth touching:
 
 ```sh
 # How often the unread count is fetched, in seconds. Default 60.
 defaults write com.vitalii.MailSpace UnreadPollSeconds -float 120
-
-# Force the whole-inbox atom feed regardless of the Dock badge scope — the way
-# out for the day Gmail retires the Primary smart label. Default NO.
-defaults write com.vitalii.MailSpace UnreadUsePlainFeed -bool YES
 
 # Stop the native side answering the sign-in autofill request at all.
 # Default NO.

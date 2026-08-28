@@ -142,38 +142,12 @@ final class UnreadPollerReadingTests: XCTestCase {
     }
 }
 
-/// What the number counts (A5) and whose numbers are added up (A4).
+/// Whose numbers are added up (A4).
+///
+/// What the number *counts* moved to `UnreadCheckTests` when A5 went: there is
+/// no scope left to choose, so the URL is one constant and the interesting
+/// assertions are about which answers may become a count at all.
 final class UnreadBadgeTests: XCTestCase {
-    // MARK: - Scope
-
-    /// The default. The badge used to count Promotions and Social, which is why
-    /// it disagreed with Gmail's own `Inbox (N)`.
-    func testPrimaryScopeAsksForTheSmartLabelFeed() {
-        XCTAssertEqual(
-            UnreadPoller.feedPath(scope: .primary, usePlainFeed: false),
-            "/mail/feed/atom/%5Esmartlabel_personal"
-        )
-    }
-
-    func testEverythingScopeAsksForTheWholeInbox() {
-        XCTAssertEqual(UnreadPoller.feedPath(scope: .everything, usePlainFeed: false), "/mail/feed/atom")
-    }
-
-    /// The `UnreadUsePlainFeed` valve wins over the pop-up — the way out for
-    /// the day Gmail retires the smart label.
-    func testThePlainFeedValveOverridesTheScope() {
-        XCTAssertEqual(UnreadPoller.feedPath(scope: .primary, usePlainFeed: true), "/mail/feed/atom")
-        XCTAssertEqual(UnreadPoller.feedPath(scope: .everything, usePlainFeed: true), "/mail/feed/atom")
-    }
-
-    /// Same-origin, host-relative: the fetch runs inside the account's own
-    /// Gmail page, which is what makes its cookies apply.
-    func testEveryFeedPathIsHostRelative() {
-        for scope in BadgeScope.allCases {
-            XCTAssertTrue(UnreadPoller.feedPath(scope: scope, usePlainFeed: false).hasPrefix("/"))
-        }
-    }
-
     // MARK: - Participation
 
     func testOnlyParticipatingAccountsAddUp() {
@@ -228,5 +202,21 @@ final class UnreadBadgeTests: XCTestCase {
         // number by a poll cycle.
         poller.forget(accountId: UUID())
         XCTAssertEqual(told, 2)
+    }
+
+    /// The diagnostic starts empty rather than starting confident.
+    func testAnAccountWithNoCheckYetReportsNothing() {
+        let poller = UnreadPoller()
+        XCTAssertNil(poller.lastCheck(for: UUID()))
+        XCTAssertNil(poller.lastCheckedAt)
+    }
+
+    /// A "Check Now" with nothing to poll still calls back, or the button would
+    /// stay disabled with `Checking…` on screen forever.
+    func testARefreshWithNoMailAccountsStillCallsBack() {
+        let poller = UnreadPoller()
+        let answered = expectation(description: "refresh called back")
+        poller.refresh { answered.fulfill() }
+        wait(for: [answered], timeout: 1)
     }
 }

@@ -31,6 +31,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 guard let self else { return done() }
                 self.nextEventPoller.refresh(completion: done)
             }
+        ),
+        unread: UnreadCheckControls(
+            report: { [weak self] in self?.unreadCheckReport() ?? UnreadCheckControls().report() },
+            recheck: { [weak self] done in
+                guard let self else { return done() }
+                self.unreadPoller.refresh(completion: done)
+            }
         )
     )
     private var loginProbe: LoginProbe?
@@ -334,11 +341,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         windowController?.refreshIndicators()
     }
 
+    /// The Settings ▸ Accounts diagnostic: one line per Mail account, joining
+    /// the poller's last answer to the account's own name. Names, statuses and
+    /// counts — nothing that came out of a message.
+    private func unreadCheckReport() -> UnreadCheckReport {
+        UnreadCheckReport(
+            requestedPath: UnreadPoller.feedPath,
+            checkedAt: unreadPoller.lastCheckedAt,
+            lines: accountStore.accounts.filter(\.mailEnabled).map { account in
+                UnreadCheckReport.Line(
+                    name: account.name,
+                    answer: unreadPoller.lastCheck(for: account.id)
+                )
+            }
+        )
+    }
+
     func badgeInputsChanged(repoll: Bool) {
         if repoll {
-            // The scope changed what the number means, so the number has to be
-            // fetched again — not a stop()/start() cycle, which only the
-            // interval needs.
+            // The number itself is no longer trustworthy, so it is fetched
+            // again — not a stop()/start() cycle, which only the interval needs.
             unreadPoller.refresh()
         } else {
             unreadPoller.refreshBadge()

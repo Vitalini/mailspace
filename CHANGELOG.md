@@ -10,6 +10,30 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Fixed
+- The unread count on a Mail tab, and the Dock badge, are the number of unread
+  messages in that account's **Inbox** again. Since 1.1.0 the default setting
+  counted unread mail anywhere in the mailbox — archived messages and everything
+  filed under a label included — so an account with 2 unread in its inbox and a
+  few thousand sitting in archived labels showed `999+`.
+- A count that cannot be read now shows nothing instead of `0`. A feed Gmail
+  refuses, an answer that is not a feed, and an answer served from somewhere
+  other than your inbox used to arrive as a confident zero, which looks exactly
+  like an empty inbox.
+
+### Changed
+- **Settings ▸ Accounts** no longer offers *Primary inbox only* against
+  *Everything in the inbox*. The Primary option could not be delivered — Gmail's
+  feed can give you your inbox, or it can give you a label, and Primary is
+  neither — so rather than a setting that quietly meant something else, the pane
+  now states what the number is: unread in the Inbox, Promotions and Social
+  included when Gmail's category tabs are switched on for that account.
+- The same section carries a **Check Now** button and a line saying what the last
+  check asked for, what each account answered, and the number it worked out from
+  it, so the badge can be checked against Gmail's own sidebar without taking
+  anything on trust. It shows statuses and counts, never anything out of your
+  mail.
+
 ## [1.1.0] - 2026-08-27
 
 ### Added
