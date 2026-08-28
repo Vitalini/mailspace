@@ -42,6 +42,7 @@ a wrapped line belongs to the bullet above it, here and in the update window.
   until the next launch. A check that was never answered — most often because
   the tab was rebuilt while it was running — used to stop that account being
   checked again at all.
+
 ## [1.1.1] - 2026-08-27
 
 ### Fixed
