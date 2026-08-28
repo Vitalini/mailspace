@@ -55,6 +55,48 @@ final class DownloadDestinationTests: XCTestCase {
         XCTAssertThrowsError(try NavigationPolicy.downloadDestination(suggestedFilename: "report.pdf", in: base))
     }
 
+    // MARK: - The folder nobody ever chose
+
+    /// The owner's Mac has no download key in its preferences at all, so this
+    /// is the resolution that was actually running when he clicked: registered
+    /// defaults only. It had to be ruled out before the real cause could be
+    /// believed, and a change here would silently move where his files land.
+    func testWithNothingStoredTheFolderIsTheSystemDownloadsFolder() throws {
+        let suite = "download-destination-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        AppSettings.registerDefaults(in: defaults)
+
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertTrue(settings.usesSystemDownloadDirectory)
+        XCTAssertEqual(
+            settings.downloadDirectory.standardizedFileURL,
+            AppSettings.systemDownloadDirectory.standardizedFileURL
+        )
+        XCTAssertEqual(settings.downloadDirectory.lastPathComponent, "Downloads")
+
+        // And a name resolves inside it rather than anywhere else. Nothing is
+        // created and nothing is written: this is the same call the delegate
+        // makes, minus the folder check.
+        let destination = LinkRouter.uniqueDestination(
+            in: settings.downloadDirectory, filename: "report.pdf"
+        )
+        XCTAssertEqual(
+            destination.deletingLastPathComponent().standardizedFileURL,
+            AppSettings.systemDownloadDirectory.standardizedFileURL
+        )
+    }
+
+    /// A folder that does not exist yet is created rather than refused — the
+    /// other way a chosen folder could swallow a download.
+    func testAFolderThatDoesNotExistYetIsCreated() throws {
+        let fresh = base.appendingPathComponent("not-yet", isDirectory: true)
+        let destination = try NavigationPolicy.downloadDestination(suggestedFilename: "report.pdf", in: fresh)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+        XCTAssertEqual(destination.deletingLastPathComponent().standardizedFileURL, fresh.standardizedFileURL)
+    }
+
     // MARK: - G2
 
     func testTheCheckboxDecidesWhetherTheBrowserComesForward() {

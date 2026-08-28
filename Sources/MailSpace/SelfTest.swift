@@ -54,6 +54,16 @@ import WebKit
 /// webview on a non-persistent store, `loadHTMLString`, no `htmlembed` fetch, no
 /// signed-in session, no real calendar.
 ///
+/// `MAILSPACE_SELFTEST=downloads` drives the shipping `NavigationPolicy` through
+/// every shape a Gmail attachment download arrives in — a plain link, a
+/// `target="_blank"` link, `window.open`, a response that carries no
+/// `Content-Disposition`, and the hidden frame Gmail actually uses — and checks
+/// that a **file appears on disk** each time, once more after
+/// `AccountSession.recycle` has replaced the webview, and that a download which
+/// cannot be written reports itself instead of vanishing. The fixture is served
+/// by a `WKURLSchemeHandler` this probe owns: no network, no socket, no Google
+/// host, no account, and nothing on screen.
+///
 /// `MAILSPACE_SELFTEST=store` builds a real `AccountSession`, uses its data
 /// store, then tears it down exactly the way account removal does and deletes
 /// the store — proof that "signed out and deleted from this Mac" is true.
@@ -89,6 +99,10 @@ enum SelfTest {
         /// Renders the tab bar offscreen to a PNG, so the signed-out signal can
         /// be looked at without opening a window on anyone's screen.
         case tabshot
+        /// Clicks a file, five ways, and checks that a file appears — plus the
+        /// one case where it must not: a download that cannot be written says
+        /// so instead of doing nothing.
+        case downloads
         case agenda
     }
 
