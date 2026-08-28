@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-08-28
+
 ## [1.1.1] - 2026-08-27
 
 ### Fixed
