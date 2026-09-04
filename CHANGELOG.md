@@ -10,6 +10,13 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Fixed
+- **Dropping a file on the page no longer loses your place.** Dragging anything
+  from Finder onto the message list replaced the inbox with that file, and the
+  only way back was to navigate the tab by hand. A dropped file the page does
+  not want is now ignored and the tab stays exactly where it was. Dropping a
+  file into somewhere that *does* take one — a compose window — still works.
+
 ## [1.1.2] - 2026-08-28
 
 ### Fixed

@@ -339,6 +339,24 @@ case "$DOWNLOADS_OUT" in
   *) fail "downloads: $DOWNLOADS_OUT" ;;
 esac
 
+# 7bb. A file dragged from Finder onto a page that does not want it. WebKit's own
+#      drag controller falls back to LOADING the file — a main-frame navigation
+#      with a file: URL — so dropping anything on the message list replaced the
+#      inbox with it and the tab had to be navigated back by hand. This drives
+#      the shipping NavigationPolicy through a real NSDraggingDestination
+#      sequence, on the main frame and on a subframe, and checks the tab has not
+#      moved. The last case is the one that must still work: a page that ACCEPTS
+#      the drop still receives a real File with the right bytes, because the fix
+#      cancels a navigation and never touches the drag.
+#      No network, no synthesised input: the page comes from a URL scheme handler
+#      the probe owns and the dragging info is built in process. The dragged file
+#      is fifteen bytes the probe wrote in a temporary directory.
+DROP_OUT="$(MAILSPACE_SELFTEST=drop run_with_timeout 120 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$DROP_OUT" in
+  *"result=ok"*) pass "a dropped file does not navigate the tab: $DROP_OUT" ;;
+  *) fail "dropped file: $DROP_OUT" ;;
+esac
+
 # 7bc. The Calendar countdown's parser. Privacy puts the shipped parser inside
 #      the page — the agenda response carries meeting titles, and only numbers
 #      cross the bridge — so `swift test` cannot reach it. This probe runs that

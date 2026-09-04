@@ -273,7 +273,100 @@ final class LinkRouterTests: XCTestCase {
 
     func testOtherSystemSchemesStayInAppRatherThanPoppingADialog() {
         XCTAssertEqual(LinkRouter.destination(for: url("tel:+15551234")), .allowInApp)
-        XCTAssertEqual(LinkRouter.destination(for: url("file:///etc/hosts")), .allowInApp)
+        XCTAssertEqual(LinkRouter.destination(for: url("sms:+15551234")), .allowInApp)
+    }
+
+    // MARK: - What a scheme may do to a frame
+
+    /// The schemes the page legitimately drives itself. Every one of these is
+    /// load-bearing: the sign-in SPA opens `about:blank` popups and iframes,
+    /// the download path is built on `blob:`, and refusing any of them here
+    /// would take popups or downloads with it.
+    ///
+    /// Checked in both frame positions, because the frame only ever decides the
+    /// external hand-off — never whether a scheme may navigate at all.
+    func testThePageDrivenSchemesStillNavigateEitherFrame() {
+        for candidate in [
+            "about:blank",
+            "about:srcdoc",
+            "blob:https://mail.google.com/9b1deb4d-0000-0000-0000-000000000000",
+            "data:text/html,<b>x</b>",
+            "javascript:void(0)"
+        ] {
+            for isMainFrame in [true, false] {
+                XCTAssertEqual(
+                    LinkRouter.destination(for: url(candidate), isMainFrameTarget: isMainFrame, isSSOEscorted: false),
+                    .allowInApp,
+                    "must still navigate: \(candidate) mainFrame=\(isMainFrame)"
+                )
+            }
+        }
+    }
+
+    /// A `file:` URL never takes over a frame, in either position.
+    ///
+    /// Nobody links to one. It arrives because WebKit's drag controller falls
+    /// back to *loading* a dropped file when no part of the page accepts the
+    /// drop — a main-frame navigation, `navigationType == .other` — and
+    /// allowing it replaced the inbox with whatever was dragged onto it.
+    /// WebKit's own cross-scheme protection does not stop this: the load comes
+    /// from the drag controller rather than from script, so an `https` page is
+    /// no safer than any other.
+    func testADroppedFileNeverNavigatesAFrame() {
+        for candidate in [
+            "file:///etc/hosts",
+            "file:///Users/someone/Desktop/quarterly.pdf",
+            "file:///Users/someone/Desktop/a%20file%20with%20spaces.png",
+            "file://localhost/etc/hosts",
+            "file:///"
+        ] {
+            for isMainFrame in [true, false] {
+                XCTAssertEqual(
+                    LinkRouter.destination(for: url(candidate), isMainFrameTarget: isMainFrame, isSSOEscorted: false),
+                    .refuse,
+                    "must be refused: \(candidate) mainFrame=\(isMainFrame)"
+                )
+            }
+        }
+    }
+
+    /// The scheme is read case-insensitively, like every other scheme test
+    /// here — `FILE:` is the same scheme.
+    func testFileSchemeIsRefusedWhateverItsCase() {
+        XCTAssertEqual(LinkRouter.destination(for: url("FILE:///etc/hosts")), .refuse)
+        XCTAssertEqual(LinkRouter.destination(for: url("File:///etc/hosts")), .refuse)
+    }
+
+    /// A refusal is not an escort's business: no `SSOEscort` pass, and no
+    /// redirect wrapper, can turn a local file into something that may load.
+    func testNoEscortOrRedirectWrapperCanLetAFileLoad() {
+        let file = url("file:///etc/hosts")
+        XCTAssertEqual(
+            LinkRouter.destination(for: file, isMainFrameTarget: true, isSSOEscorted: true),
+            .refuse
+        )
+        XCTAssertFalse(LinkRouter.needsEscort(for: file, isMainFrameTarget: true))
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://www.google.com/url?q=file:///etc/hosts")),
+            .refuse
+        )
+    }
+
+    /// The two surfaces and the browser hand-off are untouched by the scheme
+    /// guard: it sits in front of the http(s) path, not inside it.
+    func testTheWebSchemesAreUnaffected() {
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://mail.google.com/mail/u/0/#inbox")),
+            .allowInApp
+        )
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("https://example.com/article")),
+            .openExternally(url("https://example.com/article"))
+        )
+        XCTAssertEqual(
+            LinkRouter.destination(for: url("mailto:a@b.com")),
+            .compose(url("mailto:a@b.com"))
+        )
     }
 
     // MARK: - Gmail's outbound redirect wrapper

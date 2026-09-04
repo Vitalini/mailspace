@@ -103,6 +103,10 @@ enum SelfTest {
         /// one case where it must not: a download that cannot be written says
         /// so instead of doing nothing.
         case downloads
+        /// Drops a file on a page that refuses it and on a page that wants it,
+        /// and checks the tab stays put for the first while the file still
+        /// arrives intact for the second.
+        case drop
         case agenda
     }
 

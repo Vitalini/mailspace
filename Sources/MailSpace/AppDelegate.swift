@@ -50,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var recoveryProbe: RecoveryProbe?
     private var settingsProbe: SettingsProbe?
     private var downloadProbe: DownloadProbe?
+    private var dropProbe: DropProbe?
     private var agendaProbe: AgendaProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
@@ -223,6 +224,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if SelfTest.mode == .downloads {
             downloadProbe = DownloadProbe()
             downloadProbe?.run()
+            return
+        }
+        if SelfTest.mode == .drop {
+            dropProbe = DropProbe()
+            dropProbe?.run()
             return
         }
         if SelfTest.mode == .settings {

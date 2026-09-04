@@ -57,7 +57,35 @@ enum LinkRouter {
         case openExternally(URL)
         /// A `mailto:` link, which MailSpace composes itself.
         case compose(URL)
+        /// Not allowed to take over a frame at all, and nothing is done with it
+        /// instead. Only `file:` reaches this today — see `refusedSchemes`.
+        case refuse
     }
+
+    /// Schemes no navigation may ever commit inside an account webview, in any
+    /// frame.
+    ///
+    /// `file:` is here because of a drop, not because of a link. Dragging a
+    /// file from Finder onto a part of the page that does not accept the drop
+    /// makes WebKit's own drag controller fall back to *loading* it: a
+    /// main-frame navigation arrives with `navigationType == .other` and a
+    /// `file:` URL, and allowing it replaces the inbox with that file. The
+    /// owner's place is gone and the tab has to be navigated back by hand.
+    ///
+    /// This is not the cross-scheme protection WebKit already applies to
+    /// script-driven loads. The load comes from the drag controller rather than
+    /// from the page, so WebKit permits it from an `https` origin exactly as it
+    /// does from anywhere else, and it commits even for a file outside any
+    /// `allowingReadAccessTo` grant (measured, `MAILSPACE_SELFTEST=drop`).
+    ///
+    /// Deliberately a small denylist rather than an allowlist of everything
+    /// else. Refusing every unrecognised scheme would also refuse the schemes
+    /// the app itself serves through a `WKURLSchemeHandler` — which is how the
+    /// download and recovery probes load their fixture pages — and would change
+    /// nothing for the rest, since a scheme WebKit cannot load fails on its own
+    /// whether the policy allows it or not. `file:` is the one scheme that
+    /// genuinely renders foreign local content in the account's tab.
+    private static let refusedSchemes: Set<String> = ["file"]
 
     /// The single routing decision, shared by the navigation and popup paths.
     ///
@@ -69,6 +97,7 @@ enum LinkRouter {
         let url = unwrapRedirect(requested)
 
         guard let scheme = url.scheme?.lowercased() else { return .allowInApp }
+        if refusedSchemes.contains(scheme) { return .refuse }
         if scheme == "mailto" { return .compose(url) }
         guard scheme == "http" || scheme == "https" else { return .allowInApp }
         guard let host = url.host, !host.isEmpty else { return .allowInApp }
@@ -93,6 +122,10 @@ enum LinkRouter {
     ///   Calendar embed foreign content — ads, maps, tracked images — and
     ///   sending those to the browser would open a window per embed. A
     ///   subframe cannot navigate the page the user is looking at, so it stays.
+    ///   `.refuse` is the exception that ignores the frame entirely: a `file:`
+    ///   load is refused in a subframe too. WebKit's drag fallback aims at the
+    ///   main frame in practice, but nothing about the rule depends on that,
+    ///   and a local file has no business rendering in an embed either.
     /// - `isSSOEscorted`: a live `SSOEscort` pass authorises this one hop off
     ///   Google. A Workspace account is redirected to its own identity provider
     ///   on a host MailSpace has never heard of; handing that to the browser
@@ -1107,6 +1140,21 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         case .allowInApp:
             decisionHandler(.allow)
 
+        case .refuse:
+            // A file dropped on a part of the page that did not want it. A
+            // page that *does* want one — a compose window — never gets here:
+            // it takes the drop itself, WebKit hands it a real `File`, and no
+            // navigation is attempted at all. So by the time this runs there is
+            // nothing useful left to do with the file, and the only job is to
+            // leave the tab exactly where it was. `.cancel` does that: no
+            // provisional navigation, no commit, `webView.url` unchanged.
+            //
+            // Logged without the path, because a filename the owner chose is as
+            // much his content as the mail is, and `log show` keeps it for days
+            // where anything on this Mac can read it.
+            Log.info("ignored a file dropped onto the page; MailSpace does not open local files")
+            decisionHandler(.cancel)
+
         case .download(let url):
             // Recognised as a file body rather than a destination, and fetched
             // here because this is the only place the account's session exists.
@@ -1531,6 +1579,11 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
                 return nil
             case .compose(let mailto):
                 mailtoHandler?(mailto)
+                return nil
+            case .refuse:
+                // `window.open("file:///…")` gets no window, and no window is
+                // left behind empty either.
+                Log.info("refused to open a window on a local file")
                 return nil
             case .download:
                 // Falls through to a popup on purpose. `window.open(fileURL)`
