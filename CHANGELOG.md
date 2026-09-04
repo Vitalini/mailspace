@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-09-04
+
 ### Fixed
 - **Dropping a file on the page no longer loses your place.** Dragging anything
   from Finder onto the message list replaced the inbox with that file, and the
