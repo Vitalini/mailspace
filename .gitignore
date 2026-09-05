@@ -24,3 +24,6 @@ update-key
 
 # Internal plans, research and solutions all stay local
 docs/
+
+# CE vocabulary file, generated locally
+CONCEPTS.md
