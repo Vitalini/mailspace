@@ -988,6 +988,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         settingsWindowController.show()
     }
 
+    /// U0 probe (M1): proves ⌘/ reaches the app while a `WKWebView` is first
+    /// responder, before anything is built on top of that key. Replaced by the
+    /// real panel in U3.
+    @objc func showKeyboardShortcuts(_ sender: Any?) {
+        NSLog("MailSpace: showKeyboardShortcuts fired, sender=\(String(describing: sender))")
+    }
+
     /// A check he asked for: it always answers, including when the answer is
     /// "you are up to date" or "GitHub could not be reached".
     @objc func checkForUpdates(_ sender: Any?) {
@@ -1251,6 +1258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 enum MainMenu {
     static let accountsMenuTitle = "Accounts"
     static let viewMenuTitle = "View"
+    static let helpMenuTitle = "Help"
+    static let shortcutsItemTitle = "Keyboard Shortcuts…"
 
     static func build() -> NSMenu {
         let mainMenu = NSMenu()
@@ -1260,6 +1269,13 @@ enum MainMenu {
         mainMenu.addItem(viewMenuItem())
         mainMenu.addItem(accountsMenuItem())
         mainMenu.addItem(windowMenuItem())
+        let help = helpMenuItem()
+        mainMenu.addItem(help)
+        // Registering the submenu is what inserts the standard menu-item search
+        // field (R3) and moves the menu to the Help position. It happens here,
+        // not inside `helpMenuItem()`, so the builder stays callable from
+        // `swift test`, where `NSApp` is nil.
+        NSApp.helpMenu = help.submenu
         return mainMenu
     }
 
@@ -1353,5 +1369,26 @@ enum MainMenu {
         let item = submenuItem(menu)
         NSApp.windowsMenu = menu
         return item
+    }
+
+    /// R1, R2. One item: the keyboard cheat sheet, at ⌘/. `/` and `?` are used
+    /// nowhere else in the app, and Gmail's own search-focus binding is a bare
+    /// `/`, never ⌘/.
+    ///
+    /// Deliberately unlike `windowMenuItem()`, this touches no `NSApp`: it
+    /// builds the menu and returns the item, and `build()` does the
+    /// `NSApp.helpMenu` registration. `MainMenuHelpTests` calls it directly
+    /// under `swift test`, where `NSApp` is nil and an assignment here would
+    /// crash the suite rather than fail it. Internal, not private, for the same
+    /// reason.
+    static func helpMenuItem() -> NSMenuItem {
+        let menu = NSMenu(title: helpMenuTitle)
+        let shortcuts = menu.addItem(
+            withTitle: shortcutsItemTitle,
+            action: #selector(AppDelegate.showKeyboardShortcuts(_:)),
+            keyEquivalent: "/"
+        )
+        shortcuts.keyEquivalentModifierMask = [.command]
+        return submenuItem(menu)
     }
 }
