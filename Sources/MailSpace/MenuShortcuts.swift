@@ -17,7 +17,7 @@ struct MenuShortcutGroup: Equatable {
 
 /// The cheat sheet is a projection of the live menu bar, never a table kept
 /// beside it — a second list of shortcuts is a second thing to forget to update
-/// (KTD2, `docs/next-steps.md` §4).
+/// (KTD2).
 ///
 /// Everything here is pure: it takes the `NSMenu` it is given, reads no
 /// `NSApp`, and calls no `update()`. That is what lets `MenuShortcutsTests`
@@ -38,6 +38,11 @@ enum MenuShortcuts {
     /// the current first responder takes them. Separators, hidden items and
     /// items with no key equivalent are dropped, and a group left with nothing
     /// disappears with its header (R6).
+    ///
+    /// That empty-key-equivalent rule is also what keeps the Window menu clean:
+    /// the per-window entries AppKit appends itself through `addWindowsItem`
+    /// carry no key equivalent, so they never reach a row and no explicit
+    /// exclusion is needed for them.
     static func groups(of menuBar: NSMenu) -> [MenuShortcutGroup] {
         menuBar.items.compactMap { root in
             // The menu bar has no bare items; if one appears it has no group to

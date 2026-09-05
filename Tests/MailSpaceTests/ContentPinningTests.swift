@@ -2,8 +2,8 @@ import AppKit
 import XCTest
 @testable import MailSpace
 
-/// The three cheap wins from `docs/next-steps.md` §1, each of which is a rule
-/// small enough to pin down here rather than notice going wrong later.
+/// Three cheap wins, each of which is a rule small enough to pin down here
+/// rather than notice going wrong later.
 final class ContentPinningTests: XCTestCase {
     /// `refresh()` used to remove every subview and re-pin on every call —
     /// including a re-click of the tab already showing and every drag drop —

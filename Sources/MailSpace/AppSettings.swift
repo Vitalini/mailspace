@@ -52,9 +52,9 @@ enum DownloadFinishedAction: String, CaseIterable {
 
 /// App-level preferences, over `UserDefaults.standard`.
 ///
-/// The shape `docs/plans/2026-08-26-1224-feat-settings-window-plan.md` calls
-/// for (KTD-S1): one object, typed accessors, `registerDefaults` at launch, no
-/// framework. Per-account preferences are deliberately *not* here — they live
+/// The shape the settings-window plan calls for (KTD-S1): one object, typed
+/// accessors, `registerDefaults` at launch, no framework. Per-account
+/// preferences are deliberately *not* here — they live
 /// on `Account` in `accounts.json` (KTD-S2).
 ///
 /// The defaults domain follows the bundle identifier, so the self-test bundle
