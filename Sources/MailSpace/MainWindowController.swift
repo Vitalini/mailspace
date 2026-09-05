@@ -158,8 +158,13 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     /// B6. The only way back from a frame stranded on a display that is no
     /// longer attached. A rescue belongs in a menu, not in Settings.
+    ///
+    /// The shortcuts panel autosaves its own frame and can be stranded the same
+    /// way, with no menu item of its own, so this rescue clears it too — by the
+    /// controller's constant, never by a second copy of the string.
     func resetWindowPosition() {
         NSWindow.removeFrame(usingName: Self.frameAutosaveName)
+        NSWindow.removeFrame(usingName: ShortcutsWindowController.frameAutosaveName)
         window.setContentSize(NSSize(width: 1280, height: 840))
         window.center()
         window.makeKeyAndOrderFront(nil)

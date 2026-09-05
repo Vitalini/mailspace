@@ -58,8 +58,11 @@ enum MenuShortcuts {
     /// as it arrived (KTD2). A promoted name that has no group — Accounts with
     /// no accounts (R11) — is skipped, never inserted empty.
     static func orderedForDisplay(_ groups: [MenuShortcutGroup]) -> [MenuShortcutGroup] {
-        let promoted = promotedGroupTitles.compactMap { title in
-            groups.first { $0.title == title }
+        // `flatMap`, not `first`: the tail filter drops *every* group with a
+        // promoted title, so promoting only the first would lose a second
+        // group named "View". Identical output when the titles are unique.
+        let promoted = promotedGroupTitles.flatMap { title in
+            groups.filter { $0.title == title }
         }
         return promoted + groups.filter { !promotedGroupTitles.contains($0.title) }
     }

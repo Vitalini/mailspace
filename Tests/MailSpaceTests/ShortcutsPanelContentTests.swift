@@ -25,6 +25,20 @@ final class ShortcutsPanelContentTests: XCTestCase {
         view.list.arrangedSubviews.compactMap { $0 as? NSStackView }
     }
 
+    /// Every arranged subview flattened to the text it shows: a header is its
+    /// own string, a row is its title followed by its key string. Asserting the
+    /// whole sequence pins group order, row order and which header a row sits
+    /// under — none of which a map of view types can tell apart.
+    private func texts(_ view: ShortcutsContentView) -> [String] {
+        view.list.arrangedSubviews.flatMap { subview -> [String] in
+            if let label = subview as? NSTextField { return [label.stringValue] }
+            if let row = subview as? NSStackView {
+                return row.arrangedSubviews.compactMap { ($0 as? NSTextField)?.stringValue }
+            }
+            return []
+        }
+    }
+
     private func footer(_ view: ShortcutsContentView) -> NSTextField? {
         view.subviews.compactMap { $0 as? NSTextField }.first
     }
@@ -40,8 +54,11 @@ final class ShortcutsPanelContentTests: XCTestCase {
         XCTAssertEqual(headers(view), ["View", "Accounts"])
         XCTAssertEqual(rows(view).count, 4)
         XCTAssertEqual(
-            view.list.arrangedSubviews.map { $0 is NSTextField },
-            [true, false, false, true, false, false]
+            texts(view),
+            [
+                "View", "Mail", "⇧⌘M", "Calendar", "⇧⌘K",
+                "Accounts", "Work · Mail", "⌘1", "Work · Calendar", "⌘2"
+            ]
         )
     }
 

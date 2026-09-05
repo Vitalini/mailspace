@@ -210,6 +210,25 @@ final class MenuShortcutsTests: XCTestCase {
         )
     }
 
+    /// Two top-level menus with the same promoted name. The tail filter drops
+    /// every group whose title is promoted, so promotion has to keep every
+    /// match — promoting only the first would delete the second one outright.
+    func testEveryGroupSharingAPromotedTitleSurvives() {
+        let groups = [
+            group("MailSpace", [("About MailSpace", "⌘X")]),
+            group("View", [("Mail", "⇧⌘M")]),
+            group("View", [("Calendar", "⇧⌘K")])
+        ]
+
+        let ordered = MenuShortcuts.orderedForDisplay(groups)
+
+        XCTAssertEqual(ordered.map(\.title), ["View", "View", "MailSpace"])
+        XCTAssertEqual(
+            ordered.map { $0.rows.map(\.title) },
+            [["Mail"], ["Calendar"], ["About MailSpace"]]
+        )
+    }
+
     // MARK: - Glyph rendering
 
     /// R8. The glyph order is the one macOS prints, whatever order the mask was
