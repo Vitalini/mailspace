@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             }
         )
     )
+    /// Built on the first ⌘/ and kept for the process lifetime, like Settings.
+    private lazy var shortcutsWindowController = ShortcutsWindowController()
     private var loginProbe: LoginProbe?
     private var shimProbe: ShimProbe?
     private var autofillProbe: AutofillProbe?
@@ -988,11 +990,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         settingsWindowController.show()
     }
 
-    /// U0 probe (M1): proves ⌘/ reaches the app while a `WKWebView` is first
-    /// responder, before anything is built on top of that key. Replaced by the
-    /// real panel in U3.
+    /// ⌘/ — the keyboard cheat sheet.
     @objc func showKeyboardShortcuts(_ sender: Any?) {
-        NSLog("MailSpace: showKeyboardShortcuts fired, sender=\(String(describing: sender))")
+        shortcutsWindowController.show()
     }
 
     /// A check he asked for: it always answers, including when the answer is
