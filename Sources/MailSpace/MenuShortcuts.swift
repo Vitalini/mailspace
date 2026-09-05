@@ -117,30 +117,35 @@ enum MenuShortcuts {
     }
 
     /// Keys that arrive in `keyEquivalent` as one character with no printable
-    /// form of their own.
+    /// form of their own. Named through `NSEvent.SpecialKey` rather than written
+    /// as raw code points: AppKit owns these values, and the case name says
+    /// which key each row is for.
     private static let namedKeys: [Unicode.Scalar: String] = {
         var keys: [Unicode.Scalar: String] = [
-            "\u{000D}": "↩",   // Return
-            "\u{0003}": "⌅",   // Enter, keypad
-            "\u{0009}": "⇥",   // Tab
-            "\u{0019}": "⇤",   // Backtab
-            "\u{0008}": "⌫",   // Backspace
-            "\u{007F}": "⌫",   // Delete
-            "\u{F728}": "⌦",   // Forward delete
-            "\u{001B}": "⎋",   // Escape
-            "\u{0020}": "␣",   // Space
-            "\u{F700}": "↑",
-            "\u{F701}": "↓",
-            "\u{F702}": "←",
-            "\u{F703}": "→",
-            "\u{F72C}": "⇞",   // Page up
-            "\u{F72D}": "⇟",   // Page down
-            "\u{F729}": "↖",   // Home
-            "\u{F72B}": "↘"    // End
+            NSEvent.SpecialKey.carriageReturn.unicodeScalar: "↩",
+            NSEvent.SpecialKey.enter.unicodeScalar: "⌅",
+            NSEvent.SpecialKey.tab.unicodeScalar: "⇥",
+            NSEvent.SpecialKey.backTab.unicodeScalar: "⇤",
+            NSEvent.SpecialKey.backspace.unicodeScalar: "⌫",
+            NSEvent.SpecialKey.delete.unicodeScalar: "⌫",
+            NSEvent.SpecialKey.deleteForward.unicodeScalar: "⌦",
+            NSEvent.SpecialKey.upArrow.unicodeScalar: "↑",
+            NSEvent.SpecialKey.downArrow.unicodeScalar: "↓",
+            NSEvent.SpecialKey.leftArrow.unicodeScalar: "←",
+            NSEvent.SpecialKey.rightArrow.unicodeScalar: "→",
+            NSEvent.SpecialKey.pageUp.unicodeScalar: "⇞",
+            NSEvent.SpecialKey.pageDown.unicodeScalar: "⇟",
+            NSEvent.SpecialKey.home.unicodeScalar: "↖",
+            NSEvent.SpecialKey.end.unicodeScalar: "↘",
+            // Escape and Space are ordinary ASCII and have no `SpecialKey` case
+            // — OpenStep's reserved range does not cover them.
+            "\u{001B}": "⎋",
+            "\u{0020}": "␣"
         ]
-        // F1…F20 are contiguous from NSF1FunctionKey.
+        // F1…F20 are contiguous from `.f1`.
+        let firstFunctionKey = NSEvent.SpecialKey.f1.unicodeScalar.value
         for index in 0..<20 {
-            guard let scalar = Unicode.Scalar(0xF704 + index) else { continue }
+            guard let scalar = Unicode.Scalar(firstFunctionKey + UInt32(index)) else { continue }
             keys[scalar] = "F\(index + 1)"
         }
         return keys
