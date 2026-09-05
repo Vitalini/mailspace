@@ -2,10 +2,9 @@ import AppKit
 
 /// The Settings window, ⌘, .
 ///
-/// Programmatic `NSWindow` plus an `NSToolbar` whose items select panes
-/// (`docs/plans/2026-08-26-1224-feat-settings-window-plan.md`, U1): General
-/// carries the app-wide behaviour, Accounts the per-account switches and the
-/// add/edit/remove buttons.
+/// Programmatic `NSWindow` plus an `NSToolbar` whose items select panes:
+/// General carries the app-wide behaviour, Accounts the per-account switches
+/// and the add/edit/remove buttons.
 final class SettingsWindowController: NSObject, NSToolbarDelegate {
     private struct Pane {
         let identifier: NSToolbarItem.Identifier

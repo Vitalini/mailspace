@@ -18,3 +18,9 @@ build/
 accounts.json
 dist/
 update-key
+
+# Local CE routing, per checkout
+.compound-engineering/config.local.yaml
+
+# Internal plans, research and solutions all stay local
+docs/
