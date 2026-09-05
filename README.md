@@ -1,8 +1,7 @@
 # MailSpace
 
 Personal macOS app wrapping Gmail and Google Calendar — a replacement for the
-discontinued Mailplane. Single user, never distributed. See
-[docs/mailspace-requirements.md](docs/mailspace-requirements.md).
+discontinued Mailplane. Single user, never distributed.
 
 ## Build
 
@@ -227,7 +226,5 @@ Run it once. Without it the build still works — it falls back to ad-hoc signin
 ad-hoc gives the app a new identity on every rebuild, so macOS asks for notification
 permission again after each `make build`.
 
-Details, how notifications actually reach Notification Center, what the probes do and do
-not prove, and what to check when a banner does not appear (a Focus mode suppresses
-banners for every app while still delivering the notification):
-[docs/notifications.md](docs/notifications.md).
+When a banner does not appear, check Focus first: a Focus mode suppresses banners for
+every app while still delivering the notification.

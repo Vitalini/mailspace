@@ -293,7 +293,7 @@ case "$SHIM_OUT" in
     echo "       $SHIM_OUT"
     echo "       The self-test identity holds no notification authorization, so nothing"
     echo "       could be read back from Notification Center. The JS-to-bridge half of"
-    echo "       the path passed; the native half is unverified. See docs/notifications.md."
+    echo "       the path passed; the native half is unverified."
     ;;
   *) fail "notifications: $SHIM_OUT" ;;
 esac

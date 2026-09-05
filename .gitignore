@@ -21,3 +21,6 @@ update-key
 
 # Local CE routing, per checkout
 .compound-engineering/config.local.yaml
+
+# Internal plans and research stay local
+docs/
