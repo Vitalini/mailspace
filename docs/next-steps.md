@@ -53,8 +53,9 @@ Batched afterwards, hours each: next/previous tab (verify ⌃⇥ reaches the men
 - Command palette, menu-bar extra, Services menu, global hotkey, AppleScript dictionary, send-to-task-manager — plausible, all below the line.
 - Label-as-entry-point tab — breaks `AuthSurface.isSignedIn` and `recoverIfStalled`, which compare against `view.url`.
 - Notification digest — destroys click-through to the right account, duplicates per-account muting.
-- Shortcut cheat sheet — a second source of truth for what the menus render.
 
 ## 4. Already planned
 
 Per-tab unread pills and the Calendar next-event countdown are already specced (`docs/plans`; countdown plan 9fb6d2f, same-origin fetch of `calendar.google.com/calendar/u/0/htmlembed` in AGENDA mode). The pill appears above only because it needs the Primary-only decision made; the countdown is unchanged and is not a new idea. One live conflict: the countdown needs a loaded Calendar page, so it rules out lazy or evicted Calendar webviews unless it moves to a cookie-based `URLSession` fetch.
+
+Shortcut cheat sheet — specced in `docs/plans/2026-09-04-1743-feat-shortcut-cheat-sheet-plan.md`, and moved here out of §3. The objection that put it under "deliberately not doing" was that a hand-written table is a second source of truth for what the menus render. The plan removes it: the sheet is walked out of the live `NSApp.mainMenu` on every open, so it is a view of the menus rather than a copy of them, and the ⌘1…9 tab rows come from the Accounts menu the window controller already rebuilds.

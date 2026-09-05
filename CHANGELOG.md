@@ -10,6 +10,15 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Added
+- **Every shortcut MailSpace has, on one screen.** `Help ▸ Keyboard
+  Shortcuts…`, or ⌘/, opens a list of every shortcut the menus define —
+  ⇧⌘M and ⇧⌘K for Mail and Calendar, ⌘1…9 for your tabs, and the rest —
+  grouped the way the menu bar groups them. It is read out of the menus
+  themselves each time it opens, so it cannot tell you something the menus
+  do not. Esc or ⌘W closes it. Gmail and Calendar keep their own shortcuts,
+  still behind `?` inside the page.
+
 ## [1.1.3] - 2026-09-04
 
 ### Fixed
