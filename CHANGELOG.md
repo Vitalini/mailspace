@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-04
+
 ### Added
 - **Every shortcut MailSpace has, on one screen.** `Help ▸ Keyboard
   Shortcuts…`, or ⌘/, opens a list of every shortcut the menus define —
