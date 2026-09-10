@@ -30,15 +30,18 @@ enum UserAgent {
     /// Advertised when Safari cannot be found or its version cannot be read.
     ///
     /// One Safari major behind is still inside Google's current-and-previous
-    /// window; two is not. `UserAgentTests` bounds this against the installed
-    /// Safari so it cannot go quietly stale.
+    /// window; two is not. `UserAgentTests` bounds this against whatever Safari
+    /// is installed on the machine running the suite, so the bound only bites on
+    /// a Mac kept current — CI on `macos-14` carries an older Safari and passes
+    /// it trivially. A developer's own run is what keeps this constant honest.
     static let fallbackVersion = "26.6"
 
-    /// Two or three ASCII-digit parts, whole-string. ASCII rather than `\d` so
-    /// everything accepted here is also something `SemanticVersion` can parse;
-    /// two parts minimum for the same reason — `SemanticVersion` refuses a bare
-    /// major.
-    private static let versionPattern = "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"
+    /// Two or three ASCII-digit parts, whole-string, four digits each at most.
+    /// Every clause is there so that everything accepted here is also something
+    /// `SemanticVersion` can parse: ASCII rather than `\d`, two parts minimum
+    /// because it refuses a bare major, and the length bound because it parses
+    /// each part into an `Int` that an unbounded digit run overflows.
+    private static let versionPattern = "^[0-9]{1,4}\\.[0-9]{1,4}(\\.[0-9]{1,4})?$"
 
     /// Read once per process: `static let` initialisation is lazy, thread-safe
     /// and happens exactly once, so the LaunchServices lookup and the plist
@@ -77,11 +80,15 @@ enum UserAgent {
         return info["CFBundleShortVersionString"] as? String
     }
 
+    /// Compiled once for the process rather than per call, since the pattern is
+    /// a constant and `resolve` runs on every version the app is handed.
+    private static let versionRegex = try? Regex(versionPattern)
+
     /// `wholeMatch` rather than a search, so a well-formed first line of a
     /// multi-line value cannot pass for the value: the whole-string guarantee
     /// is the API's, not a range comparison maintained here.
-    private static func isWellFormed(_ version: String) -> Bool {
-        guard let regex = try? Regex(versionPattern) else { return false }
+    static func isWellFormed(_ version: String) -> Bool {
+        guard let regex = versionRegex else { return false }
         return (try? regex.wholeMatch(in: version)) != nil
     }
 }

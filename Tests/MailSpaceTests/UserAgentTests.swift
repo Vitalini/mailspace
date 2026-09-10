@@ -14,6 +14,10 @@ final class UserAgentTests: XCTestCase {
     private let frozenPrefix =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
 
+    /// Every shape the resolver accepts. Two tests read it: one that an accepted
+    /// version is advertised verbatim, one that `SemanticVersion` can parse it.
+    private let accepted = ["26.6", "26.6.2", "18.0", "0.0", "9999.9999.9999"]
+
     // MARK: - Shape
 
     func testTheUserAgentIsTheFrozenPrefixThenOneSpaceThenTheApplicationName() {
@@ -27,10 +31,10 @@ final class UserAgentTests: XCTestCase {
             UserAgent.applicationName,
             "Version/\(UserAgent.safariVersion) Safari/605.1.15"
         )
-        // `resolve` returns its input unchanged only for a version it accepts,
-        // so this asserts the advertised version is a well-formed one without
-        // restating the validation rule.
-        XCTAssertEqual(UserAgent.resolve(installed: UserAgent.safariVersion), UserAgent.safariVersion)
+        XCTAssertTrue(
+            UserAgent.isWellFormed(UserAgent.safariVersion),
+            "\(UserAgent.safariVersion) is advertised but is not a version the resolver accepts"
+        )
     }
 
     // MARK: - Freshness
@@ -81,9 +85,20 @@ final class UserAgentTests: XCTestCase {
     // MARK: - Validation and fallback
 
     func testAWellFormedVersionIsCarriedVerbatim() {
-        XCTAssertEqual(UserAgent.resolve(installed: "26.6.2"), "26.6.2")
-        XCTAssertEqual(UserAgent.resolve(installed: "26.6"), "26.6")
-        XCTAssertEqual(UserAgent.resolve(installed: "18.0"), "18.0")
+        for value in accepted {
+            XCTAssertEqual(UserAgent.resolve(installed: value), value)
+        }
+    }
+
+    /// The two validators must agree: `UserAgent` decides what is advertised and
+    /// `testTheFallbackConstantHasNotGoneStale` compares majors through
+    /// `SemanticVersion`, so anything the first accepts the second must parse.
+    /// This is what bounds the digit runs in the pattern — an unbounded run
+    /// passes the regex and then overflows `SemanticVersion`'s `Int`.
+    func testEverythingTheResolverAcceptsAlsoParsesAsASemanticVersion() {
+        for value in accepted {
+            XCTAssertNotNil(SemanticVersion(value), "\(value) is advertised but does not parse")
+        }
     }
 
     func testAnythingElseFallsBackToTheConstant() {
@@ -99,7 +114,8 @@ final class UserAgentTests: XCTestCase {
             ".6",
             "26.6 ",
             " 26.6",
-            "26.6.2\n26.6"  // `^…$` must not be satisfied by one line of a multi-line value
+            "26.6.2\n26.6",  // `^…$` must not be satisfied by one line of a multi-line value
+            "12345678901234567890.0"  // 20 digits: overflows the `Int` SemanticVersion parses into
         ]
         for value in refused {
             XCTAssertEqual(
@@ -111,7 +127,7 @@ final class UserAgentTests: XCTestCase {
     }
 
     func testTheFallbackConstantIsItselfSomethingTheResolverAccepts() {
-        XCTAssertEqual(UserAgent.resolve(installed: UserAgent.fallbackVersion), UserAgent.fallbackVersion)
+        XCTAssertTrue(UserAgent.isWellFormed(UserAgent.fallbackVersion))
         XCTAssertNotNil(SemanticVersion(UserAgent.fallbackVersion))
     }
 
