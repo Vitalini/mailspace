@@ -17,14 +17,15 @@ import AppKit
 /// AppKit only — the resolver stays testable in a process that has never
 /// instantiated a WebKit object.
 enum UserAgent {
+    /// WebKit's build number, which is not the Safari version and does not
+    /// move with it. Safari sends it twice — once in the `AppleWebKit/` prefix
+    /// and once in the `Safari/` tail — so it is one constant here.
+    private static let webKitBuild = "605.1.15"
+
     /// WebKit's own prefix. Frozen: this is what Safari itself sends, down to
     /// the `10_15_7` that stopped tracking the real macOS version years ago.
     private static let webKitPrefix =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-
-    /// WebKit's build number, which is not the Safari version and does not
-    /// move with it.
-    private static let webKitBuild = "605.1.15"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/\(webKitBuild) (KHTML, like Gecko)"
 
     /// Advertised when Safari cannot be found or its version cannot be read.
     ///
@@ -76,12 +77,11 @@ enum UserAgent {
         return info["CFBundleShortVersionString"] as? String
     }
 
-    /// Matched against the whole string, so a well-formed first line of a
-    /// multi-line value cannot pass for the value.
+    /// `wholeMatch` rather than a search, so a well-formed first line of a
+    /// multi-line value cannot pass for the value: the whole-string guarantee
+    /// is the API's, not a range comparison maintained here.
     private static func isWellFormed(_ version: String) -> Bool {
-        guard let regex = try? NSRegularExpression(pattern: versionPattern) else { return false }
-        let whole = NSRange(version.startIndex..<version.endIndex, in: version)
-        guard let match = regex.firstMatch(in: version, range: whole) else { return false }
-        return match.range == whole
+        guard let regex = try? Regex(versionPattern) else { return false }
+        return (try? regex.wholeMatch(in: version)) != nil
     }
 }
