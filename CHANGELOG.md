@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-10
+
 ### Fixed
 - **Gmail no longer says your browser is out of date.** Every Mail tab opened
   with a "This browser version is no longer supported" banner, because MailSpace
