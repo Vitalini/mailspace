@@ -16,18 +16,18 @@ struct ScriptReplyHandler {
 
 /// Builds the per-account WebKit configuration and the webviews on top of it.
 enum WebViewFactory {
-    /// Safari 17.6 desktop user agent.
+    /// The desktop Safari user agent, carrying the version of the Safari
+    /// installed on this Mac — read once by `UserAgent`, not written down here.
     ///
     /// Google refuses `accounts.google.com` sign-in to user agents it reads as
-    /// an embedded browser (`disallowed_useragent`). The engine here genuinely
-    /// *is* WebKit, so presenting Safari's UA is accurate rather than a spoof.
-    /// If Google tightens detection, bump this one constant first.
-    static let userAgent =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+    /// an embedded browser (`disallowed_useragent`), which is any agent with no
+    /// `Version/… Safari/…` tail. The engine here genuinely *is* WebKit, so
+    /// presenting Safari's UA is accurate rather than a spoof.
+    static let userAgent = UserAgent.userAgent
 
     /// The `applicationNameForUserAgent` suffix WebKit also exposes to pages
     /// that sniff it separately from `navigator.userAgent`.
-    static let applicationName = "Version/17.6 Safari/605.1.15"
+    static let applicationName = UserAgent.applicationName
 
     /// One configuration per account. Mail and Calendar share it (and therefore
     /// the same `WKWebsiteDataStore`), so one Google sign-in covers both.

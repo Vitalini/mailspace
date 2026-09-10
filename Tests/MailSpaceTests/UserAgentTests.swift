@@ -99,7 +99,7 @@ final class UserAgentTests: XCTestCase {
             ".6",
             "26.6 ",
             " 26.6",
-            "26.6.2\n17.6"  // `^…$` must not be satisfied by one line of a multi-line value
+            "26.6.2\n26.6"  // `^…$` must not be satisfied by one line of a multi-line value
         ]
         for value in refused {
             XCTAssertEqual(
@@ -113,5 +113,20 @@ final class UserAgentTests: XCTestCase {
     func testTheFallbackConstantIsItselfSomethingTheResolverAccepts() {
         XCTAssertEqual(UserAgent.resolve(installed: UserAgent.fallbackVersion), UserAgent.fallbackVersion)
         XCTAssertNotNil(SemanticVersion(UserAgent.fallbackVersion))
+    }
+
+    // MARK: - What the rest of the app reads
+    //
+    // `NavigationPolicy` and `SelfTest` read the two names off
+    // `WebViewFactory`, so those are the strings that actually reach a page.
+    // Reading a `static let String` off it instantiates no WebKit object, and
+    // this file still imports no WebKit.
+
+    func testWebViewFactoryForwardsTheUserAgent() {
+        XCTAssertEqual(WebViewFactory.userAgent, UserAgent.userAgent)
+    }
+
+    func testWebViewFactoryForwardsTheApplicationName() {
+        XCTAssertEqual(WebViewFactory.applicationName, UserAgent.applicationName)
     }
 }
