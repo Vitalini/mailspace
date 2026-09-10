@@ -10,6 +10,13 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Fixed
+- **Gmail no longer says your browser is out of date.** Every Mail tab opened
+  with a "This browser version is no longer supported" banner, because MailSpace
+  announced a Safari version from two releases ago. It now announces the Safari
+  installed on your Mac, and keeps up with it on its own — the next Safari
+  update is enough, with no MailSpace update behind it.
+
 ## [1.2.0] - 2026-09-04
 
 ### Added
