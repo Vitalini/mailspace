@@ -54,6 +54,11 @@ import WebKit
 /// webview on a non-persistent store, `loadHTMLString`, no `htmlembed` fetch, no
 /// signed-in session, no real calendar.
 ///
+/// `MAILSPACE_SELFTEST=meetinglink` does the same for the Join lookup: the
+/// shipped `msFindMeetingLink` runs over every fixture in `MeetingLinkFixtures`
+/// and must agree with `MeetingLink` and with the fixture's expected answer. It
+/// touches no network and no real calendar, and its line carries counts only.
+///
 /// `MAILSPACE_SELFTEST=downloads` drives the shipping `NavigationPolicy` through
 /// every shape a Gmail attachment download arrives in — a plain link, a
 /// `target="_blank"` link, `window.open`, a response that carries no
@@ -108,6 +113,9 @@ enum SelfTest {
         /// arrives intact for the second.
         case drop
         case agenda
+        /// Runs the shipped meeting-link lookup over every hand-written
+        /// fixture and asserts it agrees with `MeetingLink`.
+        case meetinglink
     }
 
     /// The throwaway identity self-tests run under. Assembled by
@@ -1535,6 +1543,152 @@ final class AgendaProbe: NSObject, WKNavigationDelegate {
         SelfTest.finish(
             "agenda result=ok fixtures=\(AgendaFixtures.all.count) compared=\(compared) "
             + "mismatches=0 network=none"
+        )
+    }
+}
+
+
+/// Proves the meeting-link lookup that ships and the one that is tested agree.
+///
+/// The lookup runs in the Calendar page, because the page holds event titles
+/// and its event list (KTD16). This probe first runs the shipped allow-list
+/// over `MeetingLinkFixtures`' allowed and refused URLs, then parses each
+/// hand-written fixture with `DOMParser` in an offscreen webview, runs the
+/// **production** `msFindMeetingLink` over it with the fixture's title as an
+/// argument and the fixture's event page as a stand-in for the fetch, and
+/// compares the answer with `MeetingLink` and with the fixture's expected
+/// value. Its line names fixtures and counts, never a URL or a title.
+final class MeetingLinkProbe: NSObject, WKNavigationDelegate {
+    private let webView: WKWebView
+    private var pending = MeetingLinkFixtures.all
+    private var mismatches: [String] = []
+    private var compared = 0
+    private var urlsChecked = 0
+    private var identitiesChecked = 0
+    private var started = false
+
+    override init() {
+        webView = WebViewFactory.makeWebView(configuration: SelfTest.makeProbeConfiguration())
+        super.init()
+        webView.navigationDelegate = self
+    }
+
+    func run(timeout: TimeInterval = 60) {
+        SelfTest.armWatchdog(timeout) { [weak self] in
+            "meetinglink result=TIMEOUT compared=\(self?.compared ?? 0)"
+        }
+        SelfTest.presentOffscreen(webView)
+        webView.loadHTMLString(
+            "<html><head><title>meetinglink self-test</title></head><body></body></html>",
+            baseURL: URL(string: "about:blank")
+        )
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !started else { return }
+        started = true
+        checkAllowList()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        SelfTest.finish("meetinglink result=FAILED reason=page-load")
+    }
+
+    /// The page's `msMeetingAllowed` over the one shared URL table.
+    private func checkAllowList() {
+        let allowed = MeetingLinkFixtures.allowedURLs
+        let refused = MeetingLinkFixtures.refusedURLs
+        webView.callAsyncJavaScript(
+            MeetingLinkScript.findFunction
+                + "\n\nreturn [allowed.map(msMeetingAllowed), refused.map(msMeetingAllowed), "
+                + "ids.map(function (id) { const found = msMeetingIdentity(id); return [found.series, found.timestamp]; })];",
+            arguments: ["allowed": allowed, "refused": refused, "ids": MeetingLinkFixtures.identityCases],
+            in: nil,
+            in: .defaultClient
+        ) { [weak self] result in
+            guard let self else { return }
+            if case .success(let value) = result, let answers = value as? [Any], answers.count == 3,
+               let allowedAnswers = answers[0] as? [Bool], let refusedAnswers = answers[1] as? [Bool],
+               let identities = answers[2] as? [[String]] {
+                self.urlsChecked = allowedAnswers.count + refusedAnswers.count
+                for (index, accepted) in allowedAnswers.enumerated() where !accepted {
+                    self.mismatches.append("allowed#\(index):js")
+                }
+                for (index, accepted) in refusedAnswers.enumerated() where accepted {
+                    self.mismatches.append("refused#\(index):js")
+                }
+                self.identitiesChecked = identities.count
+                for (index, id) in MeetingLinkFixtures.identityCases.enumerated() {
+                    let swift = MeetingLink.identity(of: id)
+                    if index >= identities.count || identities[index] != [swift.series, swift.timestamp] {
+                        self.mismatches.append("identity#\(index)")
+                    }
+                }
+            } else {
+                self.mismatches.append("allow-list:script-error")
+            }
+            self.compareNext()
+        }
+    }
+
+    private func compareNext() {
+        guard let next = pending.first else { return report() }
+        pending.removeFirst()
+
+        let swift = MeetingLink.find(html: next.html, title: next.title) { _ in next.fetched }
+        webView.callAsyncJavaScript(
+            MeetingLinkScript.findFunction
+                + "\n\nreturn await msFindMeetingLink(new DOMParser().parseFromString(html, 'text/html'), title, "
+                + "async function () { return fetched; });",
+            arguments: ["html": next.html, "title": next.title, "fetched": next.fetched ?? NSNull()],
+            in: nil,
+            in: .defaultClient
+        ) { [weak self] result in
+            guard let self else { return }
+            self.compared += 1
+            switch result {
+            case .failure:
+                self.mismatches.append("\(next.name):script-error")
+            case .success(let value):
+                if let complaint = Self.disagreement(swift: swift, expected: next.expected, javaScript: value) {
+                    self.mismatches.append("\(next.name):\(complaint)")
+                }
+            }
+            self.compareNext()
+        }
+    }
+
+    /// `nil` when all three agree. Complaints name which field differs, never
+    /// its value.
+    private static func disagreement(swift: MeetingLink.Match, expected: MeetingLink.Match, javaScript value: Any) -> String? {
+        guard let payload = value as? [String: Any], (payload["ok"] as? Bool) == true else { return "no-payload" }
+        let javaScript = MeetingLink.Match(
+            url: payload["url"] as? String,
+            links: (payload["links"] as? Int) ?? -1,
+            fetched: (payload["fetched"] as? Bool) ?? false
+        )
+        if swift != expected { return "swift-vs-expected" }
+        if javaScript.url != swift.url { return "url" }
+        if javaScript.links != swift.links { return "links swift=\(swift.links) js=\(javaScript.links)" }
+        if javaScript.fetched != swift.fetched { return "fetched" }
+        return nil
+    }
+
+    private func report() {
+        let total = MeetingLinkFixtures.all.count
+        guard mismatches.isEmpty else {
+            SelfTest.finish(
+                "meetinglink result=FAILED fixtures=\(total) compared=\(compared) urls=\(urlsChecked) "
+                + "mismatches=\(mismatches.count) at=\(mismatches.joined(separator: ","))"
+            )
+        }
+        SelfTest.finish(
+            "meetinglink result=ok fixtures=\(total) compared=\(compared) urls=\(urlsChecked) "
+            + "ids=\(identitiesChecked) mismatches=0 network=none"
         )
     }
 }

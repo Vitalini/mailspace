@@ -71,6 +71,65 @@ final class NotificationPolicyTests: XCTestCase {
         XCTAssertTrue(NotificationShim.userScript.source.contains("MailSpaceNotification.maxActions = 0;"))
     }
 
+    // MARK: - R32: Calendar key names
+
+    func testTheShimForwardsKeyNamesACountAndOneLink() {
+        let source = NotificationShim.userScript.source
+        XCTAssertTrue(source.contains("optionKeys: keysOf(options)"))
+        XCTAssertTrue(source.contains("dataKeys: keysOf(data)"))
+        XCTAssertTrue(source.contains("actionCount: countActions(options)"))
+        XCTAssertTrue(source.contains("dataLink: meetingLinkIn(data)"))
+    }
+
+    /// Calendar's `data` is page content; only its key names and one
+    /// candidate link may cross (KTD18).
+    func testTheShimNeverForwardsTheDataObject() {
+        let source = NotificationShim.userScript.source
+        XCTAssertFalse(source.contains("data: options.data"))
+        XCTAssertFalse(source.contains("data: data"))
+    }
+
+    /// Two different meeting strings are no link at all.
+    func testTheShimOffersADataLinkOnlyWhenThereIsExactlyOne() {
+        let source = NotificationShim.userScript.source
+        XCTAssertTrue(source.contains("} else if (found !== value) {"))
+    }
+
+    func testTheCalendarLineCarriesNamesAndCountsOnly() {
+        let title = "Weekly sync"
+        let body = "Tomorrow at 10:00"
+        let link = "https://meet.google.com/abc-defg-hij"
+
+        let line = CalendarNotificationLine.make(
+            optionKeys: ["body", "tag", "data"],
+            dataKeys: ["eventId"],
+            actionCount: 2,
+            join: .data,
+            links: 0
+        )
+
+        XCTAssertEqual(line, "calendar notification keys=body,tag,data data=eventId actions=2 join=data links=0")
+        XCTAssertFalse(line.contains(title))
+        XCTAssertFalse(line.contains(body))
+        XCTAssertFalse(line.contains(link))
+        XCTAssertFalse(line.contains("meet.google.com"))
+    }
+
+    /// A key name that is not an identifier could be content; it is masked.
+    func testTheCalendarLineMasksKeysThatAreNotIdentifiers() {
+        let line = CalendarNotificationLine.make(
+            optionKeys: [], dataKeys: ["eventId", "Weekly sync with Bob"], actionCount: 0, join: .fetch, links: 1
+        )
+
+        XCTAssertEqual(line, "calendar notification keys=- data=eventId,? actions=0 join=fetch links=1")
+    }
+
+    /// R32's source vocabulary, exactly.
+    func testTheJoinSourcesAreTheR32Vocabulary() {
+        let sources: [JoinSource] = [.data, .page, .fetch, .none, .error, .timeout, .noWebView]
+        XCTAssertEqual(sources.map(\.rawValue), ["data", "page", "fetch", "none", "error", "timeout", "no-webview"])
+    }
+
     // MARK: - B1
 
     func testTheTabOnScreenGetsNoBanner() {

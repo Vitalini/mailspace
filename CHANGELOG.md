@@ -10,6 +10,13 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Added
+- **Join a meeting from its reminder.** When a Calendar reminder is for an
+  event with a Google Meet, Zoom or Teams link, it gets a Join button that
+  opens the meeting in your browser. A recurring meeting gets it when every
+  instance has the same link. Events without a link, or with same-named events
+  that disagree on the link, get no button.
+
 ## [1.3.0] - 2026-10-15
 
 ### Added
