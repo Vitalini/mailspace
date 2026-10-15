@@ -146,7 +146,7 @@ enum MeetingLinkScript {
       const scripts = root.querySelectorAll('script');
       for (let i = 0; i < scripts.length; i++) {
         const text = scripts[i].textContent || '';
-        if (text.indexOf('\(MeetingLink.eventURLMarker)') < 0) { continue; }
+        if (text.indexOf('\(MeetingLink.eventListMarker)') < 0) { continue; }
         let json;
         try { json = JSON.parse(text.trim()); } catch (error) { continue; }
         msMeetingRecords(json, key, records);

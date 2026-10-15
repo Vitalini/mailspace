@@ -211,6 +211,15 @@ enum MeetingLinkFixtures {
             expected: found(meet)
         ),
         Fixture(
+            name: "list-escapes-equals-sign",
+            title: "Weekly sync",
+            html: page(chip("ev1", "Weekly sync") + script(
+                json(["placeholder-list", [record("ev1", "Weekly sync", [meet])]])
+                    .replacingOccurrences(of: "eid=", with: "eid\\u003d")
+            )),
+            expected: found(meet)
+        ),
+        Fixture(
             name: "record-as-object",
             title: "Weekly sync",
             html: page(chip("ev1", "Weekly sync") + script(json([

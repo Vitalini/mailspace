@@ -47,6 +47,11 @@ enum MeetingLink {
     /// What an event record's own URL contains, followed by the event id.
     static let eventURLMarker = "/calendar/event?eid="
 
+    /// What a script must contain, raw, to be parsed as an event list. Shorter
+    /// than `eventURLMarker` on purpose: the page's JSON escapes `=` as
+    /// `\u003d`, so the full marker only appears after parsing.
+    static let eventListMarker = "/calendar/event?eid"
+
     /// The event page the fetch fallback asks for, relative to the page origin.
     static let eventPagePath = "/calendar/event?eid="
 
@@ -152,7 +157,7 @@ enum MeetingLink {
     private static func recordLinks(in root: Element, eventId: String) -> [String]? {
         var records: [Any] = []
         for script in [root] + root.elements() where script.name == "script" {
-            guard let body = script.rawText, body.contains(eventURLMarker),
+            guard let body = script.rawText, body.contains(eventListMarker),
                   let data = body.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
             else { continue }
