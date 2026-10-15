@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-15
+
 ### Added
 - **Copy a sign-in code straight from the notification.** When a Gmail
   notification carries a one-time code, such as "Your verification code is
