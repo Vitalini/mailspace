@@ -121,7 +121,7 @@ enum MeetingLinkScript {
     // MeetingLink.identity(of:).
     function msMeetingIdentity(eventId) {
       const key = msMeetingEventKey(eventId);
-      const malformed = { series: '#' + key, timestamp: '' };
+      const malformed = { series: '\(MeetingLink.malformedSeriesPrefix)' + key, timestamp: '' };
       if (!/^[A-Za-z0-9_-]+$/.test(key)) { return malformed; }
       let base64 = key.replace(/-/g, '+').replace(/_/g, '/');
       while (base64.length % 4 !== 0) { base64 += '='; }
@@ -148,13 +148,12 @@ enum MeetingLinkScript {
       return best;
     }
 
-    // The event id an event URL names, decoded and without padding; null when
-    // the string is not an event URL.
+    // The event id an event-URL member names, decoded and without padding;
+    // null unless the whole string is such a URL.
     function msMeetingEventIdInURL(value) {
-      const marker = '\(MeetingLink.eventURLMarker)';
-      const at = value.indexOf(marker);
-      if (at < 0) { return null; }
-      let raw = value.slice(at + marker.length);
+      const prefix = '\(MeetingLink.eventURLPrefix)';
+      if (value.indexOf(prefix) !== 0 || /\\s/.test(value)) { return null; }
+      let raw = value.slice(prefix.length);
       const end = raw.search(/[&#]/);
       if (end >= 0) { raw = raw.slice(0, end); }
       let decoded = raw;
@@ -170,13 +169,18 @@ enum MeetingLinkScript {
     function msMeetingRecords(value, matches, records) {
       if (value === null || typeof value !== 'object') { return; }
       const members = msMeetingMembers(value);
+      // A container with an event-URL member is a record. It belongs to an
+      // event only when it names exactly one; a record naming two events is
+      // nobody's, and is not searched further.
+      const named = [];
       for (let i = 0; i < members.length; i++) {
         if (typeof members[i] !== 'string') { continue; }
         const id = msMeetingEventIdInURL(members[i]);
-        if (id !== null && matches(id)) {
-          records.push(value);
-          return;
-        }
+        if (id !== null && named.indexOf(id) < 0) { named.push(id); }
+      }
+      if (named.length > 0) {
+        if (named.length === 1 && matches(named[0])) { records.push(value); }
+        return;
       }
       for (let i = 0; i < members.length; i++) { msMeetingRecords(members[i], matches, records); }
     }
@@ -255,15 +259,15 @@ enum MeetingLinkScript {
       // Several series with one title: every event must have its record,
       // and every record the same one link. Never fetched.
       if (ids.length > \(MeetingLink.maxRecurringRecords)) { return nothing; }
-      const perEvent = [];
+      // Each record is judged on its own, as in the one-series case.
+      const perRecord = [];
       for (let i = 0; i < ids.length; i++) {
         const key = msMeetingEventKey(ids[i]);
         const found = msMeetingRecordLinks(root, function (id) { return id === key; });
-        let all = [];
-        for (let j = 0; j < found.length; j++) { all = all.concat(found[j]); }
-        perEvent.push(found.length === 0 ? null : msMeetingDistinct(all));
+        if (found.length === 0) { perRecord.push(null); }
+        for (let j = 0; j < found.length; j++) { perRecord.push(found[j]); }
       }
-      return msMeetingAgreeing(perEvent, false);
+      return msMeetingAgreeing(perRecord, false);
     }
     """
 
@@ -273,17 +277,47 @@ enum MeetingLinkScript {
     static let pageScript = findFunction + """
 
 
+    // The event page, same-origin only, at most `fetchByteLimit` bytes, and
+    // given up before Swift's deadline (`abortAfterMs`, an argument).
     async function msMeetingFetchPage(eventId) {
+      const limit = \(MeetingLink.fetchByteLimit);
+      const abortAfter = typeof abortAfterMs === 'number' ? abortAfterMs : \(JoinLookup.scriptAbortMilliseconds);
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
-      const timer = controller ? setTimeout(function () { controller.abort(); }, \(Int(JoinLookup.deadline * 1000))) : null;
+      const timer = controller ? setTimeout(function () { controller.abort(); }, abortAfter) : null;
       try {
         const response = await fetch('\(MeetingLink.eventPagePath)' + eventId, {
-          credentials: 'include',
+          credentials: 'same-origin',
+          redirect: 'follow',
           signal: controller ? controller.signal : undefined
         });
         if (!response.ok) { return null; }
         if (new URL(response.url, location.href).origin !== location.origin) { return null; }
-        return await response.text();
+        const declared = Number(response.headers.get('content-length'));
+        if (declared > limit) {
+          if (controller) { controller.abort(); }
+          return null;
+        }
+        if (!response.body || typeof response.body.getReader !== 'function') {
+          const text = await response.text();
+          return text.length > limit ? null : text;
+        }
+        const reader = response.body.getReader();
+        const chunks = [];
+        let size = 0;
+        for (;;) {
+          const step = await reader.read();
+          if (step.done) { break; }
+          size += step.value.byteLength;
+          if (size > limit) {
+            try { await reader.cancel(); } catch (error) { }
+            return null;
+          }
+          chunks.push(step.value);
+        }
+        const bytes = new Uint8Array(size);
+        let at = 0;
+        for (let i = 0; i < chunks.length; i++) { bytes.set(chunks[i], at); at += chunks[i].byteLength; }
+        return new TextDecoder('utf-8').decode(bytes);
       } finally {
         if (timer !== null) { clearTimeout(timer); }
       }

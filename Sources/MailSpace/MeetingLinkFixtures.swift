@@ -155,6 +155,8 @@ enum MeetingLinkFixtures {
         "ZXYx",
         "not base64!",
         "abcde",
+        calendarId("#x"),
+        "#x placeholder@example.com",
         ""
     ]
 
@@ -398,6 +400,48 @@ enum MeetingLinkFixtures {
                 ])
             ),
             expected: found(meet)
+        ),
+        Fixture(
+            name: "forged-member-claims-victim",
+            title: "Weekly sync",
+            html: page(chip("ev1", "Weekly sync") + eventList([
+                record("ev9", "Party", [eventURL("ev1"), meet])
+            ])),
+            expected: fetchedNothing
+        ),
+        Fixture(
+            name: "forged-text-claims-victim",
+            title: "Weekly sync",
+            html: page(chip("ev1", "Weekly sync") + eventList([
+                record("ev1", "Weekly sync", ["Room 4"]),
+                record("ev9", "Party", ["Agenda:" + eventURL("ev1"), meet])
+            ])),
+            expected: .nothing
+        ),
+        Fixture(
+            name: "series-forged-instance-does-not-beat-master",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(calendarId("series1"), "Daily standup", [meet]),
+                    record(calendarId("party1"), "Party", [eventURL(instances("series1")[0]), otherMeet])
+                ])
+            ),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "several-series-each-record-checked",
+            title: "Daily standup",
+            html: page(
+                chip(instances("series1")[0], "Daily standup") + chip(instances("series2")[1], "Daily standup")
+                + eventList([
+                    record(instances("series1")[0], "Daily standup", ["Room 4"]),
+                    record(instances("series1")[0], "Daily standup", [meet]),
+                    record(instances("series2")[1], "Daily standup", [meet])
+                ])
+            ),
+            expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
         ),
         Fixture(
             name: "one-event-two-chips-padding-ignored",

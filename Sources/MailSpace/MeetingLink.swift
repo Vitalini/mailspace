@@ -23,8 +23,9 @@ import Foundation
 ///    series of its own.
 /// 3. **The records.** The page's inline `<script>` holds a JSON event list
 ///    for the visible week. A record is the innermost array or object with a
-///    direct string member holding `/calendar/event?eid=<id>`. No field
-///    position is relied on. Every string inside a record is scanned for
+///    direct string member that is the event's URL,
+///    `https://www.google.com/calendar/event?eid=<id>`; a record naming two
+///    event ids belongs to neither. No field position is relied on. Every string inside a record is scanned for
 ///    link-shaped text; the allow-listed ones are that record's links.
 /// 4. **One series** (one event, or the instances of one recurring event):
 ///    the records of its matched instances count; only when there are none,
@@ -34,8 +35,11 @@ import Foundation
 ///    instance's page, `/calendar/event?eid=<id>`, is fetched once and read
 ///    the same way; a failed or signed-out fetch is no link.
 /// 5. **Several series** with one title, at most `maxRecurringRecords` ids:
-///    a URL only when every id has its record, each holds exactly one link,
-///    and all are the same. Never fetched.
+///    a URL only when every id has a record, every record holds exactly one
+///    link, and all are the same. Never fetched.
+///
+/// The inline list is a snapshot from page load: a link edited since then is
+/// still the old one until the Calendar tab reloads.
 ///
 /// Anything else is ambiguity, and ambiguity is no button.
 enum MeetingLink {
@@ -53,16 +57,21 @@ enum MeetingLink {
     /// The attribute Google Calendar puts on an event chip.
     static let eventAttribute = "data-eventid"
 
-    /// What an event record's own URL contains, followed by the event id.
-    static let eventURLMarker = "/calendar/event?eid="
+    /// How an event record's own URL member starts, followed by the event id.
+    /// Only a string that *is* such a URL names a record's event: one that
+    /// merely contains it (a description, a forged link) does not.
+    static let eventURLPrefix = "https://www.google.com/calendar/event?eid="
 
     /// What a script must contain, raw, to be parsed as an event list. Shorter
-    /// than `eventURLMarker` on purpose: the page's JSON escapes `=` as
+    /// than `eventURLPrefix` on purpose: the page's JSON escapes `=` as
     /// `\u003d`, so the full marker only appears after parsing.
     static let eventListMarker = "/calendar/event?eid"
 
     /// The event page the fetch fallback asks for, relative to the page origin.
     static let eventPagePath = "/calendar/event?eid="
+
+    /// The most the fetch fallback reads of the event page (it is ~450 KB).
+    static let fetchByteLimit = 4 * 1024 * 1024
 
     /// An event id the fetch may put in a URL: base64url, optional padding.
     static let fetchableEventIdPattern = "^[A-Za-z0-9_-]+=*$"
@@ -149,12 +158,14 @@ enum MeetingLink {
         // Several series with one title: every event must have its record,
         // and every record the same one link. Never fetched.
         guard ids.count <= maxRecurringRecords else { return .nothing }
-        let perEvent: [[String]?] = ids.map { id in
+        // Each record is judged on its own, as in the one-series case: an
+        // empty record is never rescued by another record for the same id.
+        let perRecord: [[String]?] = ids.flatMap { id -> [[String]?] in
             let key = normalizeEventId(id)
             let found = records(in: root, where: { $0 == key })
-            return found.isEmpty ? nil : distinct(found.flatMap { $0 })
+            return found.isEmpty ? [nil] : found.map { Optional($0) }
         }
-        return agreeing(perEvent, fetched: false)
+        return agreeing(perRecord, fetched: false)
     }
 
     /// Whitespace runs (including no-break spaces) collapsed, then trimmed.
@@ -203,6 +214,10 @@ enum MeetingLink {
     }
 
     static let instanceSuffixPattern = "^[0-9]{8}(T[0-9]{6}Z?)?$"
+
+    /// Marks a malformed id's series. A decodable series is printable ASCII
+    /// only, so it can never start with this control character.
+    static let malformedSeriesPrefix = "\u{1}"
     private static let instanceSuffixExpression = try? NSRegularExpression(pattern: instanceSuffixPattern)
     private static let base64URLCharacters = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
@@ -210,7 +225,7 @@ enum MeetingLink {
     /// a recurring instance's id is `<baseId>_<timestamp>`.
     static func identity(of eventId: String) -> EventIdentity {
         let key = normalizeEventId(eventId)
-        let malformed = EventIdentity(series: "#" + key, timestamp: "")
+        let malformed = EventIdentity(series: malformedSeriesPrefix + key, timestamp: "")
         guard !key.isEmpty, key.allSatisfy({ base64URLCharacters.contains($0) }) else { return malformed }
         var base64 = key.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         while base64.count % 4 != 0 { base64 += "=" }
@@ -272,10 +287,11 @@ enum MeetingLink {
         }
     }
 
-    /// The event id an event URL names, decoded and without padding.
+    /// The event id an event-URL member names, decoded and without padding;
+    /// `nil` unless the whole string is such a URL.
     static func eventId(inURL string: String) -> String? {
-        guard let marker = string.range(of: eventURLMarker) else { return nil }
-        let rest = string[marker.upperBound...]
+        guard string.hasPrefix(eventURLPrefix), !string.contains(where: { $0.isWhitespace }) else { return nil }
+        let rest = string.dropFirst(eventURLPrefix.count)
         let raw = String(rest.prefix { $0 != "&" && $0 != "#" })
         return normalizeEventId(raw.removingPercentEncoding ?? raw)
     }
@@ -289,8 +305,12 @@ enum MeetingLink {
         } else {
             return
         }
-        if members.contains(where: { ($0 as? String).flatMap(eventId(inURL:)).map(matches) ?? false }) {
-            records.append(value)
+        // A container with an event-URL member is a record. It belongs to an
+        // event only when it names exactly one; a record naming two events is
+        // nobody's, and is not searched further.
+        let named = distinct(members.compactMap { ($0 as? String).flatMap(eventId(inURL:)) })
+        if !named.isEmpty {
+            if named.count == 1, matches(named[0]) { records.append(value) }
             return
         }
         for member in members { collectRecords(in: member, where: matches, into: &records) }

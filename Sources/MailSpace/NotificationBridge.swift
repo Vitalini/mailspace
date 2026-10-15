@@ -309,7 +309,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         webView, title, answer in
         webView.callAsyncJavaScript(
             MeetingLinkScript.pageScript,
-            arguments: ["title": title],
+            arguments: ["title": title, "abortAfterMs": JoinLookup.scriptAbortMilliseconds],
             in: nil,
             in: .defaultClient,
             completionHandler: answer

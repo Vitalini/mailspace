@@ -150,7 +150,7 @@ final class MeetingLinkTests: XCTestCase {
     func testAMalformedIdIsItsOwnSeries() {
         for id in ["ev1", "ZXYx", "not base64!", "abcde", "", "bm9zcGFjZQ",
                    MeetingLinkFixtures.calendarId("two spaces here")] {
-            XCTAssertEqual(MeetingLink.identity(of: id), Identity(series: "#" + MeetingLink.normalizeEventId(id), timestamp: ""), id)
+            XCTAssertEqual(MeetingLink.identity(of: id), Identity(series: MeetingLink.malformedSeriesPrefix + MeetingLink.normalizeEventId(id), timestamp: ""), id)
         }
     }
 
@@ -178,6 +178,32 @@ final class MeetingLinkTests: XCTestCase {
         XCTAssertNil(answer("two-series-same-title-one-missing")?.url)
         XCTAssertTrue(fetches("two-series-same-title-one-missing").isEmpty)
         XCTAssertEqual(answer("two-series-same-title-agree")?.url, MeetingLinkFixtures.meet)
+    }
+
+    /// The `#`-looking decoded id cannot collide with a malformed one.
+    func testAMalformedSeriesCannotCollideWithADecodedOne() {
+        let decoded = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("#x"))
+        XCTAssertEqual(decoded.series, "#x placeholder@example.com")
+        XCTAssertNotEqual(MeetingLink.identity(of: "#x placeholder@example.com").series, decoded.series)
+    }
+
+    // MARK: - Forged records (re-review N1, N2)
+
+    /// Only a record's own event-URL member names its event.
+    func testAForgedEventURLNeverAttributesAnotherRecord() {
+        XCTAssertNil(answer("forged-member-claims-victim")?.url)
+        XCTAssertEqual(answer("forged-text-claims-victim"), .nothing)
+        XCTAssertEqual(answer("series-forged-instance-does-not-beat-master")?.url, MeetingLinkFixtures.meet)
+        XCTAssertNil(answer("several-series-each-record-checked")?.url)
+    }
+
+    func testOnlyAWholeEventURLNamesAnEvent() {
+        let url = MeetingLinkFixtures.eventURL("ev1")
+        XCTAssertEqual(MeetingLink.eventId(inURL: url), "ev1")
+        XCTAssertEqual(MeetingLink.eventId(inURL: url + "&ctz=UTC"), "ev1")
+        XCTAssertNil(MeetingLink.eventId(inURL: "See " + url))
+        XCTAssertNil(MeetingLink.eventId(inURL: url + " and more"))
+        XCTAssertNil(MeetingLink.eventId(inURL: "https://evil.example/calendar/event?eid=ev1"))
     }
 
     func testPaddingAndEncodingDoNotSplitOneEvent() {

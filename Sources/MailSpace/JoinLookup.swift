@@ -30,6 +30,10 @@ final class JoinLookup {
     /// 0.7–1.4 s on a warm session, so the whole page path gets 3 s.
     static let deadline: TimeInterval = 3
 
+    /// When the page script gives up its fetch: half a second before the
+    /// deadline, so its own answer still arrives in time.
+    static var scriptAbortMilliseconds: Int { Int((deadline - 0.5) * 1000) }
+
     private let post: (Outcome) -> Void
     private var settled = false
 
