@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var downloadProbe: DownloadProbe?
     private var dropProbe: DropProbe?
     private var agendaProbe: AgendaProbe?
+    private var meetingLinkProbe: MeetingLinkProbe?
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
@@ -240,6 +241,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if SelfTest.mode == .agenda {
             agendaProbe = AgendaProbe()
             agendaProbe?.run()
+            return
+        }
+        if SelfTest.mode == .meetinglink {
+            meetingLinkProbe = MeetingLinkProbe()
+            meetingLinkProbe?.run()
             return
         }
 

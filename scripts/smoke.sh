@@ -370,6 +370,18 @@ case "$AGENDA_OUT" in
   *) fail "agenda parser: $AGENDA_OUT" ;;
 esac
 
+# 7bd. The Calendar Join lookup. Like the agenda parser it runs in the page,
+#      because the page holds event titles; only one allow-listed URL may come
+#      back. This runs that exact script over every hand-written fixture and
+#      asserts it agrees with the Swift reference and the expected answers.
+#      It proves the two twins agree, not that real Calendar pages match the
+#      fixtures. No network, no signed-in session, placeholder titles only.
+MEETINGLINK_OUT="$(MAILSPACE_SELFTEST=meetinglink run_with_timeout 90 "$BIN" 2>&1 | grep '^SELFTEST ' | head -1)"
+case "$MEETINGLINK_OUT" in
+  *"result=ok"*) pass "meeting-link lookup agrees with its Swift reference: $MEETINGLINK_OUT" ;;
+  *) fail "meeting-link lookup: $MEETINGLINK_OUT" ;;
+esac
+
 # 7c. The updater's verify-and-swap, against the real signed app, in a temporary
 #     directory. This is the code that could corrupt an install, and every
 #     interesting part of it lives outside Swift — ditto round-tripping a
