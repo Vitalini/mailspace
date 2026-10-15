@@ -10,6 +10,8 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-15
+
 ### Added
 - **Join a meeting from its reminder.** When a Calendar reminder is for an
   event with a Google Meet, Zoom or Teams link, it gets a Join button that
