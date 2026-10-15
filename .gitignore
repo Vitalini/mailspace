@@ -27,3 +27,6 @@ docs/
 
 # CE vocabulary file, generated locally
 CONCEPTS.md
+
+# CE worktrees live inside the repo
+.worktrees/
