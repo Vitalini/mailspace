@@ -458,6 +458,13 @@ final class UnreadPoller {
         }
     }
 
+    /// Whether a Mail webview's main frame finishing at `url` should poll now.
+    /// Read off `reading(for:)`, so this trigger and the poll it starts can
+    /// never disagree about which pages answer.
+    static func pollsOnFinish(at url: URL?) -> Bool {
+        reading(for: url) == .poll
+    }
+
     /// Whether the feed can be read from the page this webview is on: only a
     /// Gmail origin, where the fetch is same-origin and the account's cookies
     /// apply.
