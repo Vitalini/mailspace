@@ -39,6 +39,11 @@ protocol AccountHosting: AnyObject {
     /// what the number *means* (the badge scope); without it the existing
     /// counts are simply re-totalled.
     func badgeInputsChanged(repoll: Bool)
+    /// "Reload Tab" in a tab's right-click menu: replace that tab's webview
+    /// with a fresh one, whether or not it is the selected tab.
+    func reloadTab(_ tab: TabRef)
+    /// "Reload All Tabs" in the same menu: exactly what ⌥⌘R does.
+    func reloadAllTabs(_ sender: Any?)
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -108,6 +113,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         tabBar.onRemoveAccount = { [weak self] id in
             self?.host.requestRemoveAccount(id: id, presentedOn: self?.window)
         }
+        tabBar.onReloadTab = { [weak self] tab in self?.host.reloadTab(tab) }
+        tabBar.onReloadAllTabs = { [weak self] in self?.host.reloadAllTabs(nil) }
     }
 
     // MARK: - Layout

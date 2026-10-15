@@ -1,3 +1,4 @@
+import WebKit
 import XCTest
 @testable import MailSpace
 
@@ -60,5 +61,85 @@ final class TabReloadTests: XCTestCase {
 
     func testNothingFocusedAndNothingSelectedIsANoOp() {
         XCTAssertNil(NavigationPolicy.reloadTarget(keyWindowWebView: Pane?.none, selectedTab: nil))
+    }
+
+    // MARK: - Where "Reload Tab" sends the rebuilt webview
+
+    private let calendar = AccountView.calendar.url
+    private let thread = URL(string: "https://mail.google.com/mail/u/0/#inbox/FMfcgzQXJWDsKmGpLnBvTcRhNwZfPqSx")!
+
+    /// A previous load failed: its aim is where the user was trying to go.
+    func testAnOutstandingTargetWinsOverTheCurrentPage() {
+        let failed = URL(string: "https://mail.google.com/mail/u/0/#label/Work")!
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .mail, outstanding: failed, current: thread), failed)
+    }
+
+    /// The open thread survives the rebuild.
+    func testTheTabsOwnPageIsKept() {
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .mail, outstanding: nil, current: thread), thread)
+    }
+
+    /// A process that died before committing anything has no page.
+    func testNoPageFallsBackToTheEntryPoint() {
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .mail, outstanding: nil, current: nil), mail)
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .calendar, outstanding: nil, current: nil), calendar)
+    }
+
+    func testABlankPageFallsBackToTheEntryPoint() {
+        XCTAssertEqual(
+            TabRecycler.rebuildURL(view: .mail, outstanding: nil, current: URL(string: "about:blank")),
+            mail
+        )
+    }
+
+    /// A fresh webview has no SSO escort: a sign-in or customer SSO page would
+    /// be sent to the browser and leave the tab blank.
+    func testSignInAndForeignPagesFallBackToTheEntryPoint() {
+        let signIn = URL(string: "https://accounts.google.com/v3/signin/identifier?continue=x")!
+        let sso = URL(string: "https://sso.example.com/saml2/idp/login")!
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .mail, outstanding: nil, current: signIn), mail)
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .mail, outstanding: nil, current: sso), mail)
+    }
+
+    /// The other view's page is not this tab's page.
+    func testTheSiblingViewsPageFallsBackToTheEntryPoint() {
+        XCTAssertEqual(TabRecycler.rebuildURL(view: .calendar, outstanding: nil, current: thread), calendar)
+    }
+
+    // MARK: - The rebuild itself
+
+    /// R16, R18: the webview is replaced even when the automatic recycler's
+    /// guards would refuse (selected tab, fresh document), and a failed load of
+    /// the fresh webview enters the retry ladder.
+    func testARebuildReplacesTheWebViewAndAFailedLoadIsRetried() {
+        let host = FakeRecyclerHost()
+        var scheduled: [TimeInterval] = []
+        let recycler = TabRecycler(settings: AppSettings(defaults: isolatedDefaults()))
+        recycler.host = host
+        recycler.schedule = { delay, _ in scheduled.append(delay) }
+        recycler.load = { _, _ in }
+
+        let old = WKWebView()
+        let target = TabRecycler.Target(
+            accountId: UUID(), accountName: "work", view: .mail, slot: 0, webView: old
+        )
+        host.targets = [target]
+
+        XCTAssertTrue(recycler.rebuild(target, to: thread))
+        guard let fresh = host.replacements.first else { return XCTFail("no rebuild happened") }
+        XCTAssertFalse(fresh === old)
+        XCTAssertEqual(recycler.outstandingTarget(for: fresh), thread)
+        XCTAssertTrue(recycler.isRecycling(fresh))
+        XCTAssertNil(recycler.outstandingTarget(for: old))
+
+        scheduled.removeAll()
+        recycler.webViewDidFail(fresh)
+        XCTAssertEqual(scheduled, [30], "the first rung of the ladder")
+    }
+
+    private func isolatedDefaults() -> UserDefaults {
+        let suite = UserDefaults(suiteName: "tab-reload-\(UUID().uuidString)")!
+        AppSettings.registerDefaults(in: suite)
+        return suite
     }
 }

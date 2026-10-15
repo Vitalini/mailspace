@@ -1449,21 +1449,56 @@ final class TabRecycler {
         guard let fresh = host.performRecycle(target, to: url) else { return false }
 
         lastRecycleAt = environment.now
-        // Stamped at issue time, before the load returns. This single line is
-        // what prevents an infinite recycle loop: if the load never commits,
-        // the age does not stay pinned at the old document's timestamp and
-        // re-fire on every tick.
-        lastCommittedAt[fresh] = environment.now
-        recycling.insert(fresh)
-        recycleTarget[fresh] = url
-        webViewWasDiscarded(target.webView)
-        armBusyRelease(for: fresh)
+        adopt(fresh, replacing: target.webView, aimedAt: url, at: environment.now)
 
         Log.info(
             "recycled account=\(target.accountName) view=\(target.view.rawValue) "
             + "age=\(Self.describe(age)) reason=\(trigger.rawValue)"
         )
         return true
+    }
+
+    /// "Reload Tab": the user asked for this tab to be rebuilt, now.
+    ///
+    /// None of the automatic recycler's guards apply — not the selected tab,
+    /// not an open compose, not quiet hours, not the spacing between recycles.
+    /// What it shares with the automatic path is everything after the swap, so
+    /// a failed load of the fresh webview enters the same retry ladder.
+    @discardableResult
+    func rebuild(_ target: Target, to url: URL) -> Bool {
+        guard let host, let fresh = host.performRecycle(target, to: url) else { return false }
+        adopt(fresh, replacing: target.webView, aimedAt: url, at: now())
+        Log.info("rebuilt account=\(target.accountName) view=\(target.view.rawValue) reason=user")
+        return true
+    }
+
+    /// Where "Reload Tab" points the fresh webview.
+    ///
+    /// A load that failed earlier left its aim behind, and that is where the
+    /// user was going. Otherwise the page the old webview was on, but only when
+    /// it is this view's own app page: a fresh webview has no SSO escort, so a
+    /// sign-in or customer SSO page would be handed to the browser and leave
+    /// the tab blank. Anything else — no page, `about:blank` — goes to the
+    /// view's entry point.
+    static func rebuildURL(view: AccountView, outstanding: URL?, current: URL?) -> URL {
+        if let outstanding { return outstanding }
+        if let current, AuthSurface.classify(current) == .app(view) { return current }
+        return view.url
+    }
+
+    /// The bookkeeping every swap needs once the fresh webview exists.
+    private func adopt(_ fresh: WKWebView, replacing old: WKWebView, aimedAt url: URL, at date: Date) {
+        // Stamped at issue time, before the load returns. This single line is
+        // what prevents an infinite recycle loop: if the load never commits,
+        // the age does not stay pinned at the old document's timestamp and
+        // re-fire on every tick.
+        lastCommittedAt[fresh] = date
+        recycling.insert(fresh)
+        // Without the aim, `webViewDidFail` ignores the fresh webview and a
+        // failed load gets no retry.
+        recycleTarget[fresh] = url
+        webViewWasDiscarded(old)
+        armBusyRelease(for: fresh)
     }
 
     /// The busy flag has to be able to end on its own. WebKit delivers a commit
