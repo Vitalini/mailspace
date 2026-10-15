@@ -50,7 +50,7 @@ enum OneTimeCode {
         "трек", "промо", "заказа", "заказу", "замовлення", "скидки", "купона", "отслеживания", "посылки"
     ]
 
-    static let rejectedBefore: Set<Character> = ["#", "№", "+", "$", "€", "£", "₽", "₴", "/", "*", "•", ")"]
+    static let rejectedBefore: Set<Character> = ["#", "№", "+", "$", "€", "£", "₽", "₴", "/", "*", "•"]
     static let rejectedAfter: Set<Character> = ["%", "/", "$", "€", "£", "₽", "₴"]
     static let joiners: Set<Character> = ["-", ".", ":", ",", " "]
     static let precedingWords: Set<String> = ["no", "order", "ending", "to"]
@@ -130,6 +130,12 @@ enum OneTimeCode {
         if let c = nearest(from: run.lowerBound - 1, step: -1, in: text, skipping: [" "]), rejectedBefore.contains(c) {
             return false
         }
+        // A ")" rejects only after a letterless group, as in "(555) 1234".
+        // "(valid 5 min) 482913" keeps its code.
+        if let close = lastIndex(of: ")", from: run.lowerBound - 1, skipping: [" "], in: text),
+           closesLetterlessGroup(at: close, in: text) {
+            return false
+        }
         if let c = nearest(from: run.upperBound, step: 1, in: text, skipping: [" "]), rejectedAfter.contains(c) {
             return false
         }
@@ -144,6 +150,22 @@ enum OneTimeCode {
         if let word = word(startingAfter: run.upperBound, in: text), followingWords.contains(word) { return false }
 
         if run.count == 4, let value = Int(String(text[run])), years.contains(value) { return false }
+        return true
+    }
+
+    private static func lastIndex(of c: Character, from index: Int, skipping: Set<Character>, in text: [Character]) -> Int? {
+        var i = index
+        while i >= 0, skipping.contains(text[i]) { i -= 1 }
+        return i >= 0 && text[i] == c ? i : nil
+    }
+
+    /// True when the ")" at `close` ends a group with no letters, or has no "(".
+    private static func closesLetterlessGroup(at close: Int, in text: [Character]) -> Bool {
+        var i = close - 1
+        while i >= 0, text[i] != "(" {
+            if text[i].isLetter { return false }
+            i -= 1
+        }
         return true
     }
 

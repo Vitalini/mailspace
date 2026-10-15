@@ -21,6 +21,8 @@ final class OneTimeCodeTests: XCTestCase {
 
     private let positives: [Fixture] = [
         Fixture("Your verification code is 482913", "482913"),
+        Fixture("Your code (valid 5 min) 482913", "482913", "bracket with letters before the code"),
+        Fixture("Your verification code (do not share) 482913", "482913", "bracket with letters before the code"),
         Fixture("482913 is your Instagram code", "482913", "keyword after the code"),
         Fixture("Slack confirmation code: 731904", "731904"),
         Fixture("Your OTP is 5521", "5521"),
