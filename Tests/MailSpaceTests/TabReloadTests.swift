@@ -111,6 +111,21 @@ final class TabReloadTests: XCTestCase {
     /// R16, R18: the webview is replaced even when the automatic recycler's
     /// guards would refuse (selected tab, fresh document), and a failed load of
     /// the fresh webview enters the retry ladder.
+    func testTheSignInFlagCanBeCarriedToAFreshWebView() {
+        let policy = NavigationPolicy()
+        let old = WKWebView()
+        let fresh = WKWebView()
+        policy.markAuthenticating(old)
+        XCTAssertTrue(policy.isAuthenticating(old))
+
+        let wasAuthenticating = policy.isAuthenticating(old)
+        policy.webViewWasDiscarded(old)
+        XCTAssertFalse(policy.isAuthenticating(old))
+        if wasAuthenticating { policy.markAuthenticating(fresh) }
+
+        XCTAssertTrue(policy.isAuthenticating(fresh))
+    }
+
     func testARebuildReplacesTheWebViewAndAFailedLoadIsRetried() {
         let host = FakeRecyclerHost()
         var scheduled: [TimeInterval] = []

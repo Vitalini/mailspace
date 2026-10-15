@@ -1364,6 +1364,13 @@ final class NavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate, WKDo
         sawSignIn.contains(webView) || escorts[webView] != nil
     }
 
+    /// Marks a webview as mid sign-in. "Reload Tab" uses it to carry the flag
+    /// from the webview it discards to the fresh one, so the fresh webview
+    /// landing on an app surface still completes the sign-in.
+    func markAuthenticating(_ webView: WKWebView) {
+        sawSignIn.insert(webView)
+    }
+
     /// Whether the crash throttle has given up on this webview.
     func isStalled(_ webView: WKWebView) -> Bool {
         stalled.contains(webView)

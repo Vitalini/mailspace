@@ -451,7 +451,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             outstanding: tabRecycler.outstandingTarget(for: target.webView),
             current: target.webView.url
         )
-        tabRecycler.rebuild(target, to: url)
+        // Discarding the old webview clears its sign-in flag; without the
+        // carry-over a rebuild mid sign-in never fires `signInCompleted`.
+        let wasAuthenticating = navigationPolicy.isAuthenticating(target.webView)
+        guard tabRecycler.rebuild(target, to: url), wasAuthenticating,
+              let fresh = sessions[tab.accountId]?.webView(for: tab.view)
+        else { return }
+        navigationPolicy.markAuthenticating(fresh)
     }
 
     /// G11: this tab has just stopped being the visible one.
