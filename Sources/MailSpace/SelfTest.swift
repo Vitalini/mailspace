@@ -410,11 +410,19 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private var mutedMessages = -1
     private var mutedNative = -1
 
+    /// Of the first round's delivered notifications, how many carry the Copy
+    /// Code category with a code in `userInfo` — exactly one, the page
+    /// notification below. Never the code itself.
+    private var otp = -1
+    /// Whether the system's category store holds Copy Code, as `start()`
+    /// registered it.
+    private var otpCategoryRegistered = false
+
     private static let page = """
     <!DOCTYPE html><html><body><script>
       window.__probe = { permission: Notification.permission };
       Notification.requestPermission(function (granted) { window.__probe.callback = granted; });
-      new Notification('Page title', { body: 'Page body', tag: 'page-tag' });
+      new Notification('Page title', { body: 'Your verification code is 482913', tag: 'page-tag' });
       if (window.ServiceWorkerRegistration && window.ServiceWorkerRegistration.prototype.showNotification) {
         window.ServiceWorkerRegistration.prototype.showNotification.call({}, 'Worker title', { body: 'Worker body' });
         window.__probe.serviceWorkerOverridden = true;
@@ -545,8 +553,20 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
                     return
                 }
                 self.nativeDelivered = mine.count
+                self.otp = mine.filter { notification in
+                    let content = notification.request.content
+                    let code = content.userInfo[NotificationCategory.InfoKey.code] as? String
+                    return content.categoryIdentifier == NotificationCategory.oneTimeCode.identifier
+                        && !(code ?? "").isEmpty
+                }.count
                 center.removeDeliveredNotifications(withIdentifiers: mine.map(\.request.identifier))
-                DispatchQueue.main.async { self.startMutedRound() }
+                center.getNotificationCategories { categories in
+                    self.otpCategoryRegistered = categories.contains { category in
+                        category.identifier == NotificationCategory.oneTimeCode.identifier
+                            && category.actions.contains { $0.identifier == NotificationCategory.ActionId.copyCode }
+                    }
+                    DispatchQueue.main.async { self.startMutedRound() }
+                }
             }
         }
     }
@@ -599,7 +619,8 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             // Three independent things have to hold: every shim message
             // arrived, every one came from a frame the real origin check
             // trusts, and Notification Center really is holding what they
-            // produced. Only the last one is native delivery — and if this
+            // produced, the code-bearing one with Copy Code attached and
+            // registered. Only the last one is native delivery — and if this
             // throwaway identity has no authorization at all, nothing can prove
             // it, so the probe says so instead of quietly passing.
             let result: String
@@ -610,6 +631,12 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             } else if self.nativeDelivered == 3 && !muteHolds {
                 result = "FAILED"
                 reason = " reason=muted-account-still-reached-notification-center"
+            } else if self.nativeDelivered == 3 && !self.otpCategoryRegistered {
+                result = "FAILED"
+                reason = " reason=copy-code-category-not-registered"
+            } else if self.nativeDelivered == 3 && self.otp != 1 {
+                result = "FAILED"
+                reason = " reason=copy-code-category-not-attached"
             } else if self.nativeDelivered == 3 {
                 result = "ok"
             } else if !authorized {
@@ -623,7 +650,7 @@ final class ShimProbe: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
             SelfTest.finish(
                 "shim result=\(result)\(reason) delivered=\(count) trusted=\(self.gated) "
                 + "native=\(self.nativeDelivered) mutedMessages=\(self.mutedMessages) "
-                + "mutedNative=\(self.mutedNative) auth=\(self.authorization) alert=\(self.alertSetting) "
+                + "mutedNative=\(self.mutedNative) otp=\(self.otp) auth=\(self.authorization) alert=\(self.alertSetting) "
                 + "bundle=\(Bundle.main.bundleIdentifier ?? "none") "
                 + "origin=\(self.lastOrigin) titles=\(titles) probe=\(probe)"
             )
