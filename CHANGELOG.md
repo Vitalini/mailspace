@@ -10,6 +10,12 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Added
+- **Copy a sign-in code straight from the notification.** When a Gmail
+  notification carries a one-time code, such as "Your verification code is
+  482913", it gets a Copy Code button that puts the code on the clipboard
+  without bringing MailSpace forward.
+
 ### Fixed
 - **The unread count catches up as soon as you sign back in.** After Google
   signed you out and you signed in again inside the tab, the number on the tab

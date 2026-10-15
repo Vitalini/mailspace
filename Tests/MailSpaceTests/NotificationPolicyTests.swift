@@ -65,6 +65,12 @@ final class NotificationPolicyTests: XCTestCase {
         XCTAssertTrue(NotificationShim.userScript.source.contains("silent: !!options.silent"))
     }
 
+    /// The shim forwards no page `actions` and routes no click back, so the
+    /// page must not be invited to attach buttons; Copy Code is native.
+    func testTheShimStillOffersNoPageActions() {
+        XCTAssertTrue(NotificationShim.userScript.source.contains("MailSpaceNotification.maxActions = 0;"))
+    }
+
     // MARK: - B1
 
     func testTheTabOnScreenGetsNoBanner() {
