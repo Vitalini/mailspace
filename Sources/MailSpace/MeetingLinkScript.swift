@@ -228,12 +228,18 @@ enum MeetingLinkScript {
       if (oneSeries) {
         const keys = ids.map(msMeetingEventKey);
         const series = identities[0].series;
-        const belongs = function (id) {
-          if (keys.indexOf(id) >= 0) { return true; }
+        const isOwn = function (id) { return keys.indexOf(id) >= 0; };
+        const isMaster = function (id) {
           const other = msMeetingIdentity(id);
           return other.series === series && other.timestamp === '';
         };
-        const found = msMeetingRecordLinks(root, belongs);
+        // An instance's own record wins over the master's: an edited instance
+        // can carry a link the master no longer matches.
+        const seriesRecords = function (doc) {
+          const own = msMeetingRecordLinks(doc, isOwn);
+          return own.length > 0 ? own : msMeetingRecordLinks(doc, isMaster);
+        };
+        const found = seriesRecords(root);
         if (found.length > 0) { return msMeetingAgreeing(found, false); }
 
         const first = ids[msMeetingEarliest(identities)];
@@ -241,7 +247,7 @@ enum MeetingLinkScript {
         let page = null;
         try { page = await fetchPage(first); } catch (error) { page = null; }
         if (typeof page !== 'string') { return fetchedNothing; }
-        const fetched = msMeetingRecordLinks(new DOMParser().parseFromString(page, 'text/html'), belongs);
+        const fetched = seriesRecords(new DOMParser().parseFromString(page, 'text/html'));
         if (fetched.length === 0) { return fetchedNothing; }
         return msMeetingAgreeing(fetched, true);
       }

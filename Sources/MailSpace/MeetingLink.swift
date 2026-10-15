@@ -27,9 +27,10 @@ import Foundation
 ///    position is relied on. Every string inside a record is scanned for
 ///    link-shaped text; the allow-listed ones are that record's links.
 /// 4. **One series** (one event, or the instances of one recurring event):
-///    the records of its matched instances and of its bare master id count.
-///    With at least one record, a URL only when every such record holds
-///    exactly one link and they are all the same. With none, the earliest
+///    the records of its matched instances count; only when there are none,
+///    the record of its bare master id does. With at least one record, a URL
+///    only when every such record holds exactly one link and they are all the
+///    same. With none, the earliest
 ///    instance's page, `/calendar/event?eid=<id>`, is fetched once and read
 ///    the same way; a failed or signed-out fetch is no link.
 /// 5. **Several series** with one title, at most `maxRecurringRecords` ids:
@@ -124,19 +125,23 @@ enum MeetingLink {
         if identities.allSatisfy({ $0.series == identities[0].series }) {
             let keys = Set(ids.map(normalizeEventId))
             let series = identities[0].series
-            let belongs: (String) -> Bool = { id in
-                keys.contains(id) || {
-                    let other = identity(of: id)
-                    return other.series == series && other.timestamp.isEmpty
-                }()
+            let isMaster: (String) -> Bool = { id in
+                let other = identity(of: id)
+                return other.series == series && other.timestamp.isEmpty
             }
-            let found = records(in: root, where: belongs)
+            // An instance's own record wins over the master's: an edited
+            // instance can carry a link the master no longer matches.
+            let seriesRecords: (Element) -> [[String]] = { document in
+                let own = records(in: document, where: { keys.contains($0) })
+                return own.isEmpty ? records(in: document, where: isMaster) : own
+            }
+            let found = seriesRecords(root)
             if !found.isEmpty { return agreeing(found, fetched: false) }
 
             let first = ids[earliest(identities)]
             guard isFetchable(first) else { return .nothing }
             guard let page = fetch(first) else { return Match(url: nil, links: 0, fetched: true) }
-            let fetched = records(in: Document.parse(page), where: belongs)
+            let fetched = seriesRecords(Document.parse(page))
             guard !fetched.isEmpty else { return Match(url: nil, links: 0, fetched: true) }
             return agreeing(fetched, fetched: true)
         }

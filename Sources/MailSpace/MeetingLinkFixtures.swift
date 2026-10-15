@@ -318,12 +318,24 @@ enum MeetingLinkFixtures {
             expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
         ),
         Fixture(
+            name: "series-instance-record-wins-over-master",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(calendarId("series1"), "Daily standup", [otherMeet]),
+                    record(instances("series1")[1], "Daily standup", [meet])
+                ])
+            ),
+            expected: found(meet)
+        ),
+        Fixture(
             name: "series-instance-record-without-link",
             title: "Daily standup",
             html: page(
                 instances("series1").map { chip($0, "Daily standup") }.joined()
                 + eventList([
-                    record(calendarId("series1"), "Daily standup", [meet]),
+                    record(instances("series1")[0], "Daily standup", [meet]),
                     record(instances("series1")[1], "Daily standup", ["Room 4"])
                 ])
             ),

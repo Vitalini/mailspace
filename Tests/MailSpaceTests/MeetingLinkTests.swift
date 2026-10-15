@@ -158,6 +158,7 @@ final class MeetingLinkTests: XCTestCase {
         XCTAssertEqual(answer("series-master-record-only"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet))
         XCTAssertEqual(answer("series-instance-records-agree")?.url, MeetingLinkFixtures.meet)
         XCTAssertEqual(answer("series-other-series-record-ignored")?.url, MeetingLinkFixtures.meet)
+        XCTAssertEqual(answer("series-instance-record-wins-over-master")?.url, MeetingLinkFixtures.meet)
         XCTAssertTrue(fetches("series-master-record-only").isEmpty)
     }
 
