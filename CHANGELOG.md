@@ -10,6 +10,12 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Fixed
+- **A blank tab can always be brought back.** Right-click any tab and choose
+  Reload Tab: MailSpace replaces that tab's page with a fresh one, even when
+  the page has stopped responding and ⌘R does nothing. Reload All Tabs is in
+  the same menu.
+
 ## [1.2.1] - 2026-09-10
 
 ### Fixed
