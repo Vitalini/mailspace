@@ -12,27 +12,31 @@ import Foundation
 ///
 /// The lookup:
 ///
-/// 1. **The event.** A text node whose normalised text equals the title
+/// 1. **The events.** A text node whose normalised text equals the title
 ///    exactly marks its nearest `[data-eventid]` ancestor. Containment is not a
 ///    match. Ids that differ only by trailing `=` are one event. Week-view
 ///    chips do not carry the meeting link, so nothing inside a chip is read as
 ///    a link.
-/// 2. **The record.** The page's inline `<script>` holds a JSON event list for
-///    the visible week. A record is the innermost array or object with a
-///    direct string member holding `/calendar/event?eid=<that id>`. No field
-///    position is relied on.
-/// 3. **The link.** Every string inside the record is scanned for link-shaped
-///    text; the allow-listed ones are collected.
-/// 4. **Fetch, only for one event whose record was not found.** The event's
-///    own page, `/calendar/event?eid=<id>`, carries the same list for the
-///    event's week, and steps 2–3 run on it. A failed or signed-out fetch is
-///    no link.
+/// 2. **The series.** An id decodes to `<id> <calendar email>`, and a
+///    recurring instance's id is `<baseId>_<timestamp>` (`identity(of:)`).
+///    Ids with the same base id and email are one series; a malformed id is a
+///    series of its own.
+/// 3. **The records.** The page's inline `<script>` holds a JSON event list
+///    for the visible week. A record is the innermost array or object with a
+///    direct string member holding `/calendar/event?eid=<id>`. No field
+///    position is relied on. Every string inside a record is scanned for
+///    link-shaped text; the allow-listed ones are that record's links.
+/// 4. **One series** (one event, or the instances of one recurring event):
+///    the records of its matched instances and of its bare master id count.
+///    With at least one record, a URL only when every such record holds
+///    exactly one link and they are all the same. With none, the earliest
+///    instance's page, `/calendar/event?eid=<id>`, is fetched once and read
+///    the same way; a failed or signed-out fetch is no link.
+/// 5. **Several series** with one title, at most `maxRecurringRecords` ids:
+///    a URL only when every id has its record, each holds exactly one link,
+///    and all are the same. Never fetched.
 ///
-/// One event: a URL only when exactly one distinct allow-listed URL was
-/// collected. Several events with the title (a recurring meeting, or a
-/// same-title decoy), at most `maxRecurringRecords`: a URL only when every
-/// record is present and holds exactly one link, and all of them are the same
-/// link. Anything else is ambiguity, and ambiguity is no button.
+/// Anything else is ambiguity, and ambiguity is no button.
 enum MeetingLink {
     /// What one lookup found. `url` is set only when `links == 1`.
     struct Match: Equatable {
@@ -107,25 +111,45 @@ enum MeetingLink {
 
     /// - Parameter fetch: the event page for an event id, or `nil` when the
     ///   fetch failed or left the Calendar origin. Called at most once, and
-    ///   only when the title names one event.
+    ///   only when the title names one series and no record was found.
     static func find(html: String, title: String, fetch: (String) -> String?) -> Match {
         let wanted = normalize(title)
         guard !wanted.isEmpty else { return .nothing }
         let root = Document.parse(html)
         let ids = eventIds(in: root, title: wanted)
-        guard !ids.isEmpty, ids.count <= maxRecurringRecords else { return .nothing }
-        guard ids.count == 1 else { return agreeing(ids.map { recordLinks(in: root, eventId: normalizeEventId($0)) }) }
-        let eventId = ids[0]
-        let key = normalizeEventId(eventId)
+        guard !ids.isEmpty else { return .nothing }
+        let identities = ids.map(identity(of:))
 
-        if let links = recordLinks(in: root, eventId: key) {
-            return decide(links, fetched: false)
+        // One series (a single event, or instances of one recurring event).
+        if identities.allSatisfy({ $0.series == identities[0].series }) {
+            let keys = Set(ids.map(normalizeEventId))
+            let series = identities[0].series
+            let belongs: (String) -> Bool = { id in
+                keys.contains(id) || {
+                    let other = identity(of: id)
+                    return other.series == series && other.timestamp.isEmpty
+                }()
+            }
+            let found = records(in: root, where: belongs)
+            if !found.isEmpty { return agreeing(found, fetched: false) }
+
+            let first = ids[earliest(identities)]
+            guard isFetchable(first) else { return .nothing }
+            guard let page = fetch(first) else { return Match(url: nil, links: 0, fetched: true) }
+            let fetched = records(in: Document.parse(page), where: belongs)
+            guard !fetched.isEmpty else { return Match(url: nil, links: 0, fetched: true) }
+            return agreeing(fetched, fetched: true)
         }
-        guard isFetchable(eventId) else { return .nothing }
-        guard let page = fetch(eventId), let links = recordLinks(in: Document.parse(page), eventId: key) else {
-            return Match(url: nil, links: 0, fetched: true)
+
+        // Several series with one title: every event must have its record,
+        // and every record the same one link. Never fetched.
+        guard ids.count <= maxRecurringRecords else { return .nothing }
+        let perEvent: [[String]?] = ids.map { id in
+            let key = normalizeEventId(id)
+            let found = records(in: root, where: { $0 == key })
+            return found.isEmpty ? nil : distinct(found.flatMap { $0 })
         }
-        return decide(links, fetched: true)
+        return agreeing(perEvent, fetched: false)
     }
 
     /// Whitespace runs (including no-break spaces) collapsed, then trimmed.
@@ -148,18 +172,69 @@ enum MeetingLink {
         return fetchableExpression?.firstMatch(in: id, range: range)?.range == range
     }
 
-    /// The most event ids one title may name (a daily meeting in week view
-    /// names up to seven); more is no link.
+    /// The most event ids a title spanning several series may name; more is
+    /// no link.
     static let maxRecurringRecords = 10
 
-    /// Several events with one title, such as a recurring meeting's instances:
-    /// a URL only when every record holds exactly one link and it is the same
-    /// one. A missing record, a record without a link, or two different links
-    /// is no link. Never fetched.
-    private static func agreeing(_ perRecord: [[String]?]) -> Match {
+    /// A URL only when every record (or event) holds exactly one link and it
+    /// is the same one. A missing record, a record without a link, or two
+    /// different links is no link.
+    private static func agreeing(_ perRecord: [[String]?], fetched: Bool) -> Match {
         let union = distinct(perRecord.flatMap { $0 ?? [] })
         let agree = union.count == 1 && perRecord.allSatisfy { $0?.count == 1 }
-        return Match(url: agree ? union[0] : nil, links: union.count, fetched: false)
+        return Match(url: agree ? union[0] : nil, links: union.count, fetched: fetched)
+    }
+
+    // MARK: - Event identity
+
+    /// Which recurring series an event id belongs to, and which instance.
+    struct EventIdentity: Equatable {
+        /// `<baseId> <calendar email>` for a decodable id; `#<id>` for anything
+        /// else, so a malformed id is a series of its own.
+        let series: String
+        /// The instance suffix (`20261015T090000Z` or `20261015`), or empty
+        /// for a single event or a series' master.
+        let timestamp: String
+    }
+
+    static let instanceSuffixPattern = "^[0-9]{8}(T[0-9]{6}Z?)?$"
+    private static let instanceSuffixExpression = try? NSRegularExpression(pattern: instanceSuffixPattern)
+    private static let base64URLCharacters = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+    /// Calendar's `data-eventid` is base64url of `<id> <calendar email>`, and
+    /// a recurring instance's id is `<baseId>_<timestamp>`.
+    static func identity(of eventId: String) -> EventIdentity {
+        let key = normalizeEventId(eventId)
+        let malformed = EventIdentity(series: "#" + key, timestamp: "")
+        guard !key.isEmpty, key.allSatisfy({ base64URLCharacters.contains($0) }) else { return malformed }
+        var base64 = key.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64 += "=" }
+        guard let data = Data(base64Encoded: base64), !data.isEmpty,
+              data.allSatisfy({ (0x20...0x7e).contains($0) })
+        else { return malformed }
+        let parts = String(decoding: data, as: UTF8.self).split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return malformed }
+        var base = String(parts[0])
+        var timestamp = ""
+        if let underscore = base.lastIndex(of: "_"), underscore != base.startIndex {
+            let suffix = String(base[base.index(after: underscore)...])
+            let range = NSRange(suffix.startIndex..<suffix.endIndex, in: suffix)
+            if instanceSuffixExpression?.firstMatch(in: suffix, range: range) != nil {
+                timestamp = suffix
+                base = String(base[..<underscore])
+            }
+        }
+        return EventIdentity(series: base + " " + parts[1], timestamp: timestamp)
+    }
+
+    /// The first instance in time; a master or single event (no timestamp)
+    /// comes first, and ties go to document order.
+    private static func earliest(_ identities: [EventIdentity]) -> Int {
+        var best = 0
+        for index in identities.indices where identities[index].timestamp < identities[best].timestamp {
+            best = index
+        }
+        return best
     }
 
     /// The events the title names, as their chips spell the ids, in document
@@ -174,33 +249,33 @@ enum MeetingLink {
         return ids
     }
 
-    /// The distinct allow-listed links of every record for `eventId` in the
-    /// document's scripts, or `nil` when no script holds such a record.
-    private static func recordLinks(in root: Element, eventId: String) -> [String]? {
+    /// Every record in the document's scripts whose event id passes
+    /// `matches`, as that record's distinct allow-listed links.
+    private static func records(in root: Element, where matches: (String) -> Bool) -> [[String]] {
         var records: [Any] = []
         for script in [root] + root.elements() where script.name == "script" {
             guard let body = script.rawText, body.contains(eventListMarker),
                   let data = body.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
             else { continue }
-            collectRecords(in: json, eventId: eventId, into: &records)
+            collectRecords(in: json, where: matches, into: &records)
         }
-        guard !records.isEmpty else { return nil }
-        var strings: [String] = []
-        for record in records { collectStrings(in: record, into: &strings) }
-        return distinct(strings.flatMap(links(inText:)))
+        return records.map { record in
+            var strings: [String] = []
+            collectStrings(in: record, into: &strings)
+            return distinct(strings.flatMap(links(inText:)))
+        }
     }
 
-    /// Whether `string` is an event URL for `eventId`.
-    static func isEventURL(_ string: String, for eventId: String) -> Bool {
-        guard let marker = string.range(of: eventURLMarker) else { return false }
+    /// The event id an event URL names, decoded and without padding.
+    static func eventId(inURL string: String) -> String? {
+        guard let marker = string.range(of: eventURLMarker) else { return nil }
         let rest = string[marker.upperBound...]
         let raw = String(rest.prefix { $0 != "&" && $0 != "#" })
-        let decoded = raw.removingPercentEncoding ?? raw
-        return normalizeEventId(decoded) == eventId
+        return normalizeEventId(raw.removingPercentEncoding ?? raw)
     }
 
-    private static func collectRecords(in value: Any, eventId: String, into records: inout [Any]) {
+    private static func collectRecords(in value: Any, where matches: (String) -> Bool, into records: inout [Any]) {
         let members: [Any]
         if let array = value as? [Any] {
             members = array
@@ -209,11 +284,11 @@ enum MeetingLink {
         } else {
             return
         }
-        if members.contains(where: { ($0 as? String).map { isEventURL($0, for: eventId) } ?? false }) {
+        if members.contains(where: { ($0 as? String).flatMap(eventId(inURL:)).map(matches) ?? false }) {
             records.append(value)
             return
         }
-        for member in members { collectRecords(in: member, eventId: eventId, into: &records) }
+        for member in members { collectRecords(in: member, where: matches, into: &records) }
     }
 
     private static func collectStrings(in value: Any, into strings: inout [String]) {
@@ -239,9 +314,6 @@ enum MeetingLink {
         return candidates.filter(isAllowed)
     }
 
-    private static func decide(_ links: [String], fetched: Bool) -> Match {
-        Match(url: links.count == 1 ? links[0] : nil, links: links.count, fetched: fetched)
-    }
 
     private static func distinct(_ urls: [String]) -> [String] {
         var seen: [String] = []

@@ -91,23 +91,92 @@ final class MeetingLinkTests: XCTestCase {
         XCTAssertTrue(fetches("decoy-same-title-one-without-link").isEmpty)
     }
 
-    /// A recurring meeting: every instance holds the same one link.
-    func testARecurringMeetingWithOneLinkGetsJoin() {
-        XCTAssertEqual(answer("recurring-daily-same-link"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet))
-        XCTAssertEqual(answer("recurring-at-the-cap")?.url, MeetingLinkFixtures.meet)
+    /// Unrelated same-title events that all hold the same one link.
+    func testSameTitleEventsThatAgreeGetJoin() {
+        XCTAssertEqual(answer("same-title-events-daily-same-link"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet))
+        XCTAssertEqual(answer("same-title-events-at-the-cap")?.url, MeetingLinkFixtures.meet)
     }
 
-    func testARecurringMeetingThatDisagreesGetsNothing() {
-        XCTAssertNil(answer("recurring-one-instance-different-link")?.url)
-        XCTAssertNil(answer("recurring-one-instance-without-link")?.url)
-        XCTAssertNil(answer("recurring-instance-with-two-links")?.url)
-        XCTAssertEqual(answer("recurring-over-the-cap"), .nothing)
+    func testSameTitleEventsThatDisagreeGetNothing() {
+        XCTAssertNil(answer("same-title-events-one-instance-different-link")?.url)
+        XCTAssertNil(answer("same-title-events-one-instance-without-link")?.url)
+        XCTAssertNil(answer("same-title-events-instance-with-two-links")?.url)
+        XCTAssertEqual(answer("same-title-events-over-the-cap"), .nothing)
     }
 
-    /// No fetch fan-out: a missing instance record is no link, not a fetch.
-    func testAMissingInstanceRecordIsNeverFetched() {
-        XCTAssertNil(answer("recurring-one-record-missing-is-not-fetched")?.url)
-        XCTAssertTrue(fetches("recurring-one-record-missing-is-not-fetched").isEmpty)
+    /// No fetch fan-out: a missing record among several series is no link.
+    func testAMissingRecordAmongSeveralSeriesIsNeverFetched() {
+        XCTAssertNil(answer("same-title-events-one-record-missing-is-not-fetched")?.url)
+        XCTAssertTrue(fetches("same-title-events-one-record-missing-is-not-fetched").isEmpty)
+    }
+
+    // MARK: - Series
+
+    private typealias Identity = MeetingLink.EventIdentity
+
+    func testInstancesOfOneSeriesShareTheMastersSeries() {
+        let master = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series1"))
+        let monday = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series1_20261013T090000Z"))
+        let allDay = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series1_20261014"))
+
+        XCTAssertEqual(master, Identity(series: "series1 placeholder@example.com", timestamp: ""))
+        XCTAssertEqual(monday, Identity(series: "series1 placeholder@example.com", timestamp: "20261013T090000Z"))
+        XCTAssertEqual(allDay.series, master.series)
+        XCTAssertEqual(allDay.timestamp, "20261014")
+    }
+
+    func testAnotherCalendarOrBaseIsAnotherSeries() {
+        let mine = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series1_20261013T090000Z"))
+        let theirs = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series1_20261013T090000Z", "other@example.com"))
+        let other = MeetingLink.identity(of: MeetingLinkFixtures.calendarId("series2_20261013T090000Z"))
+
+        XCTAssertNotEqual(mine.series, theirs.series)
+        XCTAssertNotEqual(mine.series, other.series)
+    }
+
+    /// Only a timestamp-shaped suffix makes an instance; padding is ignored.
+    func testOnlyATimestampSuffixMakesAnInstance() {
+        XCTAssertEqual(MeetingLink.identity(of: MeetingLinkFixtures.calendarId("under_score_id")).timestamp, "")
+        XCTAssertEqual(
+            MeetingLink.identity(of: MeetingLinkFixtures.calendarId("under_score_id")).series,
+            "under_score_id placeholder@example.com"
+        )
+        XCTAssertEqual(MeetingLink.identity(of: MeetingLinkFixtures.calendarId("_20261015T090000Z")).timestamp, "")
+        let id = MeetingLinkFixtures.calendarId("series1_20261015T090000Z")
+        XCTAssertEqual(MeetingLink.identity(of: id + "=="), MeetingLink.identity(of: id))
+    }
+
+    /// Anything that does not decode to `<id> <email>` is a series of its own.
+    func testAMalformedIdIsItsOwnSeries() {
+        for id in ["ev1", "ZXYx", "not base64!", "abcde", "", "bm9zcGFjZQ",
+                   MeetingLinkFixtures.calendarId("two spaces here")] {
+            XCTAssertEqual(MeetingLink.identity(of: id), Identity(series: "#" + MeetingLink.normalizeEventId(id), timestamp: ""), id)
+        }
+    }
+
+    func testOneSeriesUsesItsMasterOrInstanceRecords() {
+        XCTAssertEqual(answer("series-master-record-only"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet))
+        XCTAssertEqual(answer("series-instance-records-agree")?.url, MeetingLinkFixtures.meet)
+        XCTAssertEqual(answer("series-other-series-record-ignored")?.url, MeetingLinkFixtures.meet)
+        XCTAssertTrue(fetches("series-master-record-only").isEmpty)
+    }
+
+    func testOneSeriesWhoseRecordsDisagreeGetsNothing() {
+        XCTAssertEqual(answer("series-instance-records-differ"), MeetingLink.Match(url: nil, links: 2, fetched: false))
+        XCTAssertNil(answer("series-instance-record-without-link")?.url)
+    }
+
+    /// One request, for the earliest instance, whatever the chip order.
+    func testOneSeriesWithoutARecordFetchesItsEarliestInstanceOnce() {
+        XCTAssertEqual(answer("series-no-record-fetch-earliest"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet, fetched: true))
+        XCTAssertEqual(fetches("series-no-record-fetch-earliest"), [MeetingLinkFixtures.instances("series1")[0]])
+    }
+
+    func testTwoSeriesWithOneTitleKeepTheStrictRule() {
+        XCTAssertEqual(answer("two-series-same-title-differ"), MeetingLink.Match(url: nil, links: 2, fetched: false))
+        XCTAssertNil(answer("two-series-same-title-one-missing")?.url)
+        XCTAssertTrue(fetches("two-series-same-title-one-missing").isEmpty)
+        XCTAssertEqual(answer("two-series-same-title-agree")?.url, MeetingLinkFixtures.meet)
     }
 
     func testPaddingAndEncodingDoNotSplitOneEvent() {

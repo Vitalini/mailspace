@@ -122,9 +122,46 @@ enum MeetingLinkFixtures {
 
     static let fetchedNothing = MeetingLink.Match(url: nil, links: 0, fetched: true)
 
-    /// A daily meeting in week view: one chip and one record per instance,
-    /// each instance with its own id. `links` gives each instance's strings.
-    static func recurring(_ title: String, _ links: [[Any]?]) -> String {
+    static let email = "placeholder@example.com"
+
+    /// A chip's `data-eventid`: base64url of `<id> <calendar email>`, without
+    /// padding, the way Calendar spells it.
+    static func calendarId(_ id: String, _ calendar: String = email) -> String {
+        Data("\(id) \(calendar)".utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// Instance ids of one daily series, Monday to Wednesday, 09:00 UTC.
+    static func instances(_ base: String, days: [Int] = [13, 14, 15], calendar: String = email) -> [String] {
+        days.map { calendarId("\(base)_202610\($0)T090000Z", calendar) }
+    }
+
+    /// Ids the identity helper is checked on in both twins.
+    static let identityCases = [
+        calendarId("series1_20261015T090000Z"),
+        calendarId("series1_20261016T090000Z"),
+        calendarId("series1"),
+        calendarId("series1_20261015"),
+        calendarId("series1_20261015T090000Z", "other@example.com"),
+        calendarId("single1"),
+        calendarId("under_score_id"),
+        calendarId("_20261015T090000Z"),
+        "bm9zcGFjZQ", // base64url of an id with no email
+        calendarId("two spaces here"),
+        calendarId("series1_20261015T090000Z") + "==",
+        "ev1",
+        "ZXYx",
+        "not base64!",
+        "abcde",
+        ""
+    ]
+
+    /// Several unrelated events with one title: one chip and one record per
+    /// event, each id malformed and so a series of its own. `links` gives each
+    /// event's strings; `nil` is an event without a record.
+    static func sameTitleEvents(_ title: String, _ links: [[Any]?]) -> String {
         let ids = links.indices.map { "day\($0)" }
         let chips = ids.map { chip($0, title) }.joined()
         let records: [Any] = zip(ids, links).compactMap { id, strings in strings.map { record(id, title, $0) } }
@@ -205,46 +242,149 @@ enum MeetingLinkFixtures {
             expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
         ),
         Fixture(
-            name: "recurring-daily-same-link",
+            name: "same-title-events-daily-same-link",
             title: "Standup",
-            html: recurring("Standup", [[meet], [meet], ["Join: \(meet)"], [meet], [NSNull(), [meet]]]),
+            html: sameTitleEvents("Standup", [[meet], [meet], ["Join: \(meet)"], [meet], [NSNull(), [meet]]]),
             expected: found(meet)
         ),
         Fixture(
-            name: "recurring-one-instance-different-link",
+            name: "same-title-events-one-instance-different-link",
             title: "Standup",
-            html: recurring("Standup", [[meet], [meet], [otherMeet], [meet], [meet]]),
+            html: sameTitleEvents("Standup", [[meet], [meet], [otherMeet], [meet], [meet]]),
             expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
         ),
         Fixture(
-            name: "recurring-one-instance-without-link",
+            name: "same-title-events-one-instance-without-link",
             title: "Standup",
-            html: recurring("Standup", [[meet], [meet], ["Room 4"], [meet], [meet]]),
+            html: sameTitleEvents("Standup", [[meet], [meet], ["Room 4"], [meet], [meet]]),
             expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
         ),
         Fixture(
-            name: "recurring-one-record-missing-is-not-fetched",
+            name: "same-title-events-one-record-missing-is-not-fetched",
             title: "Standup",
-            html: recurring("Standup", [[meet], [meet], nil, [meet], [meet]]),
+            html: sameTitleEvents("Standup", [[meet], [meet], nil, [meet], [meet]]),
             fetched: page(eventList([record("day2", "Standup", [meet])])),
             expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
         ),
         Fixture(
-            name: "recurring-instance-with-two-links",
+            name: "same-title-events-instance-with-two-links",
             title: "Standup",
-            html: recurring("Standup", [[meet], [meet, zoom], [meet]]),
+            html: sameTitleEvents("Standup", [[meet], [meet, zoom], [meet]]),
             expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
         ),
         Fixture(
-            name: "recurring-over-the-cap",
+            name: "same-title-events-over-the-cap",
             title: "Standup",
-            html: recurring("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords + 1)),
+            html: sameTitleEvents("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords + 1)),
             expected: .nothing
         ),
         Fixture(
-            name: "recurring-at-the-cap",
+            name: "same-title-events-at-the-cap",
             title: "Standup",
-            html: recurring("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords)),
+            html: sameTitleEvents("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords)),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "series-master-record-only",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([record(calendarId("series1"), "Daily standup", [meet])])
+            ),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "series-instance-records-agree",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(instances("series1")[0], "Daily standup", [meet]),
+                    record(instances("series1")[2], "Daily standup", [NSNull(), [meet]])
+                ])
+            ),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "series-instance-records-differ",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(instances("series1")[0], "Daily standup", [meet]),
+                    record(instances("series1")[1], "Daily standup", [otherMeet])
+                ])
+            ),
+            expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
+        ),
+        Fixture(
+            name: "series-instance-record-without-link",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(calendarId("series1"), "Daily standup", [meet]),
+                    record(instances("series1")[1], "Daily standup", ["Room 4"])
+                ])
+            ),
+            expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
+        ),
+        Fixture(
+            name: "series-other-series-record-ignored",
+            title: "Daily standup",
+            html: page(
+                instances("series1").map { chip($0, "Daily standup") }.joined()
+                + eventList([
+                    record(calendarId("series1"), "Daily standup", [meet]),
+                    record(calendarId("series1", "other@example.com"), "Daily standup", [otherMeet]),
+                    record(calendarId("series2"), "Daily standup", [zoom])
+                ])
+            ),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "series-no-record-fetch-earliest",
+            title: "Daily standup",
+            html: page(
+                instances("series1", days: [15, 13, 14]).map { chip($0, "Daily standup") }.joined()
+                + eventList([record(calendarId("planning1"), "Planning")])
+            ),
+            fetched: page(eventList([record(calendarId("series1"), "Daily standup", [meet])])),
+            expected: found(meet, fetched: true)
+        ),
+        Fixture(
+            name: "two-series-same-title-differ",
+            title: "Daily standup",
+            html: page(
+                chip(instances("series1")[0], "Daily standup") + chip(instances("series2")[1], "Daily standup")
+                + eventList([
+                    record(instances("series1")[0], "Daily standup", [meet]),
+                    record(instances("series2")[1], "Daily standup", [otherMeet])
+                ])
+            ),
+            expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
+        ),
+        Fixture(
+            name: "two-series-same-title-one-missing",
+            title: "Daily standup",
+            html: page(
+                chip(instances("series1")[0], "Daily standup") + chip(instances("series2")[1], "Daily standup")
+                + eventList([record(calendarId("series1"), "Daily standup", [meet])])
+            ),
+            fetched: page(eventList([record(instances("series2")[1], "Daily standup", [meet])])),
+            expected: MeetingLink.Match(url: nil, links: 0, fetched: false)
+        ),
+        Fixture(
+            name: "two-series-same-title-agree",
+            title: "Daily standup",
+            html: page(
+                chip(instances("series1")[0], "Daily standup")
+                + chip(instances("series1", calendar: "other@example.com")[0], "Daily standup")
+                + eventList([
+                    record(instances("series1")[0], "Daily standup", [meet]),
+                    record(instances("series1", calendar: "other@example.com")[0], "Daily standup", [meet])
+                ])
+            ),
             expected: found(meet)
         ),
         Fixture(

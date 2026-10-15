@@ -103,9 +103,9 @@ enum MeetingLinkScript {
       return ids;
     }
 
-    // Several events with one title: a URL only when every record holds
-    // exactly one link and it is the same one. Never fetched.
-    function msMeetingAgreeing(perRecord) {
+    // A URL only when every record (or event) holds exactly one link and it
+    // is the same one.
+    function msMeetingAgreeing(perRecord, fetched) {
       let all = [];
       let agree = true;
       for (let i = 0; i < perRecord.length; i++) {
@@ -114,19 +114,52 @@ enum MeetingLinkScript {
       }
       const union = msMeetingDistinct(all);
       agree = agree && union.length === 1;
-      return { ok: true, url: agree ? union[0] : null, links: union.length, fetched: false };
+      return { ok: true, url: agree ? union[0] : null, links: union.length, fetched: fetched };
     }
 
-    function msMeetingIsEventURL(value, key) {
+    // Which series an event id belongs to, and which instance; see
+    // MeetingLink.identity(of:).
+    function msMeetingIdentity(eventId) {
+      const key = msMeetingEventKey(eventId);
+      const malformed = { series: '#' + key, timestamp: '' };
+      if (!/^[A-Za-z0-9_-]+$/.test(key)) { return malformed; }
+      let base64 = key.replace(/-/g, '+').replace(/_/g, '/');
+      while (base64.length % 4 !== 0) { base64 += '='; }
+      let text;
+      try { text = atob(base64); } catch (error) { return malformed; }
+      if (!/^[\\x20-\\x7e]+$/.test(text)) { return malformed; }
+      const parts = text.split(' ');
+      if (parts.length !== 2 || parts[0] === '' || parts[1] === '') { return malformed; }
+      let base = parts[0];
+      let timestamp = '';
+      const at = base.lastIndexOf('_');
+      if (at > 0 && /\(jsRegexBody(MeetingLink.instanceSuffixPattern))/.test(base.slice(at + 1))) {
+        timestamp = base.slice(at + 1);
+        base = base.slice(0, at);
+      }
+      return { series: base + ' ' + parts[1], timestamp: timestamp };
+    }
+
+    function msMeetingEarliest(identities) {
+      let best = 0;
+      for (let i = 0; i < identities.length; i++) {
+        if (identities[i].timestamp < identities[best].timestamp) { best = i; }
+      }
+      return best;
+    }
+
+    // The event id an event URL names, decoded and without padding; null when
+    // the string is not an event URL.
+    function msMeetingEventIdInURL(value) {
       const marker = '\(MeetingLink.eventURLMarker)';
       const at = value.indexOf(marker);
-      if (at < 0) { return false; }
+      if (at < 0) { return null; }
       let raw = value.slice(at + marker.length);
       const end = raw.search(/[&#]/);
       if (end >= 0) { raw = raw.slice(0, end); }
       let decoded = raw;
       try { decoded = decodeURIComponent(raw); } catch (error) { decoded = raw; }
-      return msMeetingEventKey(decoded) === key;
+      return msMeetingEventKey(decoded);
     }
 
     function msMeetingMembers(value) {
@@ -134,16 +167,18 @@ enum MeetingLinkScript {
       return Object.keys(value).map(function (name) { return value[name]; });
     }
 
-    function msMeetingRecords(value, key, records) {
+    function msMeetingRecords(value, matches, records) {
       if (value === null || typeof value !== 'object') { return; }
       const members = msMeetingMembers(value);
       for (let i = 0; i < members.length; i++) {
-        if (typeof members[i] === 'string' && msMeetingIsEventURL(members[i], key)) {
+        if (typeof members[i] !== 'string') { continue; }
+        const id = msMeetingEventIdInURL(members[i]);
+        if (id !== null && matches(id)) {
           records.push(value);
           return;
         }
       }
-      for (let i = 0; i < members.length; i++) { msMeetingRecords(members[i], key, records); }
+      for (let i = 0; i < members.length; i++) { msMeetingRecords(members[i], matches, records); }
     }
 
     function msMeetingStrings(value, strings) {
@@ -153,9 +188,9 @@ enum MeetingLinkScript {
       for (let i = 0; i < members.length; i++) { msMeetingStrings(members[i], strings); }
     }
 
-    // The distinct allow-listed links of every record for `key` in the
-    // document's scripts, or null when no script holds such a record.
-    function msMeetingRecordLinks(root, key) {
+    // Every record in the document's scripts whose event id passes
+    // `matches`, as that record's distinct allow-listed links.
+    function msMeetingRecordLinks(root, matches) {
       const records = [];
       const scripts = root.querySelectorAll('script');
       for (let i = 0; i < scripts.length; i++) {
@@ -163,44 +198,66 @@ enum MeetingLinkScript {
         if (text.indexOf('\(MeetingLink.eventListMarker)') < 0) { continue; }
         let json;
         try { json = JSON.parse(text.trim()); } catch (error) { continue; }
-        msMeetingRecords(json, key, records);
+        msMeetingRecords(json, matches, records);
       }
-      if (records.length === 0) { return null; }
-      const strings = [];
-      for (let i = 0; i < records.length; i++) { msMeetingStrings(records[i], strings); }
-      let links = [];
-      for (let i = 0; i < strings.length; i++) { links = links.concat(msMeetingTextLinks(strings[i])); }
-      return msMeetingDistinct(links);
-    }
-
-    function msMeetingDecide(links, fetched) {
-      return { ok: true, url: links.length === 1 ? links[0] : null, links: links.length, fetched: fetched };
+      const perRecord = [];
+      for (let i = 0; i < records.length; i++) {
+        const strings = [];
+        msMeetingStrings(records[i], strings);
+        let links = [];
+        for (let j = 0; j < strings.length; j++) { links = links.concat(msMeetingTextLinks(strings[j])); }
+        perRecord.push(msMeetingDistinct(links));
+      }
+      return perRecord;
     }
 
     async function msFindMeetingLink(root, title, fetchPage) {
       const nothing = { ok: true, url: null, links: 0, fetched: false };
+      const fetchedNothing = { ok: true, url: null, links: 0, fetched: true };
       const wanted = msMeetingNormalize(title);
       if (wanted === '') { return nothing; }
       const ids = msMeetingEventIds(root, wanted);
-      if (ids.length === 0 || ids.length > \(MeetingLink.maxRecurringRecords)) { return nothing; }
-      if (ids.length > 1) {
-        const perRecord = [];
-        for (let i = 0; i < ids.length; i++) { perRecord.push(msMeetingRecordLinks(root, msMeetingEventKey(ids[i]))); }
-        return msMeetingAgreeing(perRecord);
+      if (ids.length === 0) { return nothing; }
+      const identities = ids.map(msMeetingIdentity);
+
+      // One series: a single event, or the instances of one recurring event.
+      let oneSeries = true;
+      for (let i = 0; i < identities.length; i++) {
+        if (identities[i].series !== identities[0].series) { oneSeries = false; }
       }
-      const eventId = ids[0];
-      const key = msMeetingEventKey(eventId);
+      if (oneSeries) {
+        const keys = ids.map(msMeetingEventKey);
+        const series = identities[0].series;
+        const belongs = function (id) {
+          if (keys.indexOf(id) >= 0) { return true; }
+          const other = msMeetingIdentity(id);
+          return other.series === series && other.timestamp === '';
+        };
+        const found = msMeetingRecordLinks(root, belongs);
+        if (found.length > 0) { return msMeetingAgreeing(found, false); }
 
-      const local = msMeetingRecordLinks(root, key);
-      if (local !== null) { return msMeetingDecide(local, false); }
-      if (!/\(jsRegexBody(MeetingLink.fetchableEventIdPattern))/.test(eventId)) { return nothing; }
+        const first = ids[msMeetingEarliest(identities)];
+        if (!/\(jsRegexBody(MeetingLink.fetchableEventIdPattern))/.test(first)) { return nothing; }
+        let page = null;
+        try { page = await fetchPage(first); } catch (error) { page = null; }
+        if (typeof page !== 'string') { return fetchedNothing; }
+        const fetched = msMeetingRecordLinks(new DOMParser().parseFromString(page, 'text/html'), belongs);
+        if (fetched.length === 0) { return fetchedNothing; }
+        return msMeetingAgreeing(fetched, true);
+      }
 
-      let page = null;
-      try { page = await fetchPage(eventId); } catch (error) { page = null; }
-      const fetched = typeof page === 'string' ? new DOMParser().parseFromString(page, 'text/html') : null;
-      const links = fetched ? msMeetingRecordLinks(fetched, key) : null;
-      if (links === null) { return { ok: true, url: null, links: 0, fetched: true }; }
-      return msMeetingDecide(links, true);
+      // Several series with one title: every event must have its record,
+      // and every record the same one link. Never fetched.
+      if (ids.length > \(MeetingLink.maxRecurringRecords)) { return nothing; }
+      const perEvent = [];
+      for (let i = 0; i < ids.length; i++) {
+        const key = msMeetingEventKey(ids[i]);
+        const found = msMeetingRecordLinks(root, function (id) { return id === key; });
+        let all = [];
+        for (let j = 0; j < found.length; j++) { all = all.concat(found[j]); }
+        perEvent.push(found.length === 0 ? null : msMeetingDistinct(all));
+      }
+      return msMeetingAgreeing(perEvent, false);
     }
     """
 

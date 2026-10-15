@@ -1564,6 +1564,7 @@ final class MeetingLinkProbe: NSObject, WKNavigationDelegate {
     private var mismatches: [String] = []
     private var compared = 0
     private var urlsChecked = 0
+    private var identitiesChecked = 0
     private var started = false
 
     override init() {
@@ -1603,19 +1604,29 @@ final class MeetingLinkProbe: NSObject, WKNavigationDelegate {
         let refused = MeetingLinkFixtures.refusedURLs
         webView.callAsyncJavaScript(
             MeetingLinkScript.findFunction
-                + "\n\nreturn [allowed.map(msMeetingAllowed), refused.map(msMeetingAllowed)];",
-            arguments: ["allowed": allowed, "refused": refused],
+                + "\n\nreturn [allowed.map(msMeetingAllowed), refused.map(msMeetingAllowed), "
+                + "ids.map(function (id) { const found = msMeetingIdentity(id); return [found.series, found.timestamp]; })];",
+            arguments: ["allowed": allowed, "refused": refused, "ids": MeetingLinkFixtures.identityCases],
             in: nil,
             in: .defaultClient
         ) { [weak self] result in
             guard let self else { return }
-            if case .success(let value) = result, let answers = value as? [[Bool]], answers.count == 2 {
-                self.urlsChecked = answers[0].count + answers[1].count
-                for (index, accepted) in answers[0].enumerated() where !accepted {
+            if case .success(let value) = result, let answers = value as? [Any], answers.count == 3,
+               let allowedAnswers = answers[0] as? [Bool], let refusedAnswers = answers[1] as? [Bool],
+               let identities = answers[2] as? [[String]] {
+                self.urlsChecked = allowedAnswers.count + refusedAnswers.count
+                for (index, accepted) in allowedAnswers.enumerated() where !accepted {
                     self.mismatches.append("allowed#\(index):js")
                 }
-                for (index, accepted) in answers[1].enumerated() where accepted {
+                for (index, accepted) in refusedAnswers.enumerated() where accepted {
                     self.mismatches.append("refused#\(index):js")
+                }
+                self.identitiesChecked = identities.count
+                for (index, id) in MeetingLinkFixtures.identityCases.enumerated() {
+                    let swift = MeetingLink.identity(of: id)
+                    if index >= identities.count || identities[index] != [swift.series, swift.timestamp] {
+                        self.mismatches.append("identity#\(index)")
+                    }
                 }
             } else {
                 self.mismatches.append("allow-list:script-error")
@@ -1676,7 +1687,8 @@ final class MeetingLinkProbe: NSObject, WKNavigationDelegate {
             )
         }
         SelfTest.finish(
-            "meetinglink result=ok fixtures=\(total) compared=\(compared) urls=\(urlsChecked) mismatches=0 network=none"
+            "meetinglink result=ok fixtures=\(total) compared=\(compared) urls=\(urlsChecked) "
+            + "ids=\(identitiesChecked) mismatches=0 network=none"
         )
     }
 }
