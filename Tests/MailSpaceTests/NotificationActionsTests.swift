@@ -70,10 +70,11 @@ final class NotificationActionsTests: XCTestCase {
         let handled = NotificationCategory.handle(
             actionIdentifier: NotificationCategory.ActionId.copyCode,
             userInfo: withCode,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            open: { _ in XCTFail("nothing may be opened") }
         )
 
-        XCTAssertTrue(handled)
+        XCTAssertEqual(handled, .done)
         XCTAssertEqual(pasteboard.string(forType: .string), "482913")
         XCTAssertEqual(pasteboard.pasteboardItems?.count, 1)
     }
@@ -83,10 +84,11 @@ final class NotificationActionsTests: XCTestCase {
         let handled = NotificationCategory.handle(
             actionIdentifier: UNNotificationDefaultActionIdentifier,
             userInfo: withCode,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            open: { _ in XCTFail("nothing may be opened") }
         )
 
-        XCTAssertFalse(handled)
+        XCTAssertEqual(handled, .notHandled)
         XCTAssertEqual(pasteboard.string(forType: .string), "old")
     }
 
@@ -94,10 +96,11 @@ final class NotificationActionsTests: XCTestCase {
         let handled = NotificationCategory.handle(
             actionIdentifier: UNNotificationDismissActionIdentifier,
             userInfo: withCode,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            open: { _ in XCTFail("nothing may be opened") }
         )
 
-        XCTAssertFalse(handled)
+        XCTAssertEqual(handled, .notHandled)
         XCTAssertEqual(pasteboard.string(forType: .string), "old")
     }
 
@@ -107,10 +110,11 @@ final class NotificationActionsTests: XCTestCase {
         let handled = NotificationCategory.handle(
             actionIdentifier: NotificationCategory.ActionId.copyCode,
             userInfo: [:],
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            open: { _ in XCTFail("nothing may be opened") }
         )
 
-        XCTAssertTrue(handled)
+        XCTAssertEqual(handled, .done)
         XCTAssertEqual(pasteboard.string(forType: .string), "old")
         XCTAssertEqual(logged.count, 1)
     }
@@ -120,7 +124,8 @@ final class NotificationActionsTests: XCTestCase {
         _ = NotificationCategory.handle(
             actionIdentifier: NotificationCategory.ActionId.copyCode,
             userInfo: withCode,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            open: { _ in XCTFail("nothing may be opened") }
         )
 
         XCTAssertFalse(logged.contains { $0.contains("482913") })
@@ -130,9 +135,11 @@ final class NotificationActionsTests: XCTestCase {
 
     private let meet = "https://meet.google.com/abc-defg-hij"
 
-    private func join(_ info: [AnyHashable: Any], action: String = NotificationCategory.ActionId.join) -> (NotificationCategory.JoinResult, [URL]) {
+    private func join(_ info: [AnyHashable: Any], action: String = NotificationCategory.ActionId.join) -> (NotificationCategory.ActionResult, [URL]) {
         var opened: [URL] = []
-        let result = NotificationCategory.handleJoin(actionIdentifier: action, userInfo: info) { opened.append($0) }
+        let result = NotificationCategory.handle(actionIdentifier: action, userInfo: info, pasteboard: pasteboard) {
+            opened.append($0)
+        }
         return (result, opened)
     }
 
@@ -140,7 +147,7 @@ final class NotificationActionsTests: XCTestCase {
     func testJoinOpensTheMeeting() {
         let (result, opened) = join([NotificationCategory.InfoKey.meetingURL: meet])
 
-        XCTAssertEqual(result, .opened)
+        XCTAssertEqual(result, .done)
         XCTAssertEqual(opened, [URL(string: meet)!])
     }
 
@@ -159,17 +166,17 @@ final class NotificationActionsTests: XCTestCase {
         XCTAssertTrue(opened.isEmpty)
     }
 
+    /// Each button acts only on its own key: Copy Code opens nothing, and
+    /// Join never writes the pasteboard.
     func testCopyAndJoinIgnoreEachOther() {
         let (result, opened) = join([NotificationCategory.InfoKey.meetingURL: meet], action: NotificationCategory.ActionId.copyCode)
-        XCTAssertEqual(result, .notHandled)
+        XCTAssertEqual(result, .done)
         XCTAssertTrue(opened.isEmpty)
+        XCTAssertEqual(pasteboard.string(forType: .string), "old")
 
-        let copied = NotificationCategory.handle(
-            actionIdentifier: NotificationCategory.ActionId.join,
-            userInfo: withCode,
-            pasteboard: pasteboard
-        )
-        XCTAssertFalse(copied)
+        let (joined, joinOpened) = join(withCode)
+        XCTAssertEqual(joined, .focusCalendar)
+        XCTAssertTrue(joinOpened.isEmpty)
         XCTAssertEqual(pasteboard.string(forType: .string), "old")
     }
 

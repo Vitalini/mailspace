@@ -434,20 +434,16 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // The delivery queue is not documented as main, and NSPasteboard,
         // NSWorkspace and the router are AppKit: everything below runs on main.
         DispatchQueue.main.async { [weak self] in
-            // A notification's own button first: Copy Code acts in place, with
-            // no tab switch and without bringing MailSpace forward.
-            if NotificationCategory.handle(actionIdentifier: actionIdentifier, userInfo: info, pasteboard: .general) {
-                completionHandler()
-                return
-            }
-            // Join opens the meeting in the default browser, again only after
-            // the allow-list check. A link that fails it shows the Calendar tab.
-            switch NotificationCategory.handleJoin(
+            // A notification's own button first. Copy Code and Join act in
+            // place, with no tab switch and without bringing MailSpace forward;
+            // Join opens the meeting only after the allow-list check again.
+            switch NotificationCategory.handle(
                 actionIdentifier: actionIdentifier,
                 userInfo: info,
+                pasteboard: .general,
                 open: { NSWorkspace.shared.open($0) }
             ) {
-            case .opened:
+            case .done:
                 completionHandler()
                 return
             case .focusCalendar:

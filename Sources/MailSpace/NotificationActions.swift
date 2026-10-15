@@ -6,8 +6,9 @@ import UserNotifications
 ///
 /// One owner on purpose: `setNotificationCategories` replaces the whole set,
 /// so a second registration site would silently delete this one's categories.
-/// A new action is a new case here plus a branch in `handle`; registration and
-/// dispatch stay as they are.
+/// A new action is a new case here plus a branch in `handle`, which answers
+/// with one `ActionResult`; registration and the one switch in
+/// `NotificationBridge`'s `didReceive` stay as they are.
 enum NotificationCategory: CaseIterable {
     /// A Mail notification carrying one confident sign-in code (`OneTimeCode`).
     case oneTimeCode
@@ -58,50 +59,52 @@ enum NotificationCategory: CaseIterable {
         Set(allCases.map(\.category))
     }
 
-    /// Runs a category's own action. Returns `false` for anything else — a
-    /// body click, a dismissal — so the caller keeps its usual routing.
+    /// What a press on a notification did.
+    enum ActionResult: Equatable {
+        /// Not one of this registry's buttons (a body click, a dismissal): the
+        /// caller keeps its usual routing.
+        case notHandled
+        /// The button did its work in place: Copy Code wrote the pasteboard (or
+        /// had nothing to write), Join handed the meeting to the browser.
+        case done
+        /// Join had no allowed link: nothing was opened, and the caller shows
+        /// the account's Calendar tab instead.
+        case focusCalendar
+    }
+
+    /// Runs a category's own action.
     ///
-    /// The pasteboard is a parameter so tests never touch the user's clipboard.
-    /// Nothing from the notification is ever logged.
-    static func handle(actionIdentifier: String, userInfo: [AnyHashable: Any], pasteboard: NSPasteboard) -> Bool {
+    /// The pasteboard and the opener are parameters so tests never touch the
+    /// user's clipboard or launch a browser. A stored meeting URL is checked
+    /// against the allow-list again before anything is opened (R30). Nothing
+    /// from the notification is ever logged (R9, R31).
+    static func handle(
+        actionIdentifier: String,
+        userInfo: [AnyHashable: Any],
+        pasteboard: NSPasteboard,
+        open: (URL) -> Void
+    ) -> ActionResult {
         switch actionIdentifier {
         case ActionId.copyCode:
             guard let code = userInfo[InfoKey.code] as? String, !code.isEmpty else {
                 Log.error("Copy Code pressed on a notification that carries no code")
-                return true
+                return .done
             }
             pasteboard.clearContents()
             pasteboard.setString(code, forType: .string)
-            return true
+            return .done
+        case ActionId.join:
+            guard let raw = userInfo[InfoKey.meetingURL] as? String,
+                  MeetingLink.isAllowed(raw),
+                  let url = URL(string: raw)
+            else {
+                Log.error("Join pressed on a notification without an allowed meeting link")
+                return .focusCalendar
+            }
+            open(url)
+            return .done
         default:
-            return false
+            return .notHandled
         }
-    }
-
-    /// What a Join press did.
-    enum JoinResult: Equatable {
-        /// Not a Join press; the caller keeps its usual routing.
-        case notHandled
-        /// The meeting was handed to the default browser.
-        case opened
-        /// The stored link is missing or fails the allow-list: nothing was
-        /// opened, and the caller shows the account's Calendar tab instead.
-        case focusCalendar
-    }
-
-    /// Runs the Join action. The stored URL is checked against the allow-list
-    /// again before anything is opened (R30); `open` is a parameter so tests
-    /// never launch a browser. The URL is never logged (R31).
-    static func handleJoin(actionIdentifier: String, userInfo: [AnyHashable: Any], open: (URL) -> Void) -> JoinResult {
-        guard actionIdentifier == ActionId.join else { return .notHandled }
-        guard let raw = userInfo[InfoKey.meetingURL] as? String,
-              MeetingLink.isAllowed(raw),
-              let url = URL(string: raw)
-        else {
-            Log.error("Join pressed on a notification without an allowed meeting link")
-            return .focusCalendar
-        }
-        open(url)
-        return .opened
     }
 }
