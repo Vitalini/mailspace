@@ -44,15 +44,17 @@ enum NotificationContent {
 enum JoinSource: String {
     /// The notification's own `data` held exactly one allow-listed link.
     case data
-    /// The page lookup matched the title inside an event container.
+    /// The event's record in the page's inline event list held it.
     case page
-    /// The page lookup matched the title outside every event container.
-    case pageFallback = "page-fallback"
+    /// The event's record in the fetched event page held it.
+    case fetch
     /// The lookup answered, with no single allow-listed link.
     case none
+    /// The page script failed or answered something else.
+    case error
     /// The lookup did not answer within the deadline.
     case timeout
-    /// No Calendar webview to ask.
+    /// The Calendar webview was gone before it could be asked.
     case noWebView = "no-webview"
 }
 
@@ -163,6 +165,20 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         return UNUserNotificationCenter.current()
     }
 
+    /// Where `post` hands a web notification's request: the current centre, or
+    /// `nil` when there is none. A seam so a test can stand in for the centre.
+    lazy var addRequest: ((UNNotificationRequest) -> Void)? = self.center.map { center in
+        { request in
+            center.add(request) { error in
+                if let error {
+                    // Domain and code only: an error's text could echo the content.
+                    let nsError = error as NSError
+                    Log.error("could not post notification: \(nsError.domain) \(nsError.code)")
+                }
+            }
+        }
+    }
+
     /// What `start()` is allowed to ask the system for, decided by the identity
     /// the process is running under. This is the single place a permission
     /// prompt can come from, and it is why an automated run cannot raise one:
@@ -231,6 +247,15 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // notification, this decides whether the user wants to see it (A2/A3).
         guard NotificationPolicy.shouldPost(account: account, view: view) else { return }
 
+        deliver(payload: payload, from: webView, account: account, view: view)
+    }
+
+    /// Posts one web notification that passed the origin and policy checks.
+    ///
+    /// Mail posts at once. Calendar waits up to `JoinLookup.deadline` for a
+    /// meeting link, then posts once; the R32 line is written at that moment,
+    /// with names and counts only.
+    func deliver(payload: [String: Any], from webView: WKWebView, account: Account, view: AccountView) {
         let title = (payload["title"] as? String) ?? ""
         let body = (payload["body"] as? String) ?? ""
         let tag = (payload["tag"] as? String) ?? ""
@@ -241,9 +266,6 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             return
         }
 
-        // Calendar waits up to `JoinLookup.deadline` for a meeting link, then
-        // posts once. The R32 line is written at that moment, with names and
-        // counts only.
         let optionKeys = (payload["optionKeys"] as? [String]) ?? []
         let dataKeys = (payload["dataKeys"] as? [String]) ?? []
         let actionCount = (payload["actionCount"] as? Int) ?? 0
@@ -261,18 +283,23 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             )
         }
 
-        if let outcome = JoinLookup.immediate(dataLink: payload["dataLink"] as? String, hasWebView: true) {
+        if let outcome = JoinLookup.immediate(dataLink: payload["dataLink"] as? String) {
             finish(outcome)
             return
         }
         JoinLookup.start(
             lookup: { [weak self, weak webView] answer in
-                guard let self, let webView else { return answer(nil) }
-                self.askMeetingLink(webView, title) { answer(Self.meetingMatch(from: $0)) }
+                guard let self, let webView else { return answer(.noWebView) }
+                self.askMeetingLink(webView, title) { answer(Self.meetingAnswer(from: $0)) }
             },
-            schedule: { delay, fire in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: fire) },
+            schedule: scheduleDeadline,
             post: finish
         )
+    }
+
+    /// Runs the Join deadline. A seam for tests; the app uses the main queue.
+    var scheduleDeadline: (TimeInterval, @escaping () -> Void) -> Void = { delay, fire in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: fire)
     }
 
     /// How the meeting-link script is put to a Calendar webview. A seam like
@@ -289,17 +316,17 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         )
     }
 
-    /// The script's `{ ok, url, links, fallback }`, or `nil` when it failed.
-    static func meetingMatch(from result: Result<Any, any Error>) -> MeetingLink.Match? {
+    /// The script's `{ ok, url, links, fetched }`, or `.failed`.
+    static func meetingAnswer(from result: Result<Any, any Error>) -> JoinLookup.Answer {
         guard case .success(let value) = result,
               let payload = value as? [String: Any],
               (payload["ok"] as? Bool) == true
-        else { return nil }
-        return MeetingLink.Match(
+        else { return .failed }
+        return .match(MeetingLink.Match(
             url: payload["url"] as? String,
             links: (payload["links"] as? Int) ?? 0,
-            fallback: (payload["fallback"] as? Bool) ?? false
-        )
+            fetched: (payload["fetched"] as? Bool) ?? false
+        ))
     }
 
     /// A download that has just landed (G4). Not a web notification: it carries
@@ -338,7 +365,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         view: AccountView,
         meetingURL: String? = nil
     ) {
-        guard let center else { return }
+        guard let addRequest else { return }
 
         let content = UNMutableNotificationContent()
         content.title = NotificationContent.title(payloadTitle: title, accountName: account.name)
@@ -357,14 +384,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         }
 
         let identifier = NotificationContent.identifier(tag: tag, accountId: account.id)
-
-        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
-            if let error {
-                // Domain and code only: an error's text could echo the content.
-                let nsError = error as NSError
-                Log.error("could not post notification: \(nsError.domain) \(nsError.code)")
-            }
-        }
+        addRequest(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
 
         let accountId = account.id
         DispatchQueue.main.async { [weak self] in

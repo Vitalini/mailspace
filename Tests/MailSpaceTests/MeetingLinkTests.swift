@@ -6,35 +6,37 @@ import XCTest
 final class MeetingLinkTests: XCTestCase {
     // MARK: - Allow-list
 
-    func testTheAllowListAcceptsMeetZoomAndTeams() {
-        for url in [
-            "https://meet.google.com/abc-defg-hij",
-            "https://meet.google.com/abc-defg-hij?authuser=0",
-            "https://us02web.zoom.us/j/123456789?pwd=x",
-            "https://zoom.us/j/123456789",
-            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_placeholder%40thread.v2/0?context=%7b%7d"
-        ] {
+    /// One table for the Swift gate, the page script's gate (smoke) and this.
+    func testTheAllowListAcceptsEveryAllowedURL() {
+        for url in MeetingLinkFixtures.allowedURLs {
             XCTAssertTrue(MeetingLink.isAllowed(url), url)
         }
     }
 
-    func testTheAllowListRejectsEverythingElse() {
-        for url in [
-            "https://meet.google.com/linkredirect?dest=https://evil.example",
-            "https://meet.google.com/abc-defg-hij/extra",
-            "http://meet.google.com/abc-defg-hij",
-            "https://meet.google.com.evil.example/x",
-            "https://evilzoom.us/j/1",
-            "https://zoom.us/webinar/1",
-            "https://zoom.us@evil.example/j/1",
-            "https://teams.microsoft.com/settings",
-            "https://meet.google.com/abc-defg-hij\n",
-            "javascript:alert(1)",
-            "/abc-defg-hij",
-            ""
-        ] {
+    func testTheAllowListRefusesEveryRefusedURL() {
+        for url in MeetingLinkFixtures.refusedURLs {
             XCTAssertFalse(MeetingLink.isAllowed(url), url)
         }
+    }
+
+    /// The gate admits a subset of what opens as-is: every allowed URL parses,
+    /// stays on its host, and has no dot segment for the browser to resolve.
+    func testEveryAllowedURLOpensExactlyAsWritten() throws {
+        let hosts = ["meet.google.com", "zoom.us", "us02web.zoom.us", "teams.microsoft.com"]
+        for raw in MeetingLinkFixtures.allowedURLs {
+            let url = try XCTUnwrap(URL(string: raw), raw)
+            XCTAssertTrue(hosts.contains(url.host ?? ""), raw)
+            XCTAssertEqual(url.standardized.absoluteString, raw, raw)
+        }
+    }
+
+    /// Review #1: nothing may climb out of `/l/meetup-join/`.
+    func testTeamsRefusesDotSegmentsEncodedDotsAndBackslashes() {
+        let base = "https://teams.microsoft.com/l/meetup-join/"
+        for tail in ["../x", "x/../y", "./x", "x/./y", "%2e%2e/x", "%2E./x", "x/.%2e/y", "x\\..\\y", "x\\y"] {
+            XCTAssertFalse(MeetingLink.isAllowed(base + tail), tail)
+        }
+        XCTAssertTrue(MeetingLink.isAllowed(base + "19%3ameeting_placeholder%40thread.v2/0"))
     }
 
     // MARK: - Fixtures
@@ -43,73 +45,105 @@ final class MeetingLinkTests: XCTestCase {
     /// script is held to the same table by `MAILSPACE_SELFTEST=meetinglink`.
     func testEveryFixtureMatchesItsExpectedResult() {
         for fixture in MeetingLinkFixtures.all {
-            XCTAssertEqual(
-                MeetingLink.find(html: fixture.html, title: fixture.title),
-                fixture.expected,
-                fixture.name
-            )
+            XCTAssertEqual(answer(fixture), fixture.expected, fixture.name)
         }
     }
 
-    func testFixtureNamesAreUnique() {
+    func testThereAreAtLeastTwentyUniquelyNamedFixtures() {
         let names = MeetingLinkFixtures.all.map(\.name)
+        XCTAssertGreaterThanOrEqual(names.count, 20)
         XCTAssertEqual(Set(names).count, names.count)
     }
 
+    private func answer(_ fixture: MeetingLinkFixtures.Fixture) -> MeetingLink.Match {
+        MeetingLink.find(html: fixture.html, title: fixture.title) { _ in fixture.fetched }
+    }
+
     private func answer(_ name: String) -> MeetingLink.Match? {
-        MeetingLinkFixtures.all.first { $0.name == name }.map { MeetingLink.find(html: $0.html, title: $0.title) }
+        MeetingLinkFixtures.all.first { $0.name == name }.map(answer)
+    }
+
+    /// The ids the fetch was asked for, per fixture.
+    private func fetches(_ name: String) -> [String] {
+        guard let fixture = MeetingLinkFixtures.all.first(where: { $0.name == name }) else { return [] }
+        var asked: [String] = []
+        _ = MeetingLink.find(html: fixture.html, title: fixture.title) { id in
+            asked.append(id)
+            return fixture.fetched
+        }
+        return asked
     }
 
     /// AE9.
-    func testOneEventWithAMeetAnchorGivesThatMeeting() {
-        XCTAssertEqual(answer("anchor-in-event")?.url, MeetingLinkFixtures.meet)
-        XCTAssertEqual(answer("text-link-in-event")?.url, MeetingLinkFixtures.meet)
+    func testTheRecordOfTheOneMatchingEventGivesItsMeeting() {
+        XCTAssertEqual(answer("meet-in-record")?.url, MeetingLinkFixtures.meet)
+        XCTAssertEqual(answer("zoom-only-in-location")?.url, MeetingLinkFixtures.zoom)
+        XCTAssertEqual(answer("teams-in-record")?.url, MeetingLinkFixtures.teams)
+        XCTAssertEqual(answer("record-as-object")?.url, MeetingLinkFixtures.meet)
     }
 
-    /// AE10: two events with the same name are no button.
+    /// AE10 and review #4: two events with the same title are no button, even
+    /// when only one of them has a link.
     func testTwoEventsWithTheSameTitleGiveNothing() {
-        XCTAssertNil(answer("two-events-same-title")?.url)
-        XCTAssertEqual(answer("two-events-same-title")?.links, 2)
+        XCTAssertEqual(answer("decoy-same-title-two-events"), .nothing)
+        XCTAssertEqual(answer("decoy-same-title-one-without-link"), .nothing)
+        XCTAssertTrue(fetches("decoy-same-title-one-without-link").isEmpty)
+    }
+
+    func testPaddingAndEncodingDoNotSplitOneEvent() {
+        XCTAssertEqual(answer("one-event-two-chips-padding-ignored")?.url, MeetingLinkFixtures.meet)
+        XCTAssertEqual(answer("record-url-encoded-with-params")?.url, MeetingLinkFixtures.meet)
+    }
+
+    func testTwoDifferentLinksInTheRecordGiveNothing() {
+        XCTAssertEqual(answer("two-links-differ"), MeetingLink.Match(url: nil, links: 2, fetched: false))
     }
 
     /// AE11.
-    func testASuffixTrickHostGivesNothing() {
+    func testHostTricksGiveNothing() {
         XCTAssertNil(answer("suffix-trick-host")?.url)
+        XCTAssertNil(answer("link-redirect")?.url)
+        XCTAssertNil(answer("teams-dot-segments")?.url)
     }
 
     /// AE12.
-    func testAnEventWithoutALinkGivesNothing() {
-        XCTAssertEqual(answer("event-without-link"), .nothing)
+    func testARecordWithoutALinkGivesNothingAndIsNotFetched() {
+        XCTAssertEqual(answer("record-without-link"), .nothing)
+        XCTAssertTrue(fetches("record-without-link").isEmpty)
     }
 
-    func testAnExactTitleIsRequired() {
-        XCTAssertNil(answer("reply-prefix-is-not-a-match")?.url)
-        XCTAssertNil(answer("title-only-in-description")?.url)
-        XCTAssertNil(answer("reminder-prefix-fails-safe")?.url)
+    func testAnExactTitleInsideAChipIsRequired() {
+        XCTAssertEqual(answer("reply-prefix-is-not-a-match"), .nothing)
+        XCTAssertEqual(answer("reminder-prefix-fails-safe"), .nothing)
+        XCTAssertEqual(answer("title-outside-every-chip"), .nothing)
     }
 
-    func testNothingOutsideAnEventIsBorrowed() {
-        XCTAssertNil(answer("link-in-another-event")?.url)
-        XCTAssertNil(answer("title-and-link-loose-in-body")?.url)
-        XCTAssertNil(answer("fallback-never-borrows-from-an-event")?.url)
+    func testAnotherEventsRecordIsNeverBorrowed() {
+        XCTAssertEqual(answer("link-in-another-events-record"), .nothing)
+        XCTAssertEqual(answer("id-prefix-is-not-a-match"), MeetingLinkFixtures.fetchedNothing)
     }
 
-    /// The fallback runs only when event containers gave no link at all; an
-    /// ambiguous container answer is final.
-    func testTheFallbackNeverOverridesAnAmbiguousEvent() {
-        XCTAssertEqual(answer("ambiguity-in-events-is-final"), MeetingLink.Match(url: nil, links: 2, fallback: false))
+    // MARK: - Fetch fallback
+
+    func testAMissingRecordIsFetchedOnceForThatEvent() {
+        XCTAssertEqual(answer("record-missing-fetch-finds-it"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet, fetched: true))
+        XCTAssertEqual(fetches("record-missing-fetch-finds-it"), ["ev1"])
+        XCTAssertEqual(answer("marker-in-a-non-json-script")?.url, MeetingLinkFixtures.zoom)
     }
 
-    func testTheFallbackFindsAnOpenEventOutsideTheGrid() {
-        XCTAssertEqual(answer("fallback-open-event-dialog")?.url, MeetingLinkFixtures.meet)
-        XCTAssertEqual(answer("fallback-open-event-dialog")?.fallback, true)
-        XCTAssertEqual(answer("fallback-aria-label")?.url, MeetingLinkFixtures.zoom)
-        XCTAssertNil(answer("fallback-hidden-is-ignored")?.url)
-        XCTAssertNil(answer("fallback-too-far-away")?.url)
+    func testASignedOutOrEmptyFetchGivesNothing() {
+        XCTAssertEqual(answer("record-missing-signed-out"), MeetingLinkFixtures.fetchedNothing)
+        XCTAssertEqual(answer("record-missing-from-fetched-page"), MeetingLinkFixtures.fetchedNothing)
+        XCTAssertEqual(answer("fetched-record-two-links"), MeetingLink.Match(url: nil, links: 2, fetched: true))
+    }
+
+    func testAnIdUnfitForAURLIsNeverFetched() {
+        XCTAssertEqual(answer("id-unfit-for-a-url-is-not-fetched"), .nothing)
+        XCTAssertTrue(fetches("id-unfit-for-a-url-is-not-fetched").isEmpty)
     }
 
     func testAnEmptyTitleGivesNothing() {
-        XCTAssertEqual(MeetingLink.find(html: MeetingLinkFixtures.page(""), title: "  "), .nothing)
+        XCTAssertEqual(MeetingLink.find(html: MeetingLinkFixtures.page(""), title: "  ") { _ in nil }, .nothing)
         XCTAssertEqual(answer("empty-title"), .nothing)
     }
 }

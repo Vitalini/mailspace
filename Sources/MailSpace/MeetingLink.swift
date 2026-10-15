@@ -4,45 +4,54 @@ import Foundation
 ///
 /// **This is the reference, not the production lookup.** The lookup that ships
 /// runs inside the Calendar page (`MeetingLinkScript`), because the page holds
-/// event titles and only one allow-listed URL may cross back. This file is the
-/// same rules in Swift, run over the same hand-written fixtures, and
-/// `MAILSPACE_SELFTEST=meetinglink` asserts the two agree on every one. The
-/// allow-list half *is* on the production path: the bridge and the Join
-/// handler re-check every URL with it.
+/// event titles and its event list, and only one allow-listed URL may cross
+/// back. This file is the same rules in Swift, run over the same hand-written
+/// fixtures, and `MAILSPACE_SELFTEST=meetinglink` asserts the two agree on
+/// every one. The allow-list half *is* on the production path: the bridge and
+/// the Join handler re-check every URL with it.
 ///
-/// The lookup, in two tiers:
+/// The lookup:
 ///
-/// 1. **Event containers.** A text node whose normalised text equals the title
-///    exactly marks its nearest `[data-eventid]` ancestor. The allow-listed
-///    links inside the marked containers are collected. Containment is not a
-///    match, and nothing outside a container counts in this tier.
-/// 2. **Fallback, only when tier 1 collected no link.** A title-bearing
-///    element outside every event container — a text node's parent, or an
-///    element whose `aria-label` equals the title — that is not hidden
-///    (`hidden`, `aria-hidden="true"`) looks for links in itself and then in at
-///    most `fallbackDepth` ancestors. The walk never reaches `body`, and it
-///    stops at any scope that holds an event container, so a link can never be
-///    borrowed from a neighbouring event.
+/// 1. **The event.** A text node whose normalised text equals the title
+///    exactly marks its nearest `[data-eventid]` ancestor. Containment is not a
+///    match. The marked chips must name exactly one event id (trailing `=`
+///    ignored); none, or two different ids, is no link. Week-view chips do not
+///    carry the meeting link, so nothing inside a chip is read as a link.
+/// 2. **The record.** The page's inline `<script>` holds a JSON event list for
+///    the visible week. A record is the innermost array or object with a
+///    direct string member holding `/calendar/event?eid=<that id>`. No field
+///    position is relied on.
+/// 3. **The link.** Every string inside the record is scanned for link-shaped
+///    text; the allow-listed ones are collected.
+/// 4. **Fetch, only when no record was found.** The event's own page,
+///    `/calendar/event?eid=<id>`, carries the same list for the event's week,
+///    and steps 2–3 run on it. A failed or signed-out fetch is no link.
 ///
-/// Either tier answers a URL only when it collected exactly one distinct
-/// allow-listed URL. Two is ambiguity, and ambiguity is no button.
+/// The answer is a URL only when exactly one distinct allow-listed URL was
+/// collected. Two is ambiguity, and ambiguity is no button.
 enum MeetingLink {
     /// What one lookup found. `url` is set only when `links == 1`.
     struct Match: Equatable {
         let url: String?
-        /// Distinct allow-listed URLs the deciding tier collected.
+        /// Distinct allow-listed URLs in the event's record.
         let links: Int
-        /// Whether tier 2 decided.
-        let fallback: Bool
+        /// Whether the record came from the fetched event page.
+        let fetched: Bool
 
-        static let nothing = Match(url: nil, links: 0, fallback: false)
+        static let nothing = Match(url: nil, links: 0, fetched: false)
     }
 
-    /// Ancestors tier 2 may climb above the title-bearing element.
-    static let fallbackDepth = 3
-
-    /// The attribute Google Calendar puts on an event element.
+    /// The attribute Google Calendar puts on an event chip.
     static let eventAttribute = "data-eventid"
+
+    /// What an event record's own URL contains, followed by the event id.
+    static let eventURLMarker = "/calendar/event?eid="
+
+    /// The event page the fetch fallback asks for, relative to the page origin.
+    static let eventPagePath = "/calendar/event?eid="
+
+    /// An event id the fetch may put in a URL: base64url, optional padding.
+    static let fetchableEventIdPattern = "^[A-Za-z0-9_-]+=*$"
 
     // MARK: - Allow-list (R28)
 
@@ -50,11 +59,17 @@ enum MeetingLink {
     /// `https`, lowercase, exact host or dot-suffix (never substring):
     /// - `meet.google.com`, path exactly one meeting code, query allowed;
     /// - `zoom.us` or `*.zoom.us`, path `/j/<digits>`, query allowed;
-    /// - `teams.microsoft.com`, path under `/l/meetup-join/`.
+    /// - `teams.microsoft.com`, path under `/l/meetup-join/` with no segment
+    ///   that starts with a dot, no `%2e` and no backslash, so the path cannot
+    ///   be normalised out of `/l/meetup-join/`; query allowed.
+    ///
+    /// `MeetingLinkFixtures.allowedURLs` and `refusedURLs` are the one table
+    /// both twins and the unit tests check these against.
     static let allowPatterns = [
         "^https://meet\\.google\\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(\\?[^\\s#\"'<>]*)?$",
         "^https://([a-z0-9-]+\\.)*zoom\\.us/j/[0-9]+(\\?[^\\s#\"'<>]*)?$",
-        "^https://teams\\.microsoft\\.com/l/meetup-join/[^\\s#\"'<>]+$"
+        "^https://teams\\.microsoft\\.com/l/meetup-join/(?!\\.)(?![^?]*(/\\.|%2[eE]))"
+            + "[^\\s#\"'<>?\\\\]+(\\?[^\\s#\"'<>\\\\]*)?$"
     ]
 
     private static let allowExpressions: [NSRegularExpression] = allowPatterns.compactMap {
@@ -78,50 +93,26 @@ enum MeetingLink {
     static let textLinkPattern = "https://[^\\s<>\"']+"
     static let trailingPunctuation = ".,;:!?)]}"
 
-    static func find(html: String, title: String) -> Match {
+    private static let textLinkExpression = try? NSRegularExpression(pattern: textLinkPattern)
+    private static let fetchableExpression = try? NSRegularExpression(pattern: fetchableEventIdPattern)
+
+    /// - Parameter fetch: the event page for an event id, or `nil` when the
+    ///   fetch failed or left the Calendar origin. Called at most once.
+    static func find(html: String, title: String, fetch: (String) -> String?) -> Match {
         let wanted = normalize(title)
         guard !wanted.isEmpty else { return .nothing }
         let root = Document.parse(html)
+        guard let eventId = eventId(in: root, title: wanted) else { return .nothing }
+        let key = normalizeEventId(eventId)
 
-        // Tier 1.
-        var events: [Element] = []
-        for text in root.textNodes() where normalize(text.data) == wanted {
-            guard let event = text.parent?.closest(where: { $0.attributes[eventAttribute] != nil }) else { continue }
-            if !events.contains(where: { $0 === event }) { events.append(event) }
+        if let links = recordLinks(in: root, eventId: key) {
+            return decide(links, fetched: false)
         }
-        let tierOne = distinct(events.flatMap(links(in:)))
-        if !tierOne.isEmpty {
-            return Match(url: tierOne.count == 1 ? tierOne[0] : nil, links: tierOne.count, fallback: false)
+        guard isFetchable(eventId) else { return .nothing }
+        guard let page = fetch(eventId), let links = recordLinks(in: Document.parse(page), eventId: key) else {
+            return Match(url: nil, links: 0, fetched: true)
         }
-
-        // Tier 2.
-        var bearers: [Element] = []
-        for text in root.textNodes() where normalize(text.data) == wanted {
-            if let parent = text.parent, !bearers.contains(where: { $0 === parent }) { bearers.append(parent) }
-        }
-        for element in root.elements() where normalize(element.attributes["aria-label"] ?? "") == wanted {
-            if !bearers.contains(where: { $0 === element }) { bearers.append(element) }
-        }
-        var found: [String] = []
-        for bearer in bearers {
-            guard bearer.closest(where: { $0.attributes[eventAttribute] != nil }) == nil else { continue }
-            guard bearer.closest(where: isHidden) == nil else { continue }
-            var scope: Element? = bearer
-            var climbed = 0
-            while let current = scope, climbed <= fallbackDepth, !isDocumentLevel(current) {
-                if current.elements().contains(where: { $0.attributes[eventAttribute] != nil }) { break }
-                let here = links(in: current)
-                if !here.isEmpty {
-                    found += here
-                    break
-                }
-                scope = current.parent
-                climbed += 1
-            }
-        }
-        let tierTwo = distinct(found)
-        guard !tierTwo.isEmpty else { return .nothing }
-        return Match(url: tierTwo.count == 1 ? tierTwo[0] : nil, links: tierTwo.count, fallback: true)
+        return decide(links, fetched: true)
     }
 
     /// Whitespace runs (including no-break spaces) collapsed, then trimmed.
@@ -131,33 +122,98 @@ enum MeetingLink {
             .joined(separator: " ")
     }
 
-    private static func isHidden(_ element: Element) -> Bool {
-        element.attributes["hidden"] != nil || element.attributes["aria-hidden"] == "true"
+    /// An event id without its base64 padding, the form the record URL and the
+    /// chip attribute share.
+    static func normalizeEventId(_ id: String) -> String {
+        var id = id
+        while id.hasSuffix("=") { id.removeLast() }
+        return id
     }
 
-    private static func isDocumentLevel(_ element: Element) -> Bool {
-        ["html", "head", "body", "#root"].contains(element.name)
+    static func isFetchable(_ id: String) -> Bool {
+        let range = NSRange(id.startIndex..<id.endIndex, in: id)
+        return fetchableExpression?.firstMatch(in: id, range: range)?.range == range
     }
 
-    /// Allow-listed anchor targets and link-shaped text under `element`.
-    private static func links(in element: Element) -> [String] {
-        var candidates: [String] = []
-        for anchor in [element] + element.elements() where anchor.name == "a" {
-            if let href = anchor.attributes["href"] {
-                candidates.append(href.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
+    /// The one event the title names, as its chip spells the id; `nil` when no
+    /// chip carries the title or two different events do.
+    private static func eventId(in root: Element, title: String) -> String? {
+        var ids: [String] = []
+        for text in root.textNodes() where normalize(text.data) == title {
+            guard let id = text.parent?.closest(where: { $0.attributes[eventAttribute] != nil })?
+                .attributes[eventAttribute], !normalizeEventId(id).isEmpty else { continue }
+            if !ids.contains(where: { normalizeEventId($0) == normalizeEventId(id) }) { ids.append(id) }
         }
-        let expression = try? NSRegularExpression(pattern: textLinkPattern)
-        for text in element.textNodes() {
-            let range = NSRange(text.data.startIndex..<text.data.endIndex, in: text.data)
-            for match in expression?.matches(in: text.data, range: range) ?? [] {
-                guard let found = Range(match.range, in: text.data) else { continue }
-                var candidate = String(text.data[found])
-                while let last = candidate.last, trailingPunctuation.contains(last) { candidate.removeLast() }
-                candidates.append(candidate)
-            }
+        return ids.count == 1 ? ids[0] : nil
+    }
+
+    /// The distinct allow-listed links of every record for `eventId` in the
+    /// document's scripts, or `nil` when no script holds such a record.
+    private static func recordLinks(in root: Element, eventId: String) -> [String]? {
+        var records: [Any] = []
+        for script in [root] + root.elements() where script.name == "script" {
+            guard let body = script.rawText, body.contains(eventURLMarker),
+                  let data = body.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            else { continue }
+            collectRecords(in: json, eventId: eventId, into: &records)
+        }
+        guard !records.isEmpty else { return nil }
+        var strings: [String] = []
+        for record in records { collectStrings(in: record, into: &strings) }
+        return distinct(strings.flatMap(links(inText:)))
+    }
+
+    /// Whether `string` is an event URL for `eventId`.
+    static func isEventURL(_ string: String, for eventId: String) -> Bool {
+        guard let marker = string.range(of: eventURLMarker) else { return false }
+        let rest = string[marker.upperBound...]
+        let raw = String(rest.prefix { $0 != "&" && $0 != "#" })
+        let decoded = raw.removingPercentEncoding ?? raw
+        return normalizeEventId(decoded) == eventId
+    }
+
+    private static func collectRecords(in value: Any, eventId: String, into records: inout [Any]) {
+        let members: [Any]
+        if let array = value as? [Any] {
+            members = array
+        } else if let object = value as? [String: Any] {
+            members = Array(object.values)
+        } else {
+            return
+        }
+        if members.contains(where: { ($0 as? String).map { isEventURL($0, for: eventId) } ?? false }) {
+            records.append(value)
+            return
+        }
+        for member in members { collectRecords(in: member, eventId: eventId, into: &records) }
+    }
+
+    private static func collectStrings(in value: Any, into strings: inout [String]) {
+        if let string = value as? String {
+            strings.append(string)
+        } else if let array = value as? [Any] {
+            for member in array { collectStrings(in: member, into: &strings) }
+        } else if let object = value as? [String: Any] {
+            for member in object.values { collectStrings(in: member, into: &strings) }
+        }
+    }
+
+    /// Allow-listed link-shaped runs in one string.
+    private static func links(inText text: String) -> [String] {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        var candidates: [String] = []
+        for match in textLinkExpression?.matches(in: text, range: range) ?? [] {
+            guard let found = Range(match.range, in: text) else { continue }
+            var candidate = String(text[found])
+            while let last = candidate.last, trailingPunctuation.contains(last) { candidate.removeLast() }
+            candidates.append(candidate)
         }
         return candidates.filter(isAllowed)
+    }
+
+    private static func decide(_ links: [String], fetched: Bool) -> Match {
+        Match(url: links.count == 1 ? links[0] : nil, links: links.count, fetched: fetched)
     }
 
     private static func distinct(_ urls: [String]) -> [String] {
@@ -170,14 +226,16 @@ enum MeetingLink {
 
     // Deliberately not a general HTML parser: it reads the hand-written
     // fixtures in `MeetingLinkFixtures`, so the reference implementation has no
-    // dependency. Script and style bodies are skipped, as the page script skips
-    // their text.
+    // dependency. Script and style bodies are kept raw on their element, never
+    // as text nodes, as the page script skips their text.
 
     final class Element {
         let name: String
         let attributes: [String: String]
         weak var parent: Element?
         var children: [Node] = []
+        /// A `script` or `style` body, verbatim (no entity decoding).
+        var rawText: String?
 
         init(name: String, attributes: [String: String]) {
             self.name = name
@@ -293,8 +351,10 @@ enum MeetingLink {
                 element.parent = stack.last
                 stack.last?.children.append(.element(element))
                 if rawTextElements.contains(name) {
-                    // The body is not markup and its text is never read.
-                    index = position(of: "</\(name)", in: characters, from: index) ?? characters.count
+                    // The body is not markup: kept raw, never a text node.
+                    let close = position(of: "</\(name)", in: characters, from: index) ?? characters.count
+                    element.rawText = String(characters[index..<close])
+                    index = close
                     continue
                 }
                 if !selfClosing, !voidElements.contains(name) {

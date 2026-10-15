@@ -118,10 +118,16 @@ final class NotificationPolicyTests: XCTestCase {
     /// A key name that is not an identifier could be content; it is masked.
     func testTheCalendarLineMasksKeysThatAreNotIdentifiers() {
         let line = CalendarNotificationLine.make(
-            optionKeys: [], dataKeys: ["eventId", "Weekly sync with Bob"], actionCount: 0, join: .pageFallback, links: 1
+            optionKeys: [], dataKeys: ["eventId", "Weekly sync with Bob"], actionCount: 0, join: .fetch, links: 1
         )
 
-        XCTAssertEqual(line, "calendar notification keys=- data=eventId,? actions=0 join=page-fallback links=1")
+        XCTAssertEqual(line, "calendar notification keys=- data=eventId,? actions=0 join=fetch links=1")
+    }
+
+    /// R32's source vocabulary, exactly.
+    func testTheJoinSourcesAreTheR32Vocabulary() {
+        let sources: [JoinSource] = [.data, .page, .fetch, .none, .error, .timeout, .noWebView]
+        XCTAssertEqual(sources.map(\.rawValue), ["data", "page", "fetch", "none", "error", "timeout", "no-webview"])
     }
 
     // MARK: - B1

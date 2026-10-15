@@ -1,6 +1,6 @@
 import Foundation
 
-/// The 1 s wait before a Calendar notification is posted (KTD19, R29).
+/// The wait before a Calendar notification is posted (KTD19, R29).
 ///
 /// The lookup and the deadline race; whichever finishes first settles the
 /// run, and the other is ignored. The decision lives here, with the lookup and
@@ -16,7 +16,19 @@ final class JoinLookup {
         let links: Int
     }
 
-    static let deadline: TimeInterval = 1
+    /// What the page lookup reported.
+    enum Answer: Equatable {
+        /// The script ran and answered.
+        case match(MeetingLink.Match)
+        /// The script threw, or answered something that is not its payload.
+        case failed
+        /// The Calendar webview was gone before it could be asked.
+        case noWebView
+    }
+
+    /// The inline event list answers in milliseconds; the fetch fallback takes
+    /// 0.7–1.4 s on a warm session, so the whole page path gets 3 s.
+    static let deadline: TimeInterval = 3
 
     private let post: (Outcome) -> Void
     private var settled = false
@@ -26,34 +38,35 @@ final class JoinLookup {
     }
 
     /// The answer that needs no page lookup: the reminder's own `data` held
-    /// one allow-listed link, or there is no webview to ask. `nil` means run
-    /// the lookup.
-    static func immediate(dataLink: String?, hasWebView: Bool) -> Outcome? {
-        if let dataLink, MeetingLink.isAllowed(dataLink) {
-            return Outcome(url: dataLink, source: .data, links: 0)
-        }
-        guard hasWebView else { return Outcome(url: nil, source: .noWebView, links: 0) }
-        return nil
+    /// one allow-listed link. `nil` means run the lookup.
+    static func immediate(dataLink: String?) -> Outcome? {
+        guard let dataLink, MeetingLink.isAllowed(dataLink) else { return nil }
+        return Outcome(url: dataLink, source: .data, links: 0)
     }
 
-    /// What a lookup answer becomes. A URL the allow-list rejects is no URL;
-    /// `nil` means the script failed.
-    static func outcome(for answer: MeetingLink.Match?) -> Outcome {
-        guard let answer else { return Outcome(url: nil, source: .none, links: 0) }
-        guard let url = answer.url, MeetingLink.isAllowed(url) else {
-            return Outcome(url: nil, source: .none, links: answer.links)
+    /// What a lookup answer becomes. A URL the allow-list rejects is no URL.
+    static func outcome(for answer: Answer) -> Outcome {
+        switch answer {
+        case .failed:
+            return Outcome(url: nil, source: .error, links: 0)
+        case .noWebView:
+            return Outcome(url: nil, source: .noWebView, links: 0)
+        case .match(let match):
+            guard let url = match.url, MeetingLink.isAllowed(url) else {
+                return Outcome(url: nil, source: .none, links: match.links)
+            }
+            return Outcome(url: url, source: match.fetched ? .fetch : .page, links: match.links)
         }
-        return Outcome(url: url, source: answer.fallback ? .pageFallback : .page, links: answer.links)
     }
 
     /// Starts the lookup and the deadline. `post` is called exactly once.
     ///
     /// - Parameters:
-    ///   - lookup: asks the page; calls back with its answer, or `nil` on failure.
+    ///   - lookup: asks the page; calls back with its answer.
     ///   - schedule: runs a closure after a delay (`DispatchQueue.main` in the app).
     static func start(
         deadline: TimeInterval = JoinLookup.deadline,
-        lookup: (@escaping (MeetingLink.Match?) -> Void) -> Void,
+        lookup: (@escaping (Answer) -> Void) -> Void,
         schedule: (TimeInterval, @escaping () -> Void) -> Void,
         post: @escaping (Outcome) -> Void
     ) {
