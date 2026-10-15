@@ -14,7 +14,7 @@ import os
 /// `privacy: .public` on the message, and that is a promise the *call sites*
 /// have to keep. The unified log is world-readable on this Mac and keeps for
 /// days, so anything handed to `Log` has left the app's privacy boundary. The
-/// rule, in three parts:
+/// rule, in four parts:
 ///
 /// - **Never a downloaded file's name.** It is what a person wrote on a
 ///   contract, an invoice, an X-ray. `NavigationPolicy.redactedName` reduces one
@@ -26,6 +26,9 @@ import os
 /// - **Never an error's own text.** A Cocoa file error spells the filename out
 ///   in its message and a URL error carries the failing URL, so a domain and a
 ///   code go in instead.
+/// - **Never notification text or a one-time code.** A notification's title
+///   and body are someone's mail, and a sign-in code is a credential. Say what
+///   happened, not what it said.
 ///
 /// Marking the message `.private` instead would put the log back where it was —
 /// unreadable, which is where a year of download failures went unnoticed. The

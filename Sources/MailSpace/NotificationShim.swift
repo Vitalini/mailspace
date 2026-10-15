@@ -81,6 +81,10 @@ enum NotificationShim {
       MailSpaceNotification.prototype.dispatchEvent = function () { return true; };
 
       MailSpaceNotification.permission = 'granted';
+      // Stays 0. The page's own `actions` are not forwarded and no click can
+      // be routed back to the page, so a non-zero value would invite buttons
+      // that never render or that do nothing. MailSpace's native buttons
+      // (Copy Code) do not depend on it.
       MailSpaceNotification.maxActions = 0;
       MailSpaceNotification.requestPermission = function (callback) {
         if (typeof callback === 'function') {

@@ -17,6 +17,25 @@ enum NotificationContent {
     static func identifier(tag: String, accountId: UUID) -> String {
         tag.isEmpty ? UUID().uuidString : "\(accountId.uuidString)|\(tag)"
     }
+
+    /// A native action a notification carries: its category, and what goes
+    /// into `userInfo` for the action to act on.
+    struct Action: Equatable {
+        let category: NotificationCategory
+        let userInfo: [String: String]
+    }
+
+    /// Which action, if any, a notification gets. Mail gets Copy Code when
+    /// `OneTimeCode` finds one confident code; Calendar gets nothing.
+    static func action(view: AccountView, title: String, body: String) -> Action? {
+        switch view {
+        case .mail:
+            guard let code = OneTimeCode.extract(title: title, body: body) else { return nil }
+            return Action(category: .oneTimeCode, userInfo: [NotificationCategory.InfoKey.code: code])
+        case .calendar:
+            return nil
+        }
+    }
 }
 
 /// Which frames may raise a native notification.
@@ -135,6 +154,8 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             return
         }
         center.delegate = self
+        // Before the authorization guard, so the self-test path registers too.
+        center.setNotificationCategories(NotificationCategory.registered)
         guard let options = Self.authorizationOptions(
             bundleIdentifier: Bundle.main.bundleIdentifier,
             selfTestActive: SelfTest.isEnabled
@@ -215,6 +236,10 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             InfoKey.accountId: account.id.uuidString,
             InfoKey.view: view.rawValue
         ]
+        if let action = NotificationContent.action(view: view, title: title, body: body) {
+            content.categoryIdentifier = action.category.identifier
+            content.userInfo.merge(action.userInfo) { current, _ in current }
+        }
 
         let identifier = NotificationContent.identifier(tag: tag, accountId: account.id)
 
@@ -268,6 +293,16 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
+        // A notification's own button first: Copy Code acts in place, with no
+        // tab switch and without bringing MailSpace forward.
+        if NotificationCategory.handle(
+            actionIdentifier: response.actionIdentifier,
+            userInfo: info,
+            pasteboard: .general
+        ) {
+            completionHandler()
+            return
+        }
         if let path = info[InfoKey.downloadPath] as? String {
             // A finished download takes the user to the file, not to a tab.
             DispatchQueue.main.async {
