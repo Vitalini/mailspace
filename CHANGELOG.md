@@ -10,6 +10,12 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 
 ## [Unreleased]
 
+### Fixed
+- **The unread count catches up as soon as you sign back in.** After Google
+  signed you out and you signed in again inside the tab, the number on the tab
+  and in the Dock could stay out of date for a minute or longer. It now
+  refreshes as soon as Gmail finishes loading.
+
 ## [1.2.1] - 2026-09-10
 
 ### Fixed
