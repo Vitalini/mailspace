@@ -370,8 +370,8 @@ final class UnreadPoller {
     }
 
     /// Polls every mail account, or just one when `accountId` is given (used
-    /// right after a new-mail notification, and on a mail webview's first
-    /// `didFinish` so the badge does not sit blank for a minute after launch).
+    /// right after a new-mail notification, and on every main-frame
+    /// `didFinish` on a page `reading(for:)` can poll).
     ///
     /// `completion` runs once every fetch this call started has answered — what
     /// the Settings "Check Now" button waits on, the same contract
