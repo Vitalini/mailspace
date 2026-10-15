@@ -213,7 +213,9 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
 
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { error in
             if let error {
-                Log.error("could not post download notification: \(error.localizedDescription)")
+                // Domain and code only: an error's text could echo the content.
+                let nsError = error as NSError
+                Log.error("could not post download notification: \(nsError.domain) \(nsError.code)")
             }
         }
     }
@@ -245,7 +247,9 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
 
         center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
             if let error {
-                Log.error("could not post notification: \(error.localizedDescription)")
+                // Domain and code only: an error's text could echo the content.
+                let nsError = error as NSError
+                Log.error("could not post notification: \(nsError.domain) \(nsError.code)")
             }
         }
 
@@ -293,26 +297,23 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
-        // A notification's own button first: Copy Code acts in place, with no
-        // tab switch and without bringing MailSpace forward.
-        if NotificationCategory.handle(
-            actionIdentifier: response.actionIdentifier,
-            userInfo: info,
-            pasteboard: .general
-        ) {
-            completionHandler()
-            return
-        }
-        if let path = info[InfoKey.downloadPath] as? String {
-            // A finished download takes the user to the file, not to a tab.
-            DispatchQueue.main.async {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        let actionIdentifier = response.actionIdentifier
+        // The delivery queue is not documented as main, and NSPasteboard,
+        // NSWorkspace and the router are AppKit: everything below runs on main.
+        DispatchQueue.main.async { [weak self] in
+            // A notification's own button first: Copy Code acts in place, with
+            // no tab switch and without bringing MailSpace forward.
+            if NotificationCategory.handle(actionIdentifier: actionIdentifier, userInfo: info, pasteboard: .general) {
+                completionHandler()
+                return
             }
-        } else if let tab = Self.tab(from: info) {
-            DispatchQueue.main.async { [weak self] in
+            if let path = info[InfoKey.downloadPath] as? String {
+                // A finished download takes the user to the file, not to a tab.
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            } else if let tab = Self.tab(from: info) {
                 self?.router?.focusAccount(tab.accountId, view: tab.view)
             }
+            completionHandler()
         }
-        completionHandler()
     }
 }

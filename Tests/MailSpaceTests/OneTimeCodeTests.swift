@@ -37,7 +37,9 @@ final class OneTimeCodeTests: XCTestCase {
         Fixture("Login code:731904", "731904", "colon after a letter is not a joiner"),
         Fixture("G-482913 is your Google verification code", "482913", "hyphen after a letter is not a joiner"),
         Fixture("Your one-time password is 482913", "482913"),
-        Fixture("Одноразовый пароль: 4821", "4821")
+        Fixture("Одноразовый пароль: 4821", "4821"),
+        Fixture("Code 482913 to confirm payment of 1500 USD", "482913", "the amount falls to a currency word"),
+        Fixture("Код 482913 для подтверждения. Сумма 15000 ₽", "482913", "the amount falls to a spaced currency sign")
     ]
 
     private let negatives: [Fixture] = [
@@ -67,6 +69,29 @@ final class OneTimeCodeTests: XCTestCase {
                 "beyond the 40-character window"),
         Fixture("Your code is 123 456", nil, "grouped code, the known miss"),
         Fixture("Your OTP is 2047", nil, "year rule, the known miss"),
+        // Order, amount and phone mails: a wrong number copied is worse than no button.
+        Fixture("Заказ № 12345678 доставлен. Код для получения придёт в SMS", nil, "№ across a space"),
+        Fixture("Order No. 123456 confirmed. Use code THANKS", nil, "preceding word no"),
+        Fixture("Списание 15000 ₽. Код подтверждения придет отдельно", nil, "₽ across a space"),
+        Fixture("Payment of 1500 USD requires a verification code", nil, "following currency word"),
+        Fixture("Call (555) 1234 to reset your PIN", nil, ") across a space"),
+        Fixture("Оплата 12500₽ прошла, код заказа отправлен", nil, "₽ after"),
+        Fixture("Your order 123456 — verification required", nil, "preceding word order"),
+        // Order, track and promo codes named as codes.
+        Fixture("Код заказа 12345678. Спасибо за покупку!", nil, "disqualifier after the keyword"),
+        Fixture("Трек-код: 80012345", nil, "disqualifier before the keyword"),
+        Fixture("Промо-код 202405 на скидку 10%", nil, "disqualifier before the keyword"),
+        Fixture("Ваш код скидки 482913", nil, "disqualifier after the keyword"),
+        Fixture("Order code 482913 confirmed", nil, "disqualifier before the keyword"),
+        Fixture("Referral code 482913", nil, "disqualifier before the keyword"),
+        // PIN-changed mails: masked card digits and times.
+        Fixture("Карта *4242: PIN-код изменён", nil, "* mask before"),
+        Fixture("Карта •4242: PIN-код изменён", nil, "bullet mask before"),
+        Fixture("Your card ending 4242: PIN changed", nil, "preceding word ending"),
+        Fixture("Team sync moved to 1430. Dial-in PIN below", nil, "preceding word to"),
+        // Known miss, kept on the safe side: an amount with a currency prefix the
+        // rules do not read survives as a second candidate, so uniqueness drops both.
+        Fixture("OTP 482913 for Rs.15000 at AMAZON", nil, "uniqueness, the payment known miss"),
         Fixture("", nil, "empty")
     ]
 
