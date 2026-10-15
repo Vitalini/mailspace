@@ -82,9 +82,9 @@ enum MeetingLinkScript {
       return seen;
     }
 
-    // The one event the title names, as its chip spells the id; null when no
-    // chip carries the title or two different events do.
-    function msMeetingEventId(root, wanted) {
+    // The events the title names, as their chips spell the ids, in document
+    // order and distinct up to padding.
+    function msMeetingEventIds(root, wanted) {
       const ids = [];
       const nodes = msMeetingTextNodes(root);
       for (let i = 0; i < nodes.length; i++) {
@@ -100,7 +100,21 @@ enum MeetingLinkScript {
         }
         if (!known) { ids.push(id); }
       }
-      return ids.length === 1 ? ids[0] : null;
+      return ids;
+    }
+
+    // Several events with one title: a URL only when every record holds
+    // exactly one link and it is the same one. Never fetched.
+    function msMeetingAgreeing(perRecord) {
+      let all = [];
+      let agree = true;
+      for (let i = 0; i < perRecord.length; i++) {
+        if (perRecord[i] === null || perRecord[i].length !== 1) { agree = false; }
+        if (perRecord[i] !== null) { all = all.concat(perRecord[i]); }
+      }
+      const union = msMeetingDistinct(all);
+      agree = agree && union.length === 1;
+      return { ok: true, url: agree ? union[0] : null, links: union.length, fetched: false };
     }
 
     function msMeetingIsEventURL(value, key) {
@@ -167,8 +181,14 @@ enum MeetingLinkScript {
       const nothing = { ok: true, url: null, links: 0, fetched: false };
       const wanted = msMeetingNormalize(title);
       if (wanted === '') { return nothing; }
-      const eventId = msMeetingEventId(root, wanted);
-      if (eventId === null) { return nothing; }
+      const ids = msMeetingEventIds(root, wanted);
+      if (ids.length === 0 || ids.length > \(MeetingLink.maxRecurringRecords)) { return nothing; }
+      if (ids.length > 1) {
+        const perRecord = [];
+        for (let i = 0; i < ids.length; i++) { perRecord.push(msMeetingRecordLinks(root, msMeetingEventKey(ids[i]))); }
+        return msMeetingAgreeing(perRecord);
+      }
+      const eventId = ids[0];
       const key = msMeetingEventKey(eventId);
 
       const local = msMeetingRecordLinks(root, key);

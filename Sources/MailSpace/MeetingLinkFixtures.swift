@@ -122,6 +122,15 @@ enum MeetingLinkFixtures {
 
     static let fetchedNothing = MeetingLink.Match(url: nil, links: 0, fetched: true)
 
+    /// A daily meeting in week view: one chip and one record per instance,
+    /// each instance with its own id. `links` gives each instance's strings.
+    static func recurring(_ title: String, _ links: [[Any]?]) -> String {
+        let ids = links.indices.map { "day\($0)" }
+        let chips = ids.map { chip($0, title) }.joined()
+        let records: [Any] = zip(ids, links).compactMap { id, strings in strings.map { record(id, title, $0) } }
+        return page(chips + eventList(records))
+    }
+
     // MARK: - Fixtures
 
     static let all: [Fixture] = [
@@ -184,7 +193,7 @@ enum MeetingLinkFixtures {
                 chip("ev1", "Standup") + chip("ev2", "Standup")
                 + eventList([record("ev1", "Standup", [meet]), record("ev2", "Standup", [otherMeet])])
             ),
-            expected: .nothing
+            expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
         ),
         Fixture(
             name: "decoy-same-title-one-without-link",
@@ -193,7 +202,50 @@ enum MeetingLinkFixtures {
                 chip("ev1", "Weekly sync") + chip("ev2", "Weekly sync")
                 + eventList([record("ev1", "Weekly sync"), record("ev2", "Weekly sync", [meet])])
             ),
+            expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
+        ),
+        Fixture(
+            name: "recurring-daily-same-link",
+            title: "Standup",
+            html: recurring("Standup", [[meet], [meet], ["Join: \(meet)"], [meet], [NSNull(), [meet]]]),
+            expected: found(meet)
+        ),
+        Fixture(
+            name: "recurring-one-instance-different-link",
+            title: "Standup",
+            html: recurring("Standup", [[meet], [meet], [otherMeet], [meet], [meet]]),
+            expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
+        ),
+        Fixture(
+            name: "recurring-one-instance-without-link",
+            title: "Standup",
+            html: recurring("Standup", [[meet], [meet], ["Room 4"], [meet], [meet]]),
+            expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
+        ),
+        Fixture(
+            name: "recurring-one-record-missing-is-not-fetched",
+            title: "Standup",
+            html: recurring("Standup", [[meet], [meet], nil, [meet], [meet]]),
+            fetched: page(eventList([record("day2", "Standup", [meet])])),
+            expected: MeetingLink.Match(url: nil, links: 1, fetched: false)
+        ),
+        Fixture(
+            name: "recurring-instance-with-two-links",
+            title: "Standup",
+            html: recurring("Standup", [[meet], [meet, zoom], [meet]]),
+            expected: MeetingLink.Match(url: nil, links: 2, fetched: false)
+        ),
+        Fixture(
+            name: "recurring-over-the-cap",
+            title: "Standup",
+            html: recurring("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords + 1)),
             expected: .nothing
+        ),
+        Fixture(
+            name: "recurring-at-the-cap",
+            title: "Standup",
+            html: recurring("Standup", Array(repeating: [meet], count: MeetingLink.maxRecurringRecords)),
+            expected: found(meet)
         ),
         Fixture(
             name: "one-event-two-chips-padding-ignored",

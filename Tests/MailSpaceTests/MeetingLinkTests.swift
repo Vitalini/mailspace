@@ -82,12 +82,32 @@ final class MeetingLinkTests: XCTestCase {
         XCTAssertEqual(answer("record-as-object")?.url, MeetingLinkFixtures.meet)
     }
 
-    /// AE10 and review #4: two events with the same title are no button, even
-    /// when only one of them has a link.
-    func testTwoEventsWithTheSameTitleGiveNothing() {
-        XCTAssertEqual(answer("decoy-same-title-two-events"), .nothing)
-        XCTAssertEqual(answer("decoy-same-title-one-without-link"), .nothing)
+    /// AE10 and review #4: two events with the same title give a URL only
+    /// when both records agree on one link; a decoy with another link or no
+    /// link gives none, and is never fetched.
+    func testTwoEventsWithTheSameTitleMustAgree() {
+        XCTAssertEqual(answer("decoy-same-title-two-events"), MeetingLink.Match(url: nil, links: 2, fetched: false))
+        XCTAssertEqual(answer("decoy-same-title-one-without-link"), MeetingLink.Match(url: nil, links: 1, fetched: false))
         XCTAssertTrue(fetches("decoy-same-title-one-without-link").isEmpty)
+    }
+
+    /// A recurring meeting: every instance holds the same one link.
+    func testARecurringMeetingWithOneLinkGetsJoin() {
+        XCTAssertEqual(answer("recurring-daily-same-link"), MeetingLinkFixtures.found(MeetingLinkFixtures.meet))
+        XCTAssertEqual(answer("recurring-at-the-cap")?.url, MeetingLinkFixtures.meet)
+    }
+
+    func testARecurringMeetingThatDisagreesGetsNothing() {
+        XCTAssertNil(answer("recurring-one-instance-different-link")?.url)
+        XCTAssertNil(answer("recurring-one-instance-without-link")?.url)
+        XCTAssertNil(answer("recurring-instance-with-two-links")?.url)
+        XCTAssertEqual(answer("recurring-over-the-cap"), .nothing)
+    }
+
+    /// No fetch fan-out: a missing instance record is no link, not a fetch.
+    func testAMissingInstanceRecordIsNeverFetched() {
+        XCTAssertNil(answer("recurring-one-record-missing-is-not-fetched")?.url)
+        XCTAssertTrue(fetches("recurring-one-record-missing-is-not-fetched").isEmpty)
     }
 
     func testPaddingAndEncodingDoNotSplitOneEvent() {

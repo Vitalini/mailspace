@@ -14,21 +14,25 @@ import Foundation
 ///
 /// 1. **The event.** A text node whose normalised text equals the title
 ///    exactly marks its nearest `[data-eventid]` ancestor. Containment is not a
-///    match. The marked chips must name exactly one event id (trailing `=`
-///    ignored); none, or two different ids, is no link. Week-view chips do not
-///    carry the meeting link, so nothing inside a chip is read as a link.
+///    match. Ids that differ only by trailing `=` are one event. Week-view
+///    chips do not carry the meeting link, so nothing inside a chip is read as
+///    a link.
 /// 2. **The record.** The page's inline `<script>` holds a JSON event list for
 ///    the visible week. A record is the innermost array or object with a
 ///    direct string member holding `/calendar/event?eid=<that id>`. No field
 ///    position is relied on.
 /// 3. **The link.** Every string inside the record is scanned for link-shaped
 ///    text; the allow-listed ones are collected.
-/// 4. **Fetch, only when no record was found.** The event's own page,
-///    `/calendar/event?eid=<id>`, carries the same list for the event's week,
-///    and steps 2–3 run on it. A failed or signed-out fetch is no link.
+/// 4. **Fetch, only for one event whose record was not found.** The event's
+///    own page, `/calendar/event?eid=<id>`, carries the same list for the
+///    event's week, and steps 2–3 run on it. A failed or signed-out fetch is
+///    no link.
 ///
-/// The answer is a URL only when exactly one distinct allow-listed URL was
-/// collected. Two is ambiguity, and ambiguity is no button.
+/// One event: a URL only when exactly one distinct allow-listed URL was
+/// collected. Several events with the title (a recurring meeting, or a
+/// same-title decoy), at most `maxRecurringRecords`: a URL only when every
+/// record is present and holds exactly one link, and all of them are the same
+/// link. Anything else is ambiguity, and ambiguity is no button.
 enum MeetingLink {
     /// What one lookup found. `url` is set only when `links == 1`.
     struct Match: Equatable {
@@ -102,12 +106,16 @@ enum MeetingLink {
     private static let fetchableExpression = try? NSRegularExpression(pattern: fetchableEventIdPattern)
 
     /// - Parameter fetch: the event page for an event id, or `nil` when the
-    ///   fetch failed or left the Calendar origin. Called at most once.
+    ///   fetch failed or left the Calendar origin. Called at most once, and
+    ///   only when the title names one event.
     static func find(html: String, title: String, fetch: (String) -> String?) -> Match {
         let wanted = normalize(title)
         guard !wanted.isEmpty else { return .nothing }
         let root = Document.parse(html)
-        guard let eventId = eventId(in: root, title: wanted) else { return .nothing }
+        let ids = eventIds(in: root, title: wanted)
+        guard !ids.isEmpty, ids.count <= maxRecurringRecords else { return .nothing }
+        guard ids.count == 1 else { return agreeing(ids.map { recordLinks(in: root, eventId: normalizeEventId($0)) }) }
+        let eventId = ids[0]
         let key = normalizeEventId(eventId)
 
         if let links = recordLinks(in: root, eventId: key) {
@@ -140,16 +148,30 @@ enum MeetingLink {
         return fetchableExpression?.firstMatch(in: id, range: range)?.range == range
     }
 
-    /// The one event the title names, as its chip spells the id; `nil` when no
-    /// chip carries the title or two different events do.
-    private static func eventId(in root: Element, title: String) -> String? {
+    /// The most event ids one title may name (a daily meeting in week view
+    /// names up to seven); more is no link.
+    static let maxRecurringRecords = 10
+
+    /// Several events with one title, such as a recurring meeting's instances:
+    /// a URL only when every record holds exactly one link and it is the same
+    /// one. A missing record, a record without a link, or two different links
+    /// is no link. Never fetched.
+    private static func agreeing(_ perRecord: [[String]?]) -> Match {
+        let union = distinct(perRecord.flatMap { $0 ?? [] })
+        let agree = union.count == 1 && perRecord.allSatisfy { $0?.count == 1 }
+        return Match(url: agree ? union[0] : nil, links: union.count, fetched: false)
+    }
+
+    /// The events the title names, as their chips spell the ids, in document
+    /// order and distinct up to padding.
+    private static func eventIds(in root: Element, title: String) -> [String] {
         var ids: [String] = []
         for text in root.textNodes() where normalize(text.data) == title {
             guard let id = text.parent?.closest(where: { $0.attributes[eventAttribute] != nil })?
                 .attributes[eventAttribute], !normalizeEventId(id).isEmpty else { continue }
             if !ids.contains(where: { normalizeEventId($0) == normalizeEventId(id) }) { ids.append(id) }
         }
-        return ids.count == 1 ? ids[0] : nil
+        return ids
     }
 
     /// The distinct allow-listed links of every record for `eventId` in the
