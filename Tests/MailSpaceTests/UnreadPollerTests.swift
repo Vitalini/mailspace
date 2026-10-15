@@ -94,6 +94,33 @@ final class UnreadPollerReadingTests: XCTestCase {
         XCTAssertEqual(UnreadPoller.reading(for: nil), .noAnswer)
     }
 
+    /// A Mail tab that finishes loading a page the feed can be read from polls
+    /// at once — the return to the inbox after signing back in is the case
+    /// this exists for. Anything else polls nothing from that path.
+    func testAFinishPollsExactlyWhereTheFeedCanBeRead() {
+        let polls = [
+            "https://mail.google.com/mail/u/0/#inbox",
+            "https://mail.google.com/mail/u/1/#inbox",
+            "https://mail.googlemail.com/mail/u/0/"
+        ]
+        for page in polls {
+            XCTAssertTrue(UnreadPoller.pollsOnFinish(at: url(page)), page)
+        }
+        let silent = [
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://consent.google.com/c",
+            "https://idp.customer.example/login",
+            "about:blank",
+            "https://calendar.google.com/calendar/u/0/r",
+            "https://mail.google.com/chat/u/0/",
+            "http://mail.google.com/mail/u/0/"
+        ]
+        for page in silent {
+            XCTAssertFalse(UnreadPoller.pollsOnFinish(at: url(page)), page)
+        }
+        XCTAssertFalse(UnreadPoller.pollsOnFinish(at: nil))
+    }
+
     /// …but "keep the previous count" is bounded at ten cycles, so it cannot
     /// become "stale forever" — the failure the original definite-zero rule was
     /// written to prevent.

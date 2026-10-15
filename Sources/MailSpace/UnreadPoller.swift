@@ -370,8 +370,8 @@ final class UnreadPoller {
     }
 
     /// Polls every mail account, or just one when `accountId` is given (used
-    /// right after a new-mail notification, and on a mail webview's first
-    /// `didFinish` so the badge does not sit blank for a minute after launch).
+    /// right after a new-mail notification, and on every main-frame
+    /// `didFinish` on a page `reading(for:)` can poll).
     ///
     /// `completion` runs once every fetch this call started has answered — what
     /// the Settings "Check Now" button waits on, the same contract
@@ -458,6 +458,13 @@ final class UnreadPoller {
         }
     }
 
+    /// Whether a Mail webview's main frame finishing at `url` should poll now.
+    /// Read off `reading(for:)`, so this trigger and the poll it starts can
+    /// never disagree about which pages answer.
+    static func pollsOnFinish(at url: URL?) -> Bool {
+        reading(for: url) == .poll
+    }
+
     /// Whether the feed can be read from the page this webview is on: only a
     /// Gmail origin, where the fetch is same-origin and the account's cookies
     /// apply.
@@ -539,7 +546,7 @@ final class UnreadPoller {
             // Google is open, which is the only reachability question the
             // recycler actually cares about.
             if probe.reached { self.onReachability?(true) }
-            self.observe(accountId, busy ? .busy : SessionHealth.observation(for: probe))
+            self.observe(accountId, SessionHealth.filtered(SessionHealth.observation(for: probe), busy: busy))
 
             // One decision, in one place: an answer either carries a count this
             // app can stand behind or it does not, and everything that does not

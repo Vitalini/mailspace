@@ -11,6 +11,10 @@ a wrapped line belongs to the bullet above it, here and in the update window.
 ## [Unreleased]
 
 ### Fixed
+- **The unread count catches up as soon as you sign back in.** After Google
+  signed you out and you signed in again inside the tab, the number on the tab
+  and in the Dock could stay out of date for a minute or longer. It now
+  refreshes as soon as Gmail finishes loading.
 - **A blank tab can always be brought back.** Right-click any tab and choose
   Reload Tab: MailSpace replaces that tab's page with a fresh one, even when
   the page has stopped responding and ⌘R does nothing. Reload All Tabs is in
