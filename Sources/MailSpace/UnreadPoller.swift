@@ -546,7 +546,7 @@ final class UnreadPoller {
             // Google is open, which is the only reachability question the
             // recycler actually cares about.
             if probe.reached { self.onReachability?(true) }
-            self.observe(accountId, busy ? .busy : SessionHealth.observation(for: probe))
+            self.observe(accountId, SessionHealth.filtered(SessionHealth.observation(for: probe), busy: busy))
 
             // One decision, in one place: an answer either carries a count this
             // app can stand behind or it does not, and everything that does not
