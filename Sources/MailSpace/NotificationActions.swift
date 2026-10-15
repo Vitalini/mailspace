@@ -11,6 +11,9 @@ import UserNotifications
 enum NotificationCategory: CaseIterable {
     /// A Mail notification carrying one confident sign-in code (`OneTimeCode`).
     case oneTimeCode
+    /// A Calendar reminder carrying one allow-listed meeting link
+    /// (`MeetingLink`).
+    case meetingJoin
 
     /// `userInfo` keys a category's notification carries.
     enum InfoKey {
@@ -18,15 +21,20 @@ enum NotificationCategory: CaseIterable {
         /// button's promise is fixed when the banner is drawn. Notification
         /// Center already holds the body that contains it.
         static let code = "oneTimeCode"
+        /// The meeting URL, decided at post time from the reminder's own data
+        /// or the Calendar page. Re-checked against the allow-list on press.
+        static let meetingURL = "meetingURL"
     }
 
     enum ActionId {
         static let copyCode = "com.vitalii.MailSpace.action.copyCode"
+        static let join = "com.vitalii.MailSpace.action.join"
     }
 
     var identifier: String {
         switch self {
         case .oneTimeCode: return "com.vitalii.MailSpace.category.oneTimeCode"
+        case .meetingJoin: return "com.vitalii.MailSpace.category.meetingJoin"
         }
     }
 
@@ -36,6 +44,8 @@ enum NotificationCategory: CaseIterable {
         switch self {
         case .oneTimeCode:
             return [UNNotificationAction(identifier: ActionId.copyCode, title: "Copy Code", options: [])]
+        case .meetingJoin:
+            return [UNNotificationAction(identifier: ActionId.join, title: "Join", options: [])]
         }
     }
 
@@ -66,5 +76,32 @@ enum NotificationCategory: CaseIterable {
         default:
             return false
         }
+    }
+
+    /// What a Join press did.
+    enum JoinResult: Equatable {
+        /// Not a Join press; the caller keeps its usual routing.
+        case notHandled
+        /// The meeting was handed to the default browser.
+        case opened
+        /// The stored link is missing or fails the allow-list: nothing was
+        /// opened, and the caller shows the account's Calendar tab instead.
+        case focusCalendar
+    }
+
+    /// Runs the Join action. The stored URL is checked against the allow-list
+    /// again before anything is opened (R30); `open` is a parameter so tests
+    /// never launch a browser. The URL is never logged (R31).
+    static func handleJoin(actionIdentifier: String, userInfo: [AnyHashable: Any], open: (URL) -> Void) -> JoinResult {
+        guard actionIdentifier == ActionId.join else { return .notHandled }
+        guard let raw = userInfo[InfoKey.meetingURL] as? String,
+              MeetingLink.isAllowed(raw),
+              let url = URL(string: raw)
+        else {
+            Log.error("Join pressed on a notification without an allowed meeting link")
+            return .focusCalendar
+        }
+        open(url)
+        return .opened
     }
 }

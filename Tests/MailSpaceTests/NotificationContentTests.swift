@@ -69,4 +69,39 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(action?.category, .oneTimeCode)
         XCTAssertEqual(action?.userInfo, [NotificationCategory.InfoKey.code: "482913"])
     }
+
+    // MARK: - Join
+
+    /// AE9.
+    func testACalendarReminderWithAMeetingLinkGetsJoin() {
+        let url = "https://meet.google.com/abc-defg-hij"
+        let action = NotificationContent.action(view: .calendar, title: "Weekly sync", body: "10:00", meetingURL: url)
+
+        XCTAssertEqual(action?.category, .meetingJoin)
+        XCTAssertEqual(action?.userInfo, [NotificationCategory.InfoKey.meetingURL: url])
+    }
+
+    /// AE12: no link, no button; the reminder is posted as before.
+    func testACalendarReminderWithoutALinkGetsNothing() {
+        XCTAssertNil(NotificationContent.action(view: .calendar, title: "Weekly sync", body: "10:00"))
+    }
+
+    /// AE11: the content decision applies the allow-list again.
+    func testACalendarReminderWithAForeignLinkGetsNothing() {
+        XCTAssertNil(NotificationContent.action(
+            view: .calendar, title: "Weekly sync", body: "", meetingURL: "https://meet.google.com.evil.example/x"
+        ))
+    }
+
+    /// R33: Mail is exactly as stream 1 left it, with or without a link.
+    func testMailIgnoresAMeetingLink() {
+        let action = NotificationContent.action(
+            view: .mail, title: "Acme", body: "Your verification code is 482913",
+            meetingURL: "https://meet.google.com/abc-defg-hij"
+        )
+        XCTAssertEqual(action?.category, .oneTimeCode)
+        XCTAssertNil(NotificationContent.action(
+            view: .mail, title: "Lunch", body: "See you", meetingURL: "https://meet.google.com/abc-defg-hij"
+        ))
+    }
 }

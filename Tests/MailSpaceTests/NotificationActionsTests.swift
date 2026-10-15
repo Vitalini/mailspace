@@ -30,13 +30,21 @@ final class NotificationActionsTests: XCTestCase {
 
     // MARK: - Registry
 
-    func testTheRegistryHoldsOneCopyCodeCategory() throws {
+    func testTheRegistryHoldsCopyCodeAndJoin() throws {
         let categories = NotificationCategory.registered
-        XCTAssertEqual(categories.count, 1)
+        XCTAssertEqual(categories.count, 2)
 
-        let category = try XCTUnwrap(categories.first)
-        XCTAssertEqual(category.identifier, NotificationCategory.oneTimeCode.identifier)
-        XCTAssertEqual(category.actions.map(\.title), ["Copy Code"])
+        let copy = try XCTUnwrap(categories.first { $0.identifier == NotificationCategory.oneTimeCode.identifier })
+        XCTAssertEqual(copy.actions.map(\.title), ["Copy Code"])
+        let join = try XCTUnwrap(categories.first { $0.identifier == NotificationCategory.meetingJoin.identifier })
+        XCTAssertEqual(join.actions.map(\.title), ["Join"])
+    }
+
+    /// Join is delivered without activating MailSpace; the browser comes
+    /// forward on its own.
+    func testJoinDoesNotBringTheAppForward() throws {
+        let action = try XCTUnwrap(NotificationCategory.meetingJoin.category.actions.first)
+        XCTAssertFalse(action.options.contains(.foreground))
     }
 
     /// Without `.foreground`, macOS delivers the press without activating
@@ -116,5 +124,64 @@ final class NotificationActionsTests: XCTestCase {
         )
 
         XCTAssertFalse(logged.contains { $0.contains("482913") })
+    }
+
+    // MARK: - Join handler
+
+    private let meet = "https://meet.google.com/abc-defg-hij"
+
+    private func join(_ info: [AnyHashable: Any], action: String = NotificationCategory.ActionId.join) -> (NotificationCategory.JoinResult, [URL]) {
+        var opened: [URL] = []
+        let result = NotificationCategory.handleJoin(actionIdentifier: action, userInfo: info) { opened.append($0) }
+        return (result, opened)
+    }
+
+    /// AE9.
+    func testJoinOpensTheMeeting() {
+        let (result, opened) = join([NotificationCategory.InfoKey.meetingURL: meet])
+
+        XCTAssertEqual(result, .opened)
+        XCTAssertEqual(opened, [URL(string: meet)!])
+    }
+
+    /// AE11: a stored link that fails the allow-list opens nothing.
+    func testJoinWithAForeignLinkFocusesCalendarInstead() {
+        let (result, opened) = join([NotificationCategory.InfoKey.meetingURL: "https://meet.google.com.evil.example/x"])
+
+        XCTAssertEqual(result, .focusCalendar)
+        XCTAssertTrue(opened.isEmpty)
+    }
+
+    func testJoinWithoutALinkFocusesCalendar() {
+        let (result, opened) = join([:])
+
+        XCTAssertEqual(result, .focusCalendar)
+        XCTAssertTrue(opened.isEmpty)
+    }
+
+    func testCopyAndJoinIgnoreEachOther() {
+        let (result, opened) = join([NotificationCategory.InfoKey.meetingURL: meet], action: NotificationCategory.ActionId.copyCode)
+        XCTAssertEqual(result, .notHandled)
+        XCTAssertTrue(opened.isEmpty)
+
+        let copied = NotificationCategory.handle(
+            actionIdentifier: NotificationCategory.ActionId.join,
+            userInfo: withCode,
+            pasteboard: pasteboard
+        )
+        XCTAssertFalse(copied)
+        XCTAssertEqual(pasteboard.string(forType: .string), "old")
+    }
+
+    func testABodyClickIsNotAJoin() {
+        XCTAssertEqual(join([NotificationCategory.InfoKey.meetingURL: meet], action: UNNotificationDefaultActionIdentifier).0, .notHandled)
+    }
+
+    /// R31: the meeting URL never reaches the log, on success or failure.
+    func testTheMeetingURLIsNeverLogged() {
+        _ = join([NotificationCategory.InfoKey.meetingURL: meet])
+        _ = join([NotificationCategory.InfoKey.meetingURL: "https://meet.google.com.evil.example/x"])
+
+        XCTAssertFalse(logged.contains { $0.contains("meet.google.com") })
     }
 }

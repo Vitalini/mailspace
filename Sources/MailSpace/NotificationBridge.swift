@@ -26,14 +26,16 @@ enum NotificationContent {
     }
 
     /// Which action, if any, a notification gets. Mail gets Copy Code when
-    /// `OneTimeCode` finds one confident code; Calendar gets nothing.
-    static func action(view: AccountView, title: String, body: String) -> Action? {
+    /// `OneTimeCode` finds one confident code; Calendar gets Join when the
+    /// lookup found a meeting URL that passes the allow-list.
+    static func action(view: AccountView, title: String, body: String, meetingURL: String? = nil) -> Action? {
         switch view {
         case .mail:
             guard let code = OneTimeCode.extract(title: title, body: body) else { return nil }
             return Action(category: .oneTimeCode, userInfo: [NotificationCategory.InfoKey.code: code])
         case .calendar:
-            return nil
+            guard let meetingURL, MeetingLink.isAllowed(meetingURL) else { return nil }
+            return Action(category: .meetingJoin, userInfo: [NotificationCategory.InfoKey.meetingURL: meetingURL])
         }
     }
 }
@@ -229,23 +231,74 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // notification, this decides whether the user wants to see it (A2/A3).
         guard NotificationPolicy.shouldPost(account: account, view: view) else { return }
 
-        if view == .calendar {
-            Log.info(CalendarNotificationLine.make(
-                optionKeys: (payload["optionKeys"] as? [String]) ?? [],
-                dataKeys: (payload["dataKeys"] as? [String]) ?? [],
-                actionCount: (payload["actionCount"] as? Int) ?? 0,
-                join: .none,
-                links: 0
-            ))
+        let title = (payload["title"] as? String) ?? ""
+        let body = (payload["body"] as? String) ?? ""
+        let tag = (payload["tag"] as? String) ?? ""
+        let silent = (payload["silent"] as? Bool) ?? false
+
+        guard view == .calendar else {
+            post(title: title, body: body, tag: tag, silent: silent, account: account, view: view)
+            return
         }
 
-        post(
-            title: (payload["title"] as? String) ?? "",
-            body: (payload["body"] as? String) ?? "",
-            tag: (payload["tag"] as? String) ?? "",
-            silent: (payload["silent"] as? Bool) ?? false,
-            account: account,
-            view: view
+        // Calendar waits up to `JoinLookup.deadline` for a meeting link, then
+        // posts once. The R32 line is written at that moment, with names and
+        // counts only.
+        let optionKeys = (payload["optionKeys"] as? [String]) ?? []
+        let dataKeys = (payload["dataKeys"] as? [String]) ?? []
+        let actionCount = (payload["actionCount"] as? Int) ?? 0
+        let finish: (JoinLookup.Outcome) -> Void = { [weak self] outcome in
+            Log.info(CalendarNotificationLine.make(
+                optionKeys: optionKeys,
+                dataKeys: dataKeys,
+                actionCount: actionCount,
+                join: outcome.source,
+                links: outcome.links
+            ))
+            self?.post(
+                title: title, body: body, tag: tag, silent: silent,
+                account: account, view: view, meetingURL: outcome.url
+            )
+        }
+
+        if let outcome = JoinLookup.immediate(dataLink: payload["dataLink"] as? String, hasWebView: true) {
+            finish(outcome)
+            return
+        }
+        JoinLookup.start(
+            lookup: { [weak self, weak webView] answer in
+                guard let self, let webView else { return answer(nil) }
+                self.askMeetingLink(webView, title) { answer(Self.meetingMatch(from: $0)) }
+            },
+            schedule: { delay, fire in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: fire) },
+            post: finish
+        )
+    }
+
+    /// How the meeting-link script is put to a Calendar webview. A seam like
+    /// `NextEventPoller.ask`; nothing in the app replaces it. The title is an
+    /// argument, never part of the source.
+    var askMeetingLink: (WKWebView, String, @escaping (Result<Any, any Error>) -> Void) -> Void = {
+        webView, title, answer in
+        webView.callAsyncJavaScript(
+            MeetingLinkScript.pageScript,
+            arguments: ["title": title],
+            in: nil,
+            in: .defaultClient,
+            completionHandler: answer
+        )
+    }
+
+    /// The script's `{ ok, url, links, fallback }`, or `nil` when it failed.
+    static func meetingMatch(from result: Result<Any, any Error>) -> MeetingLink.Match? {
+        guard case .success(let value) = result,
+              let payload = value as? [String: Any],
+              (payload["ok"] as? Bool) == true
+        else { return nil }
+        return MeetingLink.Match(
+            url: payload["url"] as? String,
+            links: (payload["links"] as? Int) ?? 0,
+            fallback: (payload["fallback"] as? Bool) ?? false
         )
     }
 
@@ -273,7 +326,18 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
     /// the same path, so its click routes back to the right account and view
     /// with nothing new to build. It never asks for a sound of its own, so
     /// `silent` defaults to the web-notification default.
-    func post(title: String, body: String, tag: String, silent: Bool = false, account: Account, view: AccountView) {
+    ///
+    /// `meetingURL` is the Calendar lookup's answer; it is re-checked against
+    /// the allow-list by the content decision before Join is attached.
+    func post(
+        title: String,
+        body: String,
+        tag: String,
+        silent: Bool = false,
+        account: Account,
+        view: AccountView,
+        meetingURL: String? = nil
+    ) {
         guard let center else { return }
 
         let content = UNMutableNotificationContent()
@@ -287,7 +351,7 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             InfoKey.accountId: account.id.uuidString,
             InfoKey.view: view.rawValue
         ]
-        if let action = NotificationContent.action(view: view, title: title, body: body) {
+        if let action = NotificationContent.action(view: view, title: title, body: body, meetingURL: meetingURL) {
             content.categoryIdentifier = action.category.identifier
             content.userInfo.merge(action.userInfo) { current, _ in current }
         }
@@ -355,6 +419,28 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
             if NotificationCategory.handle(actionIdentifier: actionIdentifier, userInfo: info, pasteboard: .general) {
                 completionHandler()
                 return
+            }
+            // Join opens the meeting in the default browser, again only after
+            // the allow-list check. A link that fails it shows the Calendar tab.
+            switch NotificationCategory.handleJoin(
+                actionIdentifier: actionIdentifier,
+                userInfo: info,
+                open: { NSWorkspace.shared.open($0) }
+            ) {
+            case .opened:
+                completionHandler()
+                return
+            case .focusCalendar:
+                if let tab = Self.tab(from: info) {
+                    // The press does not activate MailSpace, so the tab would
+                    // otherwise change behind other windows.
+                    NSApp.activate(ignoringOtherApps: true)
+                    self?.router?.focusAccount(tab.accountId, view: .calendar)
+                }
+                completionHandler()
+                return
+            case .notHandled:
+                break
             }
             if let path = info[InfoKey.downloadPath] as? String {
                 // A finished download takes the user to the file, not to a tab.
