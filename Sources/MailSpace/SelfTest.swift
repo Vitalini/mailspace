@@ -1057,6 +1057,8 @@ final class SettingsProbe: NSObject, AccountHosting {
     func calendarCountdownSeconds(for accountId: UUID) -> Int? { nil }
     func calendarCountdownDescription(for accountId: UUID) -> String? { nil }
     func badgeInputsChanged(repoll: Bool) { badgeCalls.append(repoll) }
+    func reloadTab(_ tab: TabRef) {}
+    func reloadAllTabs(_ sender: Any?) {}
 
     func run() {
         SelfTest.armWatchdog(30) { "settings result=TIMEOUT" }

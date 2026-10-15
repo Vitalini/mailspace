@@ -39,6 +39,11 @@ protocol AccountHosting: AnyObject {
     /// what the number *means* (the badge scope); without it the existing
     /// counts are simply re-totalled.
     func badgeInputsChanged(repoll: Bool)
+    /// "Reload Tab" in a tab's right-click menu: replace that tab's webview
+    /// with a fresh one, whether or not it is the selected tab.
+    func reloadTab(_ tab: TabRef)
+    /// "Reload All Tabs" in the same menu: exactly what ⌥⌘R does.
+    func reloadAllTabs(_ sender: Any?)
 }
 
 /// The one MailSpace window: a Mailplane-style account tab bar across the top,
@@ -108,6 +113,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         tabBar.onRemoveAccount = { [weak self] id in
             self?.host.requestRemoveAccount(id: id, presentedOn: self?.window)
         }
+        tabBar.onReloadTab = { [weak self] tab in self?.host.reloadTab(tab) }
+        tabBar.onReloadAllTabs = { [weak self] in self?.host.reloadAllTabs(nil) }
     }
 
     // MARK: - Layout
@@ -485,6 +492,8 @@ final class AccountTabBar: NSView {
     var onAddAccount: (() -> Void)?
     var onEditAccount: ((UUID) -> Void)?
     var onRemoveAccount: ((UUID) -> Void)?
+    var onReloadTab: ((Tab) -> Void)?
+    var onReloadAllTabs: (() -> Void)?
 
     private let background = NSVisualEffectView()
     private let tabScroll = NSScrollView()
@@ -645,6 +654,8 @@ final class AccountTabBar: NSView {
             tabView.onClick = { [weak self] tab in self?.onSelectTab?(tab) }
             tabView.onEdit = { [weak self] id in self?.onEditAccount?(id) }
             tabView.onRemove = { [weak self] id in self?.onRemoveAccount?(id) }
+            tabView.onReload = { [weak self] tab in self?.onReloadTab?(tab) }
+            tabView.onReloadAll = { [weak self] in self?.onReloadAllTabs?() }
             tabView.onDragBegan = { [weak self] in self?.isDragging = true }
             tabStack.addArrangedSubview(tabView)
         }
@@ -773,6 +784,8 @@ final class AccountTabView: NSView, NSDraggingSource {
     var onClick: ((AccountTabBar.Tab) -> Void)?
     var onEdit: ((UUID) -> Void)?
     var onRemove: ((UUID) -> Void)?
+    var onReload: ((AccountTabBar.Tab) -> Void)?
+    var onReloadAll: (() -> Void)?
     var onDragBegan: (() -> Void)?
     /// The tab has gained or lost its accessory, so the bar has to re-decide
     /// the one width every tab shares.
@@ -944,12 +957,37 @@ final class AccountTabView: NSView, NSDraggingSource {
         ])
         applyState()
 
-        let contextMenu = NSMenu()
-        let settings = contextMenu.addItem(withTitle: "Account Settings…", action: #selector(edit(_:)), keyEquivalent: "")
-        settings.target = self
-        let removeItem = contextMenu.addItem(withTitle: "Remove Account…", action: #selector(removeAccount(_:)), keyEquivalent: "")
-        removeItem.target = self
-        menu = contextMenu
+        // The callbacks are assigned after init, so each closure reads them at
+        // click time rather than capturing whatever they were here.
+        menu = Self.contextMenu(
+            for: tab,
+            reload: { [weak self] tab in self?.onReload?(tab) },
+            reloadAll: { [weak self] in self?.onReloadAll?() },
+            edit: { [weak self] id in self?.onEdit?(id) },
+            remove: { [weak self] id in self?.onRemove?(id) }
+        )
+    }
+
+    /// The right-click menu for one tab. `internal` and free of `NSApp` so
+    /// `swift test` can read and fire it.
+    ///
+    /// No item has a key equivalent: ⌘R and ⌥⌘R belong to the main menu, and
+    /// "Reload Tab" here deliberately does something different from ⌘R — it
+    /// replaces the webview instead of reloading it.
+    static func contextMenu(
+        for tab: AccountTabBar.Tab,
+        reload: @escaping (AccountTabBar.Tab) -> Void,
+        reloadAll: @escaping () -> Void,
+        edit: @escaping (UUID) -> Void,
+        remove: @escaping (UUID) -> Void
+    ) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(MenuAction.item("Reload Tab") { reload(tab) })
+        menu.addItem(MenuAction.item("Reload All Tabs") { reloadAll() })
+        menu.addItem(.separator())
+        menu.addItem(MenuAction.item("Account Settings…") { edit(tab.accountId) })
+        menu.addItem(MenuAction.item("Remove Account…") { remove(tab.accountId) })
+        return menu
     }
 
     @available(*, unavailable)
@@ -1058,12 +1096,27 @@ final class AccountTabView: NSView, NSDraggingSource {
         context == .withinApplication ? .move : []
     }
 
-    @objc private func edit(_ sender: Any?) {
-        onEdit?(tab.accountId)
+}
+
+/// A menu item's target that runs a closure. `NSMenuItem.target` is weak, so
+/// the item also holds it as `representedObject` — the item owns its action.
+private final class MenuAction: NSObject {
+    private let run: () -> Void
+
+    private init(_ run: @escaping () -> Void) {
+        self.run = run
     }
 
-    @objc private func removeAccount(_ sender: Any?) {
-        onRemove?(tab.accountId)
+    static func item(_ title: String, run: @escaping () -> Void) -> NSMenuItem {
+        let action = MenuAction(run)
+        let item = NSMenuItem(title: title, action: #selector(fire(_:)), keyEquivalent: "")
+        item.target = action
+        item.representedObject = action
+        return item
+    }
+
+    @objc private func fire(_ sender: Any?) {
+        run()
     }
 }
 

@@ -10,7 +10,8 @@ import XCTest
 /// request to Google in `swift test`; overriding the one property the gate reads
 /// keeps the whole thing offline.
 private final class StubWebView: WKWebView {
-    private let stub: URL?
+    /// Settable so a test can walk the tab through sign-in and back.
+    var stub: URL?
 
     init(_ string: String) {
         stub = URL(string: string)
@@ -138,6 +139,93 @@ final class UnreadPollerLifetimeTests: XCTestCase {
         answer?(.success([:] as [String: Any]))
         poller.refresh(accountId: accountId)
         XCTAssertEqual(asked, 2)
+    }
+}
+
+/// What a poll on every finished Gmail load relies on: coming back from a
+/// sign-in or SSO page, the next poll on Gmail asks the page once and writes
+/// the fresh count, and a poll already running is not doubled.
+final class UnreadPollerReloginTests: XCTestCase {
+    private let inbox = "https://mail.google.com/mail/u/0/#inbox"
+
+    private func answer(_ count: Int) -> [String: Any] {
+        let feed = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <feed version="0.3" xmlns="http://purl.org/atom/ns#">
+          <title>Gmail - Inbox for someone@example.com</title>
+          <fullcount>\(count)</fullcount>
+        </feed>
+        """
+        return [
+            "ok": true, "feed": feed, "status": 200, "type": "basic",
+            "reached": true, "host": "mail.google.com", "path": UnreadPoller.feedPath
+        ]
+    }
+
+    /// The poller, one account on `webView`, and a page that answers `next`.
+    private func makePoller(
+        on webView: StubWebView, answering next: @escaping () -> Int
+    ) -> (UnreadPoller, UUID, () -> Int) {
+        let poller = UnreadPoller(interval: 3600, timeout: 600)
+        let accountId = UUID()
+        poller.mailWebViews = { [(accountId: accountId, webView: webView)] }
+        var asked = 0
+        poller.ask = { [answer] _, reply in
+            asked += 1
+            reply(.success(answer(next())))
+        }
+        return (poller, accountId, { asked })
+    }
+
+    func testSigningBackInWritesTheFreshCount() {
+        let webView = StubWebView(inbox)
+        var unread = 7
+        let (poller, accountId, asked) = makePoller(on: webView) { unread }
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(poller.count(for: accountId), 7)
+
+        webView.stub = URL(string: "https://accounts.google.com/v3/signin/identifier")
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(poller.count(for: accountId), 0)
+
+        unread = 3
+        webView.stub = URL(string: inbox)
+        let before = asked()
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(asked() - before, 1)
+        XCTAssertEqual(poller.count(for: accountId), 3)
+    }
+
+    func testComingBackFromSSOReplacesTheKeptCount() {
+        let webView = StubWebView(inbox)
+        var unread = 7
+        let (poller, accountId, asked) = makePoller(on: webView) { unread }
+        poller.refresh(accountId: accountId)
+
+        webView.stub = URL(string: "https://idp.customer.example/login")
+        poller.refresh(accountId: accountId)
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(poller.count(for: accountId), 7)
+
+        unread = 2
+        webView.stub = URL(string: inbox)
+        let before = asked()
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(asked() - before, 1)
+        XCTAssertEqual(poller.count(for: accountId), 2)
+    }
+
+    func testAFinishWhileAPollIsRunningAsksOnce() {
+        let poller = UnreadPoller(interval: 3600, timeout: 600)
+        let accountId = UUID()
+        let webView = StubWebView(inbox)
+        poller.mailWebViews = { [(accountId: accountId, webView: webView)] }
+        var asked = 0
+        poller.ask = { _, _ in asked += 1 }
+
+        poller.refresh(accountId: accountId)
+        poller.refresh(accountId: accountId)
+        XCTAssertEqual(asked, 1)
     }
 }
 

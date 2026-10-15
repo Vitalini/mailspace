@@ -127,6 +127,16 @@ enum SessionHealth {
         return .unreachable
     }
 
+    /// The verdict as reported while the account may be busy. Busy freezes
+    /// negative evidence only: a fresh tab, a load or a recycle can fake a
+    /// failure, but not a parsed 2xx feed. So `.healthy` passes through, and a
+    /// successful poll right after a re-login clears the signed-out mark at
+    /// once instead of 90-150 s later.
+    static func filtered(_ verdict: Observation, busy: Bool) -> Observation {
+        guard busy, verdict != .healthy else { return verdict }
+        return .busy
+    }
+
     /// What changed for the user as a result of this cycle.
     enum Change: Equatable {
         case unchanged

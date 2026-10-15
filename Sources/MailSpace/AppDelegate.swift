@@ -57,11 +57,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// A mailto: URL that arrived before the window was ready (cold launch).
     private var pendingMailto: URL?
 
-    /// Accounts whose Dock contribution has already been seeded from a real
-    /// page. The first poll runs at t=0, when every mail webview is still
-    /// blank, so without this the badge stayed empty for up to a minute after
-    /// every launch.
-    private var badgeSeeded: Set<UUID> = []
     private let launchedAt = Date()
     /// When the Mac last woke. Read by the health monitor, and by the recycler
     /// as G16 — waking is when every tab comes due at once and the network is
@@ -437,6 +432,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
+    /// "Reload Tab". Resolved by account and view, never from the key window
+    /// or the selection, so it acts on the tab that was right-clicked. Always a
+    /// rebuild, never `reload()`: a frozen content process ignores a reload,
+    /// and a fresh webview gets a fresh process. Discarding the old webview
+    /// drops its crash-throttle and stall records.
+    func reloadTab(_ tab: TabRef) {
+        guard let target = recycleTargets().first(where: {
+            $0.accountId == tab.accountId && $0.view == tab.view
+        }) else { return }
+        let url = TabRecycler.rebuildURL(
+            view: tab.view,
+            outstanding: tabRecycler.outstandingTarget(for: target.webView),
+            current: target.webView.url
+        )
+        // Discarding the old webview clears its sign-in flag; without the
+        // carry-over a rebuild mid sign-in never fires `signInCompleted`.
+        let wasAuthenticating = navigationPolicy.isAuthenticating(target.webView)
+        guard tabRecycler.rebuild(target, to: url), wasAuthenticating,
+              let fresh = sessions[tab.accountId]?.webView(for: tab.view)
+        else { return }
+        navigationPolicy.markAuthenticating(fresh)
+    }
+
     /// G11: this tab has just stopped being the visible one.
     func tabWasDeselected(accountId: UUID, view: AccountView) {
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
@@ -711,7 +729,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private func webViewDidFinish(_ webView: WKWebView) {
         guard let session = session(hosting: webView), session.view(for: webView) == .mail else { return }
-        guard badgeSeeded.insert(session.accountId).inserted else { return }
+        // Every finish on a readable Gmail page polls, not only the first: the
+        // first poll runs at t=0 on blank webviews, and the return to the inbox
+        // after signing back in is a finish too. A poll already running for the
+        // account is not doubled; the poller skips it.
+        guard UnreadPoller.pollsOnFinish(at: webView.url) else { return }
         unreadPoller.refresh(accountId: session.accountId)
     }
 
@@ -870,7 +892,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // every download running on it has to be gone before `destroyDataStore`.
         unreadPoller.forget(accountId: id)
         health.forget(id)
-        badgeSeeded.remove(id)
         nextEventPoller.forget(accountId: id)
         navigationPolicy.closePopups(for: id)
         navigationPolicy.cancelDownloads(for: id)

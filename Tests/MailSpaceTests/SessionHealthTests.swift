@@ -179,6 +179,25 @@ final class SessionHealthTests: XCTestCase {
         XCTAssertEqual(monitor.streak, 0)
     }
 
+    /// A successful poll during the busy window right after a re-login (a
+    /// fresh tab is busy for 90 s) clears the mark at once. Negative verdicts
+    /// stay frozen while busy, so the confirmation streak is not weakened.
+    func testAHealthyVerdictClearsTheMarkWhileBusy() {
+        var monitor = SessionHealth.Monitor()
+        feed(&monitor, .authFailedStrong, times: 4)
+        XCTAssertEqual(monitor.state, .signedOut)
+
+        for negative: SessionHealth.Observation in [.authFailedStrong, .authFailedWeak, .throttled, .unreachable] {
+            XCTAssertEqual(SessionHealth.filtered(negative, busy: true), .busy)
+            XCTAssertEqual(SessionHealth.filtered(negative, busy: false), negative)
+        }
+
+        let verdict = SessionHealth.filtered(.healthy, busy: true)
+        XCTAssertEqual(verdict, .healthy)
+        XCTAssertEqual(monitor.record(verdict, now: epoch.addingTimeInterval(300)), .recovered)
+        XCTAssertEqual(monitor.state, .healthy)
+    }
+
     /// One notification per episode; a reminder only after twelve hours.
     func testTheNotificationFiresOncePerEpisodeAndThenTwiceADayAtMost() {
         var monitor = SessionHealth.Monitor()
