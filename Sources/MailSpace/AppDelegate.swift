@@ -432,6 +432,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
+    /// "Reload Tab". Resolved by account and view, never from the key window
+    /// or the selection, so it acts on the tab that was right-clicked. Always a
+    /// rebuild, never `reload()`: a frozen content process ignores a reload,
+    /// and a fresh webview gets a fresh process. Discarding the old webview
+    /// drops its crash-throttle and stall records.
+    func reloadTab(_ tab: TabRef) {
+        guard let target = recycleTargets().first(where: {
+            $0.accountId == tab.accountId && $0.view == tab.view
+        }) else { return }
+        let url = TabRecycler.rebuildURL(
+            view: tab.view,
+            outstanding: tabRecycler.outstandingTarget(for: target.webView),
+            current: target.webView.url
+        )
+        // Discarding the old webview clears its sign-in flag; without the
+        // carry-over a rebuild mid sign-in never fires `signInCompleted`.
+        let wasAuthenticating = navigationPolicy.isAuthenticating(target.webView)
+        guard tabRecycler.rebuild(target, to: url), wasAuthenticating,
+              let fresh = sessions[tab.accountId]?.webView(for: tab.view)
+        else { return }
+        navigationPolicy.markAuthenticating(fresh)
+    }
+
     /// G11: this tab has just stopped being the visible one.
     func tabWasDeselected(accountId: UUID, view: AccountView) {
         guard let webView = sessions[accountId]?.webView(for: view) else { return }
