@@ -38,6 +38,45 @@ enum NotificationContent {
     }
 }
 
+/// Where a Calendar notification's Join link came from, for the R32 line.
+enum JoinSource: String {
+    /// The notification's own `data` held exactly one allow-listed link.
+    case data
+    /// The page lookup matched the title inside an event container.
+    case page
+    /// The page lookup matched the title outside every event container.
+    case pageFallback = "page-fallback"
+    /// The lookup answered, with no single allow-listed link.
+    case none
+    /// The lookup did not answer within the deadline.
+    case timeout
+    /// No Calendar webview to ask.
+    case noWebView = "no-webview"
+}
+
+/// The one diagnostic line a Calendar notification writes (R32).
+///
+/// Names and counts only: never the title, the body, the tag or a link. Key
+/// names come from the page, so anything that does not look like an
+/// identifier is replaced by `?` rather than logged.
+enum CalendarNotificationLine {
+    static func make(optionKeys: [String], dataKeys: [String], actionCount: Int, join: JoinSource, links: Int) -> String {
+        "calendar notification keys=\(names(optionKeys)) data=\(names(dataKeys)) "
+            + "actions=\(max(0, actionCount)) join=\(join.rawValue) links=\(max(0, links))"
+    }
+
+    private static func names(_ keys: [String]) -> String {
+        guard !keys.isEmpty else { return "-" }
+        return keys.prefix(20).map { isIdentifier($0) ? $0 : "?" }.joined(separator: ",")
+    }
+
+    private static func isIdentifier(_ key: String) -> Bool {
+        (1...40).contains(key.count) && key.unicodeScalars.allSatisfy { scalar in
+            scalar.isASCII && (CharacterSet.alphanumerics.contains(scalar) || scalar == "_" || scalar == "$" || scalar == "-")
+        }
+    }
+}
+
 /// Which frames may raise a native notification.
 ///
 /// Unlike the autofill handler, the shim cannot hide in its own content world:
@@ -189,6 +228,16 @@ final class NotificationBridge: NSObject, WKScriptMessageHandler, UNUserNotifica
         // it: the origin check decides whether the page *may* raise a
         // notification, this decides whether the user wants to see it (A2/A3).
         guard NotificationPolicy.shouldPost(account: account, view: view) else { return }
+
+        if view == .calendar {
+            Log.info(CalendarNotificationLine.make(
+                optionKeys: (payload["optionKeys"] as? [String]) ?? [],
+                dataKeys: (payload["dataKeys"] as? [String]) ?? [],
+                actionCount: (payload["actionCount"] as? Int) ?? 0,
+                join: .none,
+                links: 0
+            ))
+        }
 
         post(
             title: (payload["title"] as? String) ?? "",

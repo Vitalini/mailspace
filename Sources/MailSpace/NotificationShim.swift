@@ -27,8 +27,57 @@ enum NotificationShim {
       if (window.__mailspaceNotifications) { return; }
       window.__mailspaceNotifications = true;
 
+      // Key names only, never values: the R32 diagnostic line wants to know
+      // what Calendar passes, not what it says. Each helper is wrapped so an
+      // odd or hostile object (a throwing getter, a proxy) costs the extra
+      // fields and never the notification.
+      function keysOf(value) {
+        try {
+          if (value && typeof value === 'object') {
+            return Object.keys(value).slice(0, 20).map(String);
+          }
+        } catch (e) {}
+        return [];
+      }
+
+      function countActions(options) {
+        try {
+          return Array.isArray(options.actions) ? options.actions.length : 0;
+        } catch (e) {
+          return 0;
+        }
+      }
+
+      // The one first-level string in `data` that names a meeting host, or
+      // null when there is none or more than one distinct such string. Only
+      // this one string crosses; `data` itself never does. Swift re-checks it
+      // against the full allow-list before it is used.
+      var meetingHost = /^https:\\/\\/(meet\\.google\\.com|([a-z0-9-]+\\.)*zoom\\.us|teams\\.microsoft\\.com)\\//;
+      function meetingLinkIn(data) {
+        try {
+          if (!data || typeof data !== 'object') { return null; }
+          var keys = Object.keys(data);
+          var found = null;
+          for (var i = 0; i < keys.length && i < 50; i++) {
+            var value;
+            try { value = data[keys[i]]; } catch (e) { continue; }
+            if (typeof value !== 'string' || !meetingHost.test(value)) { continue; }
+            if (found === null) {
+              found = value;
+            } else if (found !== value) {
+              return null;
+            }
+          }
+          return found;
+        } catch (e) {
+          return null;
+        }
+      }
+
       function post(title, options) {
         options = options || {};
+        var data = null;
+        try { data = options.data; } catch (e) {}
         try {
           window.webkit.messageHandlers.mailspaceNotify.postMessage({
             title: String(title == null ? '' : title),
@@ -36,7 +85,11 @@ enum NotificationShim {
             tag: String(options.tag == null ? '' : options.tag),
             // The page already knows when it does not want to make noise —
             // which is why MailSpace has no sound picker of its own.
-            silent: !!options.silent
+            silent: !!options.silent,
+            optionKeys: keysOf(options),
+            dataKeys: keysOf(data),
+            actionCount: countActions(options),
+            dataLink: meetingLinkIn(data)
           });
         } catch (e) {
           // A page without the handler (or a sandboxed frame) simply gets no
@@ -84,7 +137,7 @@ enum NotificationShim {
       // Stays 0. The page's own `actions` are not forwarded and no click can
       // be routed back to the page, so a non-zero value would invite buttons
       // that never render or that do nothing. MailSpace's native buttons
-      // (Copy Code) do not depend on it.
+      // (Copy Code, Join) do not depend on it.
       MailSpaceNotification.maxActions = 0;
       MailSpaceNotification.requestPermission = function (callback) {
         if (typeof callback === 'function') {
